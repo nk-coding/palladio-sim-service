@@ -1,0 +1,36 @@
+[package]
+name = "palladio-sim-service"
+description = "mdeo plugin service: Palladio performance simulation (SimOxide, exact SimuLizar mode) as external script functions"
+version = "0.1.0"
+edition = "2024"
+license = "EPL-2.0"
+default-run = "palladio-sim-service"
+
+[dependencies]
+simoxide-model = { path = "../simoxide/crates/simoxide-model" }
+simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
+
+axum = { version = "0.8", features = ["ws"] }
+ciborium = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+jsonwebtoken = "9"
+lru = "0.12"
+rayon = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+rsa = "0.9"
+rand = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# Simulations run behind catch_unwind: a panic fails the call, not the service.
+panic = "unwind"

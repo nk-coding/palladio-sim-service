@@ -416,3 +416,80 @@ fn cost_and_modularity() {
     assert_eq!(t.modularity, 1.0);
     let _ = WireValue::Null;
 }
+
+#[test]
+fn direct_containers_get_no_middleware() {
+    // Backend's container is reached directly (a database server): no stub, no skeleton
+    let t = translated(&fixture(0.5, "C2", &format!("{}rc.direct -- C2\n", remote(2.0, 3.0, 4.0))));
+    let g = Graph::new(&t.pcm);
+    assert!(demands_of(&g, "marshal").is_empty());
+    assert!(demands_of(&g, "unmarshal").is_empty());
+    close(response_ms(&t.pcm), 15.0, 0.02);
+    // a direct container elsewhere changes nothing for this connector
+    let t = translated(&fixture(0.5, "C2", &format!("{}rc.direct -- C1\n", remote(2.0, 3.0, 4.0))));
+    assert_eq!(demands_of(&Graph::new(&t.pcm), "marshal"), vec![("CPU".into(), 2.0)]);
+}
+
+#[test]
+fn sidecar_cores_per_replica() {
+    let decisions = format!(
+        "{}{}",
+        remote(2.0, 3.0, 4.0).replace("sidecar = false", "sidecar = true"),
+        deploy(2, 0.5).replace(ROOT, "").replace("cpuPerReplica = 0.5", "cpuPerReplica = 0.5 sidecarCores = 3")
+    );
+    let t = translated(&fixture(0.5, "C2", &decisions));
+    let g = Graph::new(&t.pcm);
+    // C2: 2 replicas with 3 sidecar cores each; C1 (no Deployable): one replica, one core
+    assert_eq!(g.num_attr("C2_sidecar_cpu", "numberOfReplicas"), Some(6.0));
+    assert_eq!(g.num_attr("C1_sidecar_cpu", "numberOfReplicas"), Some(1.0));
+    assert_eq!(g.str_attr("C2_sidecar_cpu", "processingRate").as_deref(), Some("1000.0"));
+}
+
+#[test]
+fn container_prices_replace_the_cost_rule() {
+    let priced = everything() + "cost.prices -- price\nprice : ContainerPrice { price = 7.0 }\nprice.containers -- C2\n";
+    let t = translated(&fixture(2.0, "C2", &priced));
+    // C1 by the rule: 10 + 5 × 1 core + 1; C2 priced 7; one cache: 2
+    close(t.cost, 16.0 + 7.0 + 2.0, 1e-12);
+    // a priced container that hosts nothing costs nothing
+    let t = translated(&fixture(2.0, "C1", &priced));
+    close(t.cost, 16.0 + 2.0, 1e-12);
+}
+
+fn copy_model(backend: &str, mechanism: &str) -> WireModel {
+    let hdd = "C1.activeResourceSpecifications -- C1_hdd\nC1_hdd : ProcessingResourceSpecification { \
+               schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
+               processingRate = \"1000\" numberOfReplicas = 1 }\n";
+    let decisions = format!(
+        "{}{hdd}ms : MicroserviceDecisions {{ }}\nms.copyFeeds -- feed\nfeed : CopyFeed {{ }}\nfeed.site -- site\n\
+         feed.writers -- Backend_query_cpu\nfeed.store -- AssemblyFrontend\n",
+        site(mechanism)
+    );
+    fixture(0.5, backend, &decisions)
+}
+
+#[test]
+fn local_copy_read_cpu_runs_in_the_store() {
+    let t = translated(&copy_model("C2", "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 readCpuMs = 2.0 }"));
+    let g = Graph::new(&t.pcm);
+    let mut r = demands_of(&g, "readCopy");
+    r.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(r, vec![("CPU".into(), 2.0), ("HDD".into(), 1.0)]);
+    // 5 ms + 2 ms CPU + 1 ms read
+    close(response_ms(&t.pcm), 8.0, 0.02);
+    let busy = |kind: &str| t.loads.resources.iter().find(|r| r.container == "C1" && r.kind == kind).unwrap().busy;
+    close(busy("CPU"), 0.5 * 0.007, 1e-9);
+    close(busy("HDD"), 0.5 * 0.001, 1e-9);
+}
+
+#[test]
+fn a_writer_in_the_stores_container_feeds_nothing() {
+    let m = "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 }";
+    let feeds = |t: &Translation| Graph::new(&t.pcm).all("ExternalCallAction").into_iter().filter(|a| a.contains("_feed_")).count();
+    // Backend (the writer) on C2, the store on C1: one write message
+    assert_eq!(feeds(&translated(&copy_model("C2", m))), 1);
+    // both on C1: the copy is the writer's own data
+    let t = translated(&copy_model("C1", m));
+    assert_eq!(feeds(&t), 0);
+    assert!(Graph::new(&t.pcm).all("ForkAction").is_empty());
+}

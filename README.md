@@ -27,7 +27,7 @@ palladio-sim-service (`SIM_THREADS`, `SIM_DUMP_DIR`, ...), except that the defau
 | --- | --- |
 | `archSimulate(seed = 1, maxMeasurements = 10000, maxSimTime = -1, replications = 1, simulateLinkingResources = false)` | `ArchResult`: what the monitors measured on the translated model (fields as palladio-sim-service's `SimResult`) |
 | `archStat(element, metric = "Response Time", statistic = "mean", ...)` | one number, as `pcmStat` |
-| `archCost()` | cost from the `CostModel` (DESIGN §12 D13) |
+| `archCost()` | cost from the `CostModel` (DESIGN §12 D13; `ContainerPrice`s, D22) |
 | `archModularity()` | MQ of the call graph, containers as clusters (D12) |
 | `archUtilisation(element = "")` | offered load: of a container (its highest resource), of `node:<name>`, or the highest of all |
 | `archInfo()` | `ArchInfo`: translated or not, cost, modularity, every resource's load, warnings |
@@ -55,10 +55,10 @@ Applied to a copy of the model, in this order (`src/translate.rs`):
 
 | Step | Decision | PCM result |
 | --- | --- | --- |
-| 0 | `CallSite` with a `LocalCopy`, `CopyFeed` | a copy-store component with the store; the call reads the copy (HDD); each writer gets an asynchronous fork that writes every copy it feeds |
+| 0 | `CallSite` with a `LocalCopy`, `CopyFeed` | a copy-store component with the store; the call reads the copy (`readCpuMs` CPU, `readDbMs` HDD); each writer gets an asynchronous fork that writes every copy it feeds, except a writer in the store's own container (D21) |
 | 1 | `AsyncCall` | the call inside a `ForkAction` with an asynchronous forked behaviour; through a broker, on a role of its own |
 | 1 | `CachedCall` | a probabilistic branch: hit = CPU `hitCpuMs` on the caller, miss = the call |
-| 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller (CPU, [broker], latency, call) and a skeleton with the callee (CPU, call); one SEFF per signature, forwarding parameters and return values |
+| 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller (CPU, [broker], latency, call) and a skeleton with the callee (CPU, call); one SEFF per signature, forwarding parameters and return values. Connectors into a `direct` container are left alone (D19); a sidecar has `sidecarCores` per replica (D20) |
 | 3 | `Deployable` | n replicas of q cores: `numberOfReplicas` = n·⌈q⌉, `processingRate` × q/⌈q⌉ |
 | 4 | `Node` | slowdown s = 1 + C(c, U)/(c − U) from the node's CPU load U; every CPU on the node runs at most at 1/s of full speed |
 
@@ -71,7 +71,7 @@ a simulation; see D11.
 
 ## Verification
 
-`cargo test --release` (11 tests):
+`cargo test --release` (16 tests):
 
 | Test | Checks |
 | --- | --- |
@@ -85,6 +85,11 @@ a simulation; see D11.
 | `models_without_decisions_simulate_as_in_palladio_sim_service` | the fixture and the six Palladio Simulation models: same PCM digest and identical outcome |
 | `local_copy_reads_the_copy_and_writers_feed_it` | read and write demands; 5 + 1 ms simulated |
 | `cost_and_modularity` | cost from the CostModel; MQ 0 and 1 |
+| `direct_containers_get_no_middleware` | no stub or skeleton into a direct container: 15 ms |
+| `sidecar_cores_per_replica` | 2 replicas × 3 sidecar cores = 6 cores at full speed |
+| `container_prices_replace_the_cost_rule` | a priced container costs its price, and nothing when it hosts nothing |
+| `local_copy_read_cpu_runs_in_the_store` | `readCpuMs` on the store's CPU: 5 + 2 + 1 ms |
+| `a_writer_in_the_stores_container_feeds_nothing` | one message for a remote writer, none for a co-located one |
 | `functions::tests` | the manifest declares every function and record |
 
 In the workbench, `scripts/evaluate.fn` `report()` gives the same numbers as `eval` on the
@@ -109,3 +114,7 @@ runs of the original PCM files; MediaStore: 23 554.228 ms for download).
 - A call with a local copy loses its parameter and return usages.
 - Several assemblies of one component type on containers with different CPU rates share one
   cache-hit demand (D9).
+
+The MiSArch models of the project (P3, `models/misarch-*.m`, 2 275 objects) translate in about
+30 ms and simulate 22 000 requests in under a second; `validation/msa-comparison.md` there compares
+them with msa-sim-service.

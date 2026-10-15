@@ -85,7 +85,7 @@ enum Mechanism {
     Sync,
     Async,
     Cached { hit_ratio: f64, hit_cpu_ms: f64 },
-    LocalCopy { read_db_ms: f64, write_cpu_ms: f64, write_db_ms: f64 },
+    LocalCopy { read_db_ms: f64, read_cpu_ms: f64, write_cpu_ms: f64, write_db_ms: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -97,15 +97,18 @@ struct RemoteCalls {
     deliver_cpu_ms: f64,
     sidecar: bool,
     broker: Option<String>,
+    /// Containers reached without the middleware (no stub and skeleton).
+    direct: BTreeSet<String>,
 }
 
 struct Decisions {
     ms_per_unit: f64,
     sites: Vec<(String, String, Mechanism)>, // (call site, call, mechanism)
     remote: Option<RemoteCalls>,
-    deployables: Vec<(String, f64, f64)>, // (container, replicas, cpu per replica)
+    deployables: Vec<(String, f64, f64, f64)>, // (container, replicas, cpu per replica, sidecar cores)
     nodes: Vec<(String, f64, f64, Vec<String>)>, // (name, cores, background, containers)
     cost: Option<[f64; 4]>,                  // perContainer, perCore, perReplicaOverhead, perCache
+    prices: BTreeMap<String, f64>,           // container → fixed price (ContainerPrice)
     feeds: Vec<(String, String, Vec<String>, String)>, // (feed, site, writers, store)
     any: bool,
 }
@@ -149,6 +152,7 @@ impl Decisions {
                 }
                 "LocalCopy" => Mechanism::LocalCopy {
                     read_db_ms: num(g, m, "readDbMs")?,
+                    read_cpu_ms: g.num_attr(m, "readCpuMs").unwrap_or(0.0),
                     write_cpu_ms: num(g, m, "writeCpuMs")?,
                     write_db_ms: num(g, m, "writeDbMs")?,
                 },
@@ -185,6 +189,7 @@ impl Decisions {
                 deliver_cpu_ms: num(g, r, "deliverCpuMs")?,
                 sidecar: g.bool_attr(r, "sidecar").unwrap_or(false),
                 broker: g.ref1(r, "broker"),
+                direct: g.refs(r, "direct").into_iter().collect(),
             }),
         };
         let mut deployables = Vec::new();
@@ -203,7 +208,11 @@ impl Decisions {
             if n < 1.0 || !(q > 0.0) {
                 return Err(format!("{d}: needs at least one replica and a positive cpuPerReplica"));
             }
-            deployables.push((c, n.floor(), q));
+            let sc = g.num_attr(&d, "sidecarCores").unwrap_or(1.0);
+            if !(sc >= 1.0) {
+                return Err(format!("{d}: sidecarCores must be at least 1"));
+            }
+            deployables.push((c, n.floor(), q, sc.floor()));
         }
         let mut nodes = Vec::new();
         for n in sorted(g.all("Node")) {
@@ -218,6 +227,15 @@ impl Decisions {
                 num(g, c, "perCache")?,
             ]),
         };
+        let mut prices = BTreeMap::new();
+        for p in sorted(g.all("ContainerPrice")) {
+            let price = num(g, &p, "price")?;
+            for c in g.refs(&p, "containers") {
+                if prices.insert(c.clone(), price).is_some() {
+                    return Err(format!("container {c} has two ContainerPrices"));
+                }
+            }
+        }
         let mut feeds = Vec::new();
         for f in sorted(g.all("CopyFeed")) {
             feeds.push((f.clone(), one(g, &f, "site")?, sorted(g.refs(&f, "writers")), one(g, &f, "store")?));
@@ -231,7 +249,7 @@ impl Decisions {
             }
         }
         let any = !sites.is_empty() || remote.is_some() || !deployables.is_empty() || !nodes.is_empty() || !feeds.is_empty();
-        Ok(Decisions { ms_per_unit, sites, remote, deployables, nodes, cost, feeds, any })
+        Ok(Decisions { ms_per_unit, sites, remote, deployables, nodes, cost, prices, feeds, any })
     }
 }
 
@@ -250,6 +268,7 @@ struct Builder {
     base_hdd: HashMap<String, f64>,
     sidecars: BTreeMap<String, String>,
     replicas: HashMap<String, f64>,
+    sidecar_cores: HashMap<String, f64>,
     async_roles: BTreeSet<String>,
     warnings: Vec<String>,
 }
@@ -485,7 +504,7 @@ impl Builder {
         self.g.set_attr(&cpu, "schedulingPolicy", s("PROCESSOR_SHARING"));
         self.g.set_attr(&cpu, "activeResourceType", s("CPU"));
         self.g.set_attr(&cpu, "processingRate", s(lit(rate)));
-        let n = self.replicas.get(container).copied().unwrap_or(1.0);
+        let n = self.replicas.get(container).copied().unwrap_or(1.0) * self.sidecar_cores.get(container).copied().unwrap_or(1.0);
         self.g.set_attr(&cpu, "numberOfReplicas", WireValue::Int(n as i32));
         self.g.link(&sc, "activeResourceSpecifications", &cpu);
         self.base_cpu.insert(sc.clone(), rate);
@@ -629,7 +648,8 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         base_cpu: HashMap::new(),
         base_hdd: HashMap::new(),
         sidecars: BTreeMap::new(),
-        replicas: d.deployables.iter().map(|(c, n, _)| (c.clone(), *n)).collect(),
+        replicas: d.deployables.iter().map(|(c, n, _, _)| (c.clone(), *n)).collect(),
+        sidecar_cores: d.deployables.iter().map(|(c, _, _, s)| (c.clone(), *s)).collect(),
         async_roles: BTreeSet::new(),
         warnings,
         g,
@@ -674,7 +694,7 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
     // writer → forked behaviour that sends its messages
     let mut writer_forks: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for (cs, call, m) in &d.sites {
-        let Mechanism::LocalCopy { read_db_ms, write_cpu_ms, write_db_ms } = m else { continue };
+        let Mechanism::LocalCopy { read_db_ms, read_cpu_ms, write_cpu_ms, write_db_ms } = m else { continue };
         let Some((_, _, writers, store)) = d.feeds.iter().find(|f| &f.1 == cs) else {
             return Err(format!("{cs} reads a LocalCopy, but no CopyFeed feeds it"));
         };
@@ -695,7 +715,8 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
         b.g.link(&iface, "signatures", &write);
         let rs = b.seff(&comp, &read);
         let units = b.hdd_units(&store_c, *read_db_ms)?;
-        let a = b.internal(&rs, "readCopy", &[("HDD", units)]);
+        let cpu = if *read_cpu_ms > 0.0 { b.cpu_units(&store_c, *read_cpu_ms)? } else { 0.0 };
+        let a = b.internal(&rs, "readCopy", &[("CPU", cpu), ("HDD", units)]);
         b.fill(&rs, &[a]);
         let ws = b.seff(&comp, &write);
         let (cu, hu) = (b.cpu_units(&store_c, *write_cpu_ms)?, b.hdd_units(&store_c, *write_db_ms)?);
@@ -730,6 +751,11 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
                 return Err(format!("CopyFeed writer {w} is a {}, not an ExternalCallAction or InternalAction", b.g.class(w)));
             }
             let owner = b.component_of(w).ok_or_else(|| format!("{w} is in no component"))?;
+            // A writer in the store's own container sends nothing: the copy is its own data.
+            let owner_c = b.assemblies_of(&owner).first().and_then(|a| b.container_of(a));
+            if owner_c.as_deref() == Some(store_c.as_str()) {
+                continue;
+            }
             let role = match roles.get(&(owner.clone(), store.clone())) {
                 Some(r) if b.async_roles.contains(r) => r.clone(),
                 _ => {
@@ -855,8 +881,8 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
             continue;
         };
         let (Some(cr), Some(cp)) = (b.container_of(&req), b.container_of(&prov)) else { continue };
-        // co-located, or a role no call uses (any more)
-        if cr == cp || b.g.referrers(&role, "role").is_empty() {
+        // co-located, reached directly, or a role no call uses (any more)
+        if cr == cp || rc.direct.contains(&cp) || b.g.referrers(&role, "role").is_empty() {
             continue;
         }
         let via_broker = b.async_roles.contains(&role) && broker.is_some();
@@ -916,7 +942,7 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
 
 /// Rule 3: replicas with a CPU limit each.
 fn replicas(b: &mut Builder, d: &Decisions) -> Result<(), String> {
-    for (c, n, q) in &d.deployables {
+    for (c, n, q, _) in &d.deployables {
         let base = *b.base_cpu.get(c).ok_or_else(|| format!("container {} has no CPU", b.g.entity(c)))?;
         let per = q.ceil();
         for r in b.g.refs(c, "activeResourceSpecifications") {
@@ -990,8 +1016,12 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
     let used: BTreeSet<&String> = placement.values().collect();
     let mut total = 0.0;
     for c in used {
-        let (cores, replicas) = match d.deployables.iter().find(|(x, _, _)| x == c) {
-            Some((_, n, q)) => (n * q, *n),
+        if let Some(p) = d.prices.get(c) {
+            total += p;
+            continue;
+        }
+        let (cores, replicas) = match d.deployables.iter().find(|(x, _, _, _)| x == c) {
+            Some((_, n, q, _)) => (n * q, *n),
             None => {
                 let cores = g
                     .refs(c, "activeResourceSpecifications")

@@ -115,6 +115,6 @@ runs of the original PCM files; MediaStore: 23 554.228 ms for download).
 - Several assemblies of one component type on containers with different CPU rates share one
   cache-hit demand (D9).
 
-The MiSArch models of the project (P3, `models/misarch-*.m`, 2 275 objects) translate in about
-30 ms and simulate 22 000 requests in under a second; `validation/msa-comparison.md` there compares
+The MiSArch models of the project (P3, `models/misarch-*.m`, 2 275 objects) are read, translated
+and simulated (22 000 requests) by `eval` in 0.2 s; `validation/msa-comparison.md` there compares
 them with msa-sim-service.

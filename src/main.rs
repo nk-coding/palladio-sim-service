@@ -121,18 +121,28 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
+    let clock = std::time::Instant::now();
+    let lap = |what: &str| {
+        if std::env::var_os("ARCH_TIMING").is_some() {
+            eprintln!("timing {what}: {:.1} ms", clock.elapsed().as_secs_f64() * 1000.0);
+        }
+    };
     let mut model = mfile::read(Path::new(&args[0]))?;
     if plain {
         model.instances.retain(|x| palladio_arch::graph::is_pcm(&x.class_name));
     }
+    lap("read");
     let t = translate::translate(&model)?;
+    lap("translate");
     let engine = Arc::new(Engine::new(Config::from_env()?));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| e.to_string())?;
+    let p = rt.block_on(engine.prepare(schema::schema(), Arc::new(t.pcm.clone())))?;
+    lap("prepare");
     let (prepared, outcome) = rt.block_on(async {
-        let p = engine.prepare(schema::schema(), Arc::new(t.pcm.clone())).await?;
         let o = engine.simulate(p.clone(), params.clone()).await?;
         Ok::<_, String>((p, o))
     })?;
+    lap("simulate");
     let entity = |n: &str| -> String {
         t.pcm
             .instances

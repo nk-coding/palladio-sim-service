@@ -612,7 +612,9 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
     let g = Graph::new(model);
     let mut warnings = Vec::new();
     let d = Decisions::read(&g, &mut warnings)?;
-    let original = load::analyse(&g);
+    let copies: BTreeSet<String> =
+        d.sites.iter().filter(|(_, _, m)| matches!(m, Mechanism::LocalCopy { .. })).map(|(_, call, _)| call.clone()).collect();
+    let original = load::analyse_skipping(&g, &copies);
     warnings.extend(original.warnings.iter().cloned());
     let mut placement = BTreeMap::new();
     for a in g.all("AllocationContext") {
@@ -620,7 +622,7 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
             placement.insert(asm, c);
         }
     }
-    let modularity = modularity(&original.calls, &placement);
+    let modularity = modularity(&g, &d, &original, &placement);
     let cost = cost(&g, &d, &placement, &mut warnings);
 
     if !d.any {
@@ -1038,31 +1040,74 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
     total + per_cache * caches as f64
 }
 
-/// MQ (Mancoridis et al.) of the call graph with containers as clusters: the sum over clusters
-/// of 2μ/(2μ + ε), μ the calls inside the cluster and ε the calls across its border, all
-/// weighted by expected calls per time unit.
-pub fn modularity(calls: &BTreeMap<(String, String), f64>, placement: &BTreeMap<String, String>) -> f64 {
+/// How much a call between two containers couples them, by mechanism (DESIGN §12 D32, as
+/// msa's coupling weights): a synchronous or cached call 1, a local copy 0.5, an asynchronous
+/// call 0.3. A call inside one container counts 1 whatever its mechanism.
+fn coupling_weight(m: &Mechanism) -> f64 {
+    match m {
+        Mechanism::Sync | Mechanism::Cached { .. } => 1.0,
+        Mechanism::LocalCopy { .. } => 0.5,
+        Mechanism::Async => 0.3,
+    }
+}
+
+/// Cohesive MQ (DESIGN §12 D32): TurboMQ (Mancoridis et al.) of the call graph between the
+/// movable components, with containers as clusters, where every component's own work counts as
+/// cohesion of its container.
+///
+/// - Modules are the assemblies with a `Placement` that has a candidate outside
+///   `RemoteCalls.direct`. Fixed components (no Placement) and components that can only sit in
+///   direct containers (database servers) are infrastructure: they form no cluster, and calls into
+///   them count neither way.
+/// - A module's own work is its executions per time unit (calls into its SEFFs); it is a
+///   self-loop of its container.
+/// - A call between two modules weighs its expected calls per time unit, times the coupling
+///   weight of its mechanism when the two sit in different containers. Calls of a module to
+///   itself are part of its own work.
+/// - Per container: CF = intra / (intra + inter / 2); MQ = Σ CF over containers with a module.
+///
+/// A loosely coupled one-component container scores close to 1, a single container scores 1,
+/// and putting unrelated components together lowers the value.
+fn modularity(g: &Graph, d: &Decisions, loads: &Loads, placement: &BTreeMap<String, String>) -> f64 {
+    let direct: BTreeSet<String> = d.remote.as_ref().map(|r| r.direct.clone()).unwrap_or_default();
+    let mut modules: BTreeSet<String> = BTreeSet::new();
+    for p in g.all("Placement") {
+        let Some(asm) = g.ref1(&p, "allocation").and_then(|a| g.ref1(&a, "assemblyContext")) else { continue };
+        if g.refs(&p, "candidates").iter().any(|c| !direct.contains(c)) {
+            modules.insert(asm);
+        }
+    }
+    let weight: HashMap<&String, f64> = d.sites.iter().map(|(_, call, m)| (call, coupling_weight(m))).collect();
     let mut intra: BTreeMap<&String, f64> = BTreeMap::new();
     let mut inter: BTreeMap<&String, f64> = BTreeMap::new();
-    for ((a, b), w) in calls {
-        let (Some(ca), Some(cb)) = (placement.get(a), placement.get(b)) else { continue };
-        if a == b {
+    for m in &modules {
+        let Some(c) = placement.get(m) else { continue };
+        *intra.entry(c).or_default() += loads.executions.get(m).copied().unwrap_or(0.0);
+    }
+    for ((a, b, action), w) in &loads.action_calls {
+        if a == b || !modules.contains(a) || !modules.contains(b) {
             continue;
         }
+        let (Some(ca), Some(cb)) = (placement.get(a), placement.get(b)) else { continue };
         if ca == cb {
             *intra.entry(ca).or_default() += w;
         } else {
+            let w = w * weight.get(action).copied().unwrap_or(1.0);
             *inter.entry(ca).or_default() += w;
             *inter.entry(cb).or_default() += w;
         }
     }
-    let clusters: BTreeSet<&String> = placement.values().collect();
+    let clusters: BTreeSet<&String> = modules.iter().filter_map(|m| placement.get(m)).collect();
     clusters
         .into_iter()
         .map(|c| {
             let mu = intra.get(c).copied().unwrap_or(0.0);
             let eps = inter.get(c).copied().unwrap_or(0.0);
-            if mu > 0.0 { 2.0 * mu / (2.0 * mu + eps) } else { 0.0 }
+            let cf = if mu + eps > 0.0 { mu / (mu + eps / 2.0) } else { 0.0 };
+            if std::env::var_os("ARCH_DEBUG_MQ").is_some() {
+                eprintln!("MQ {} intra {mu:.3} inter {eps:.3} cf {cf:.4}", g.entity(c));
+            }
+            cf
         })
         .sum()
 }

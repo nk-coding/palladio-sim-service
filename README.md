@@ -28,7 +28,7 @@ palladio-sim-service (`SIM_THREADS`, `SIM_DUMP_DIR`, ...), except that the defau
 | `archSimulate(seed = 1, maxMeasurements = 10000, maxSimTime = -1, replications = 1, simulateLinkingResources = false)` | `ArchResult`: what the monitors measured on the translated model (fields as palladio-sim-service's `SimResult`) |
 | `archStat(element, metric = "Response Time", statistic = "mean", ...)` | one number, as `pcmStat` |
 | `archCost()` | cost from the `CostModel` (DESIGN §12 D13; `ContainerPrice`s, D22) |
-| `archModularity()` | MQ of the call graph, containers as clusters (D12) |
+| `archModularity()` | cohesive MQ of the call graph between the movable components, containers as clusters (D32) |
 | `archUtilisation(element = "")` | offered load: of a container (its highest resource), of `node:<name>`, or the highest of all |
 | `archInfo()` | `ArchInfo`: translated or not, cost, modularity, every resource's load, warnings |
 
@@ -69,9 +69,16 @@ the instances.
 Offered loads (`src/load.rs`) come from a walk over the PCM model with expected values, not from
 a simulation; see D11.
 
+Modularity (`translate.rs` `modularity`, DESIGN D32) is the cohesive MQ of msa-sim-service's
+round 2, made generic: the modules are the components with a `Placement` that may sit outside the
+`RemoteCalls.direct` containers; each module's executions per time unit count as cohesion of its
+container; a call between two modules in different containers couples them by its frequency times
+1 (sync, cached), 0.5 (local copy) or 0.3 (async). A call that reads a local copy does not run its
+callee. `ARCH_DEBUG_MQ=1` prints every cluster's intra and inter weight to stderr.
+
 ## Verification
 
-`cargo test --release` (16 tests):
+`cargo test --release` (17 tests):
 
 | Test | Checks |
 | --- | --- |
@@ -84,7 +91,8 @@ a simulation; see D11.
 | `translation_is_deterministic_and_order_independent` | every decision kind at once; shuffled instances and reference lists translate to the same model, cost, modularity and node loads |
 | `models_without_decisions_simulate_as_in_palladio_sim_service` | the fixture and the six Palladio Simulation models: same PCM digest and identical outcome |
 | `local_copy_reads_the_copy_and_writers_feed_it` | read and write demands; 5 + 1 ms simulated |
-| `cost_and_modularity` | cost from the CostModel; MQ 0 and 1 |
+| `cost_and_modularity` | cost from the CostModel; no Placement, no cluster |
+| `modularity_is_cohesive_mq_over_movable_components` | cohesive MQ: two containers 2 × 2/3, one container 1, async and copy coupling weights, a cache couples as the call, components that can only sit in direct containers are left out, a copy read does not run the callee |
 | `direct_containers_get_no_middleware` | no stub or skeleton into a direct container: 15 ms |
 | `sidecar_cores_per_replica` | 2 replicas × 3 sidecar cores = 6 cores at full speed |
 | `container_prices_replace_the_cost_rule` | a priced container costs its price, and nothing when it hosts nothing |

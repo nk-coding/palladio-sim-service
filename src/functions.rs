@@ -4,7 +4,7 @@
 //! val r = archSimulate()                         // the translated model, simulated once
 //! val rt = archStat("defaultUsageScenario")      // mean response time of a scenario
 //! val cost = archCost()                          // from the CostModel
-//! val mq = archModularity()                      // MQ of the call graph, containers as clusters
+//! val mq = archModularity()                      // cohesive MQ, containers as clusters (D32)
 //! val u = archUtilisation("Server1")             // offered load of a container ("" = highest)
 //! ```
 

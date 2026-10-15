@@ -19,7 +19,7 @@
 use crate::graph::Graph;
 use simoxide_random::UniformSource;
 use simoxide_stoex::{Env, EvalError, Program, Value, VariableMode};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Load of one processing resource.
@@ -48,6 +48,11 @@ pub struct Loads {
     pub resources: Vec<ResourceLoad>,
     /// Expected calls per time unit between assembly contexts (caller, callee).
     pub calls: BTreeMap<(String, String), f64>,
+    /// Expected calls per time unit per external call action: (caller, callee, action).
+    pub action_calls: BTreeMap<(String, String, String), f64>,
+    /// Expected executions per time unit of every assembly context (calls into its SEFFs, from
+    /// the usage model and from other assemblies, itself included).
+    pub executions: BTreeMap<String, f64>,
     /// Arrival rate per usage scenario.
     pub arrivals: BTreeMap<String, f64>,
     pub warnings: Vec<String>,
@@ -233,6 +238,12 @@ struct Walk<'a, 'b> {
     /// units per resource spec
     demand: HashMap<String, f64>,
     calls: HashMap<(String, String), f64>,
+    action_calls: HashMap<(String, String, String), f64>,
+    executions: HashMap<String, f64>,
+    /// Calls that do not reach their callee for `executions` and `action_calls` (a local copy).
+    skip: &'b BTreeSet<String>,
+    /// > 0 inside such a call.
+    skipping: usize,
     random: bool,
     depth: usize,
     warned: std::collections::HashSet<String>,
@@ -312,6 +323,9 @@ impl Walk<'_, '_> {
             self.warn(format!("{} has no SEFF for {}", g.entity(&comp), g.entity(sig)));
             return (Frame::default(), 0.0);
         };
+        if self.skipping == 0 {
+            *self.executions.entry(asm.to_string()).or_default() += w;
+        }
         for (k, v) in self.component_frame(asm).0 {
             frame.0.entry(k).or_insert(v);
         }
@@ -365,10 +379,16 @@ impl Walk<'_, '_> {
                     return time; // a call out of the system
                 };
                 *self.calls.entry((asm.to_string(), target.clone())).or_default() += w;
+                if self.skipping == 0 {
+                    *self.action_calls.entry((asm.to_string(), target.clone(), a.to_string())).or_default() += w;
+                }
+                let skipped = self.skip.contains(a);
+                self.skipping += skipped as usize;
                 let mut callee = Frame::default();
                 let inputs = g.refs(a, "inputVariableUsages");
                 self.bind(&inputs, frame, &mut callee);
                 let (ret, t) = self.call(&target, &sig, callee, w);
+                self.skipping -= skipped as usize;
                 // return values: evaluated against the callee's result (RETURN.*)
                 let mut ret_env = ret.clone();
                 for (k, v) in &frame.0 {
@@ -508,10 +528,19 @@ impl Walk<'_, '_> {
 /// The offered load of every processing resource of `g` (plain PCM; other instances are
 /// ignored) and the call frequencies between its assembly contexts.
 pub fn analyse(g: &Graph) -> Loads {
+    analyse_skipping(g, &BTreeSet::new())
+}
+
+/// As `analyse`, but the calls of `skip` (external call actions) and everything below them do
+/// not count in `executions` and `action_calls` (the call itself does): a call that reads a local
+/// copy does not run its callee.
+pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
     let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
     let ix = Index::new(g, &mut ex);
     let mut busy: HashMap<String, f64> = HashMap::new();
     let mut calls: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut action_calls: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+    let mut executions: BTreeMap<String, f64> = BTreeMap::new();
     let mut arrivals = BTreeMap::new();
     for sc in g.all("UsageScenario") {
         let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
@@ -521,6 +550,10 @@ pub fn analyse(g: &Graph) -> Loads {
             rng: Rng(0xC0FFEE),
             demand: HashMap::new(),
             calls: HashMap::new(),
+            action_calls: HashMap::new(),
+            executions: HashMap::new(),
+            skip,
+            skipping: 0,
             random: false,
             depth: 0,
             warned: Default::default(),
@@ -530,6 +563,8 @@ pub fn analyse(g: &Graph) -> Loads {
         if walk.random {
             walk.demand.clear();
             walk.calls.clear();
+            walk.action_calls.clear();
+            walk.executions.clear();
             runs = 4000;
             time = 0.0;
             for _ in 0..runs {
@@ -540,6 +575,8 @@ pub fn analyse(g: &Graph) -> Loads {
         let time = time / n;
         let demand: Vec<(String, f64)> = walk.demand.drain().map(|(k, v)| (k, v / n)).collect();
         let sc_calls: Vec<((String, String), f64)> = walk.calls.drain().map(|(k, v)| (k, v / n)).collect();
+        let sc_action_calls: Vec<((String, String, String), f64)> = walk.action_calls.drain().map(|(k, v)| (k, v / n)).collect();
+        let sc_executions: Vec<(String, f64)> = walk.executions.drain().map(|(k, v)| (k, v / n)).collect();
         let wl = g.ref1(&sc, "workload");
         let rate = match wl.as_deref().map(|w| g.class(w)) {
             Some("OpenWorkload") => {
@@ -561,6 +598,12 @@ pub fn analyse(g: &Graph) -> Loads {
         for (k, v) in sc_calls {
             *calls.entry(k).or_default() += rate * v;
         }
+        for (k, v) in sc_action_calls {
+            *action_calls.entry(k).or_default() += rate * v;
+        }
+        for (k, v) in sc_executions {
+            *executions.entry(k).or_default() += rate * v;
+        }
     }
     let mut resources = Vec::new();
     for c in g.all("ResourceContainer") {
@@ -579,7 +622,7 @@ pub fn analyse(g: &Graph) -> Loads {
             });
         }
     }
-    Loads { resources, calls, arrivals, warnings: ex.warnings }
+    Loads { resources, calls, action_calls, executions, arrivals, warnings: ex.warnings }
 }
 
 /// The mean of a variable-free StoEx (e.g. a processing rate), if it has one.

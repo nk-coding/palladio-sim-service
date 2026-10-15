@@ -410,11 +410,50 @@ fn cost_and_modularity() {
     let t = translated(&fixture(2.0, "C2", &everything()));
     // C1: 10 + 5 × 1 core + 1; C2 (2 replicas of 0.5): 10 + 5 × 1.0 + 2 × 1; one cache: 2
     close(t.cost, 16.0 + 17.0 + 2.0, 1e-12);
-    // Frontend and Backend on different containers: no call inside a cluster
+    // no Placement: nothing is movable, no cluster
     assert_eq!(t.modularity, 0.0);
-    let t = translated(&fixture(2.0, "C1", &everything()));
-    assert_eq!(t.modularity, 1.0);
     let _ = WireValue::Null;
+}
+
+/// Placements for both components, Backend's candidates given by `backend_candidates`.
+fn placements(backend_candidates: &[&str]) -> String {
+    let mut out = String::from(
+        "pf : Placement { }\npf.allocation -- alloc_Frontend\npf.candidates -- C1\npf.candidates -- C2\n\
+         decisions.placements -- pf\npb : Placement { }\npb.allocation -- alloc_Backend\ndecisions.placements -- pb\n",
+    );
+    for c in backend_candidates {
+        out += &format!("pb.candidates -- {c}\n");
+    }
+    out
+}
+
+#[test]
+fn modularity_is_cohesive_mq_over_movable_components() {
+    // 2 requests/s: Frontend and Backend each execute 2/s, and Frontend calls Backend 2/s.
+    let mq = |backend: &str, mechanism: &str, extra: &str| {
+        translated(&fixture(2.0, backend, &format!("{}{}{extra}", site(mechanism), placements(&["C1", "C2"]))))
+            .modularity
+    };
+    let sync = "m : SyncCall { }";
+    // apart: each container 2 / (2 + 2/2)
+    close(mq("C2", sync, ""), 2.0 * 2.0 / 3.0, 1e-9);
+    // together: one cluster, (2 + 2 + 2) / 6
+    close(mq("C1", sync, ""), 1.0, 1e-9);
+    // an asynchronous call couples by 0.3: 2 / (2 + 0.6/2) each
+    close(mq("C2", "m : AsyncCall { }", ""), 2.0 * 2.0 / 2.3, 1e-9);
+    // inside one container the mechanism does not matter
+    close(mq("C1", "m : AsyncCall { }", ""), 1.0, 1e-9);
+    // a cache couples as the call
+    close(mq("C2", "m : CachedCall { hitRatio = 0.5 hitCpuMs = 1.0 }", ""), 2.0 * 2.0 / 3.0, 1e-9);
+    // a component that can only sit in direct containers (a database server) is infrastructure:
+    // Frontend alone, 2 / 2
+    let rc = remote(1.0, 1.0, 1.0).replace(ROOT, "") + "rc.direct -- C2\n";
+    let t = translated(&fixture(2.0, "C2", &format!("{}{}{rc}", site(sync), placements(&["C2"]))));
+    close(t.modularity, 1.0, 1e-9);
+    // a local copy (0.5 requests/s): Backend no longer executes for Frontend (own work 0), the
+    // read couples by 0.5: Frontend 0.5 / (0.5 + 0.25/2), Backend 0
+    let m = copy_model_with("C2", "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 }", &placements(&["C1", "C2"]));
+    close(translated(&m).modularity, 0.5 / 0.625, 1e-9);
 }
 
 #[test]
@@ -457,6 +496,10 @@ fn container_prices_replace_the_cost_rule() {
 }
 
 fn copy_model(backend: &str, mechanism: &str) -> WireModel {
+    copy_model_with(backend, mechanism, "")
+}
+
+fn copy_model_with(backend: &str, mechanism: &str, extra: &str) -> WireModel {
     let hdd = "C1.activeResourceSpecifications -- C1_hdd\nC1_hdd : ProcessingResourceSpecification { \
                schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
                processingRate = \"1000\" numberOfReplicas = 1 }\n";
@@ -465,7 +508,7 @@ fn copy_model(backend: &str, mechanism: &str) -> WireModel {
          feed.writers -- Backend_query_cpu\nfeed.store -- AssemblyFrontend\n",
         site(mechanism)
     );
-    fixture(0.5, backend, &decisions)
+    fixture(0.5, backend, &format!("{decisions}{extra}"))
 }
 
 #[test]

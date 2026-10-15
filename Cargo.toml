@@ -1,0 +1,34 @@
+[package]
+name = "palladio-arch-service"
+description = "mdeo plugin service: translates architecture decisions on plain Palladio (PCM) models into PCM and simulates the result with SimOxide"
+version = "0.1.0"
+edition = "2024"
+license = "EPL-2.0"
+default-run = "palladio-arch-service"
+
+[lib]
+name = "palladio_arch"
+path = "src/lib.rs"
+
+[dependencies]
+palladio-sim-service = { path = "../palladio-sim-service" }
+simoxide-model = { path = "../simoxide/crates/simoxide-model" }
+simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
+simoxide-stoex = { path = "../simoxide/crates/simoxide-stoex" }
+simoxide-random = { path = "../simoxide/crates/simoxide-random" }
+
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 8
+panic = "unwind"
+
+[profile.test]
+opt-level = 2

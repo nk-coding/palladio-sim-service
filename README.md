@@ -19,6 +19,11 @@ Register `http://localhost:3022/` under **Settings → Plugins** and enable **Pa
 Architecture** in a project. In the dev stack the service runs in the `palladio-arch` window of
 the `mdeo-dev` tmux session and logs to `service.log`. The environment variables are those of
 palladio-sim-service (`SIM_THREADS`, `SIM_DUMP_DIR`, ...), except that the default port is 3022.
+Cap the caches for large models: a compiled MiSArch model (9 200 PCM objects after translation)
+takes about 10 MB, so the default `SIM_MODEL_CACHE_SIZE=256` can hold about 2.5 GB; the dev stack
+runs with `SIM_MODEL_CACHE_SIZE=16 SIM_RESULT_CACHE_SIZE=1024`. `ARCH_TIMING=1 … eval MODEL` prints
+the time of each step (MiSArch: read 9 ms, translation 65–75 ms, compilation 50–60 ms, simulation
+of 22 000 measurements 60–65 ms).
 `SIM_DUMP_DIR` also receives every model as the platform sent it (`received-*.txt`).
 
 ## Functions

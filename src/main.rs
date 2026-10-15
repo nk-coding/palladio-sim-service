@@ -179,6 +179,7 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
             "simulatedTime": outcome.simulated_time, "series": series, "resources": resources,
             "nodes": t.nodes.iter().map(|n| serde_json::json!({"name": n.name, "cores": n.cores, "load": n.load, "slowdown": n.slowdown})).collect::<Vec<_>>(),
             "cost": t.cost, "modularity": t.modularity, "warnings": t.warnings,
+            "noLoad": t.no_load.iter().map(|(sc, (r, time))| serde_json::json!({"scenario": entity(sc), "rate": r, "time": time})).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
         return Ok(());
@@ -223,6 +224,7 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
         println!("  node {:<35} cores {} load {:.4} slowdown {:.4}", n.name, n.cores, n.load, n.slowdown);
     }
     println!("\ncost: {}\nmodularity: {}", t.cost, t.modularity);
+    println!("no-load response time (rate-weighted, all scenarios): {}", t.no_load_time(&[], |x| x.to_string()));
     for w in &t.warnings {
         println!("warning: {w}");
     }

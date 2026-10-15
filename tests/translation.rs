@@ -184,8 +184,9 @@ fn async_remote_call_goes_through_the_broker() {
     assert_eq!(demands_of(&g, "publish"), vec![("CPU".into(), 0.5)]);
     assert_eq!(demands_of(&g, "deliver"), vec![("CPU".into(), 0.7)]);
     assert!(demands_of(&g, "marshal").is_empty());
-    // the caller does not wait; the broker and Backend are loaded by every message
-    close(response_ms(&t.pcm), 5.0, 0.02);
+    // the caller waits for the publish only (on its path, as in msa-sim-service); the broker and
+    // Backend are loaded by every message
+    close(response_ms(&t.pcm), 5.5, 0.02);
     let busy = |c: &str| t.loads.resources.iter().find(|r| r.container == c && r.kind == "CPU").unwrap().busy;
     close(busy("C3"), 0.5 * 0.001, 1e-9);
     close(busy("C2"), 0.5 * (0.0007 + 0.010), 1e-9);
@@ -535,4 +536,282 @@ fn a_writer_in_the_stores_container_feeds_nothing() {
     let t = translated(&copy_model("C1", m));
     assert_eq!(feeds(&t), 0);
     assert!(Graph::new(&t.pcm).all("ForkAction").is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The chain fixture (P6): composed calls, bypasses, workflows, read stores, quota, publishing
+
+/// `chain.m` with `rate` requests/s, Backend (and Other) on `backend`, Notifier on `notifier`,
+/// DbRead on `read`, and `decisions` appended.
+fn chain(rate: f64, backend: &str, notifier: &str, read: &str, decisions: &str) -> WireModel {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chain.m")).unwrap();
+    let text = text
+        .replace("RATE", &format!("{rate:?}"))
+        .replace("BACKEND_C", backend)
+        .replace("NOTIFIER_C", notifier)
+        .replace("READ_C", read);
+    mfile::parse(&format!("{text}\n{decisions}")).unwrap()
+}
+
+/// RemoteCalls: caller 2, callee 3, latency 4 ms, publish 0.5, deliver 0.7; C3 and C6 (database
+/// servers) are reached directly.
+fn chain_remote() -> String {
+    format!(
+        "{}rc.direct -- C3\nrc.direct -- C6\n",
+        remote(2.0, 3.0, 4.0).replace("publishCpuMs = 0.0 deliverCpuMs = 0.0", "publishCpuMs = 0.5 deliverCpuMs = 0.7")
+    )
+}
+
+/// A broker on C5 (1 ms per message) for the chain.
+const CHAIN_BROKER: &str = r#"
+repo.interfaces -- IBroker
+repo.components -- Broker
+IBroker : OperationInterface { entityName = "IBroker" }
+IBroker.signatures -- deliver
+deliver : OperationSignature { entityName = "deliver" }
+Broker : BasicComponent { entityName = "Broker" }
+Broker.providedRoles -- Broker_provides
+Broker.serviceEffectSpecifications -- Broker_deliver
+Broker_provides : OperationProvidedRole { }
+Broker_provides.providedInterface -- IBroker
+Broker_deliver : ResourceDemandingSEFF { }
+Broker_deliver.describedService -- deliver
+Broker_deliver.steps -- Broker_deliver_start
+Broker_deliver.steps -- Broker_deliver_cpu
+Broker_deliver.steps -- Broker_deliver_stop
+Broker_deliver_start : StartAction { }
+Broker_deliver_cpu : InternalAction { entityName = "broker" }
+Broker_deliver_cpu.resourceDemand -- Broker_deliver_cpu_demand
+Broker_deliver_cpu_demand : ParametricResourceDemand { specification = "Exp(1.0)" requiredResource = ProcessingResourceType.CPU }
+Broker_deliver_stop : StopAction { }
+Broker_deliver_start.successor -- Broker_deliver_cpu
+Broker_deliver_cpu.successor -- Broker_deliver_stop
+system.assemblyContexts -- AssemblyBroker
+AssemblyBroker : AssemblyContext { entityName = "AssemblyBroker" }
+AssemblyBroker.encapsulatedComponent -- Broker
+allocation.allocationContexts -- alloc_Broker
+alloc_Broker : AllocationContext { }
+alloc_Broker.assemblyContext -- AssemblyBroker
+alloc_Broker.resourceContainer -- C5
+rc.broker -- AssemblyBroker
+"#;
+
+/// A call site on `call` with `mechanism` (named m).
+fn chain_site(call: &str, mechanism: &str) -> String {
+    format!(
+        "site : CallSite {{ }}\nsite.call -- {call}\nsite.mechanism -- m\nsite.allowed -- m\n\
+         decisions.callSites -- site\ndecisions.mechanisms -- m\n{mechanism}\n"
+    )
+}
+
+/// The analytic no-load response time in ms.
+fn no_load_ms(t: &Translation) -> f64 {
+    1000.0 * t.no_load_time(&[], |x| x.to_string())
+}
+
+/// Busy CPU of a container, in ms per request at `rate` requests/s.
+fn cpu_ms(t: &Translation, container: &str, rate: f64) -> f64 {
+    t.loads.resources.iter().filter(|r| r.container == container && r.kind == "CPU").map(|r| r.busy).sum::<f64>() / rate * 1000.0
+}
+
+#[test]
+fn chain_baseline() {
+    // all synchronous and apart: 1 + 9 + 5 + (9 + 10 + 2 + 7) + (9 + 3 + 2 + 9 + 4) = 70 ms
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &chain_remote()));
+    close(no_load_ms(&t), 70.0, 1e-9);
+    close(response_ms(&t.pcm), 70.0, 0.02);
+}
+
+#[test]
+fn composed_call_moves_to_the_composer() {
+    let composed = |backend: &str, m: &str| {
+        let d = format!(
+            "{}{}site.composer -- Gateway_request_callHandle\n",
+            chain_remote(),
+            chain_site("Frontend_handle_callQuery", m)
+        );
+        translated(&chain(0.5, backend, "C4", "C3", &d))
+    };
+    let t = composed("C2", "m : ComposedCall { composeCpuMs = 1.5 }");
+    // the gateway makes the query after Frontend answered: 1 + 9 + 5 + 27 (update), then 1.5 +
+    // 9 + 19 (query) = 71.5 ms
+    close(no_load_ms(&t), 71.5, 1e-9);
+    close(response_ms(&t.pcm), 71.5, 0.02);
+    // C0: 1 + 2 + 1.5 + 2 (the gateway's two stubs); C1 lost the query's caller CPU: 3 + 5 + 2
+    close(cpu_ms(&t, "C0", 0.5), 6.5, 1e-9);
+    close(cpu_ms(&t, "C1", 0.5), 10.0, 1e-9);
+    close(cpu_ms(&t, "C2", 0.5), 28.0, 1e-9);
+    // with the gateway's cache: hit 0.75 × 1 ms, miss 0.25 × (9 + 19)
+    let t = composed("C2", "m : ComposedCall { composeCpuMs = 1.5 hitRatio = 0.75 hitCpuMs = 1.0 }");
+    close(no_load_ms(&t), 42.0 + 1.5 + 0.75 + 0.25 * 28.0, 1e-9);
+    close(cpu_ms(&t, "C0", 0.5), 1.0 + 2.0 + 1.5 + 0.75 + 0.25 * 2.0, 1e-9);
+    // in one container the caller calls itself: 1 + 9 + 5 + 19 + (3 + 2 + 9 + 4) = 52, no compose
+    let t = composed("C1", "m : ComposedCall { composeCpuMs = 1.5 }");
+    close(no_load_ms(&t), 52.0, 1e-9);
+    assert!(demands_of(&Graph::new(&t.pcm), "compose").is_empty());
+    // a composed call couples by 0.5: Frontend 0.5 / (0.5 + 0.75/2), Backend 1 / (1 + 0.75/2)
+    let d = format!(
+        "{}{}site.composer -- Gateway_request_callHandle\n\
+         pf : Placement {{ }}\npf.allocation -- alloc_Frontend\npf.candidates -- C1\npf.candidates -- C2\ndecisions.placements -- pf\n\
+         pb : Placement {{ }}\npb.allocation -- alloc_Backend\npb.candidates -- C1\npb.candidates -- C2\ndecisions.placements -- pb\n",
+        chain_remote(),
+        chain_site("Frontend_handle_callQuery", "m : ComposedCall { composeCpuMs = 1.5 }")
+    );
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &d));
+    close(t.modularity, 0.5 / 0.875 + 1.0 / 1.375, 1e-9);
+}
+
+#[test]
+fn bypass_does_the_callees_work_and_reaches_its_database() {
+    let bypass = |backend: &str| {
+        let d = format!("{}{}", chain_remote(), chain_site("Frontend_handle_callQuery", "m : Bypass { latencyMs = 4.0 }"));
+        translated(&chain(0.5, backend, "C4", "C3", &d))
+    };
+    let t = bypass("C2");
+    // Frontend does Backend's 10 ms, waits 4 ms and reads DbRead (2 ms) itself; Other (7 ms) is
+    // skipped: 1 + 9 + 5 + 16 + 27 = 58 ms
+    close(no_load_ms(&t), 58.0, 1e-9);
+    close(response_ms(&t.pcm), 58.0, 0.02);
+    close(cpu_ms(&t, "C1", 0.5), 3.0 + 5.0 + 10.0 + 2.0, 1e-9);
+    close(cpu_ms(&t, "C2", 0.5), 3.0 + 3.0 + 2.0, 1e-9);
+    close(cpu_ms(&t, "C3", 0.5), 4.0, 1e-9);
+    // in one container it is a plain call: 1 + 9 + 5 + 19 + 18 = 52
+    close(no_load_ms(&bypass("C1")), 52.0, 1e-9);
+    // modularity: Backend no longer executes the query; the bypass couples by 2:
+    // both 0.5 / (0.5 + 1.5/2)
+    let d = format!(
+        "{}{}pf : Placement {{ }}\npf.allocation -- alloc_Frontend\npf.candidates -- C1\npf.candidates -- C2\ndecisions.placements -- pf\n\
+         pb : Placement {{ }}\npb.allocation -- alloc_Backend\npb.candidates -- C1\npb.candidates -- C2\ndecisions.placements -- pb\n",
+        chain_remote(),
+        chain_site("Frontend_handle_callQuery", "m : Bypass { latencyMs = 4.0 }")
+    );
+    close(translated(&chain(0.5, "C2", "C4", "C3", &d)).modularity, 0.8, 1e-9);
+}
+
+fn workflow(style: &str, asynchronous: bool) -> String {
+    let mut d = format!(
+        "{}wf : Workflow {{ }}\nwf.trigger -- Frontend_handle\nwf.steps -- Frontend_handle_callUpdate\n\
+         wf.steps -- Backend_update_callNotify\nwf.style -- {style}\nwf.allowed -- choreo\nwf.allowed -- orch\n\
+         decisions.workflows -- wf\nchoreo : Choreographed {{ }}\norch : Orchestrated {{ stepCpuMs = 0.5 }}\n\
+         decisions.coordinations -- choreo\ndecisions.coordinations -- orch\n",
+        chain_remote()
+    );
+    if asynchronous {
+        d += CHAIN_BROKER;
+        d += "a : AsyncCall { }\ndecisions.mechanisms -- a\n";
+        for (s, call) in [("s1", "Frontend_handle_callUpdate"), ("s2", "Backend_update_callNotify")] {
+            d += &format!("{s} : CallSite {{ }}\n{s}.call -- {call}\n{s}.mechanism -- a\n{s}.allowed -- a\ndecisions.callSites -- {s}\n");
+        }
+    }
+    d
+}
+
+#[test]
+fn orchestration_moves_the_steps_to_the_trigger() {
+    // choreography as written: 70 ms
+    close(no_load_ms(&translated(&chain(0.5, "C2", "C4", "C3", &workflow("choreo", false)))), 70.0, 1e-9);
+    // orchestrated, synchronous steps: Frontend coordinates both: 1 + 9 + 5 + 28 + (0.5 + 9 + 3 +
+    // 2) + (0.5 + 9 + 4) = 71 ms
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &workflow("orch", false)));
+    close(no_load_ms(&t), 71.0, 1e-9);
+    close(response_ms(&t.pcm), 71.0, 0.02);
+    close(cpu_ms(&t, "C1", 0.5), 3.0 + 5.0 + 2.0 + 0.5 + 2.0 + 0.5 + 2.0, 1e-9);
+    close(cpu_ms(&t, "C2", 0.5), 3.0 + 10.0 + 7.0 + 3.0 + 3.0, 1e-9);
+    // asynchronous steps, choreographed: the request waits for the first publish only
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &workflow("choreo", true)));
+    close(no_load_ms(&t), 43.5, 1e-9);
+    close(cpu_ms(&t, "C5", 0.5), 2.0, 1e-9);
+    // orchestrated: all in the background (the first step is asynchronous and remote); each step
+    // is a request and a reply: 4 messages, publish and deliver on both sides
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &workflow("orch", true)));
+    close(no_load_ms(&t), 43.0, 1e-9);
+    close(response_ms(&t.pcm), 43.0, 0.02);
+    close(cpu_ms(&t, "C5", 0.5), 4.0, 1e-9);
+    close(cpu_ms(&t, "C1", 0.5), 3.0 + 5.0 + 2.0 + 2.0 * (0.5 + 0.5 + 0.7), 1e-9);
+    close(cpu_ms(&t, "C2", 0.5), 3.0 + 10.0 + 7.0 + 0.7 + 3.0 + 0.5, 1e-9);
+    close(cpu_ms(&t, "C4", 0.5), 0.7 + 4.0 + 0.5, 1e-9);
+    // Notifier with the orchestrator: that step runs inline
+    let t = translated(&chain(0.5, "C2", "C1", "C3", &workflow("orch", false)));
+    close(no_load_ms(&t), 71.0 - 9.0, 1e-9);
+}
+
+fn projection() -> String {
+    format!(
+        "{ROOT}ms : MicroserviceDecisions {{ }}\nms.projections -- pr\npr : Projection {{ cpuMs = 0.5 }}\n\
+         pr.reads -- Assembly_DbRead\npr.source -- Assembly_Db\npr.writers -- Backend_update_callWrite\npr.apply -- IDbRead_apply\n"
+    )
+}
+
+#[test]
+fn read_store_is_fed_by_projection() {
+    // read side with the write side: nothing changes (34 ms, all local)
+    let t = translated(&chain(0.5, "C2", "C2", "C3", &projection()));
+    close(no_load_ms(&t), 34.0, 1e-9);
+    assert!(demands_of(&Graph::new(&t.pcm), "project").is_empty());
+    // a read store of its own (C6): the write projects 0.5 ms on Backend, then applies 1 ms there
+    let t = translated(&chain(0.5, "C2", "C2", "C6", &projection()));
+    close(no_load_ms(&t), 34.5, 1e-9);
+    close(response_ms(&t.pcm), 34.5, 0.02);
+    close(cpu_ms(&t, "C2", 0.5), 10.0 + 7.0 + 3.0 + 0.5 + 4.0, 1e-9);
+    close(cpu_ms(&t, "C6", 0.5), 2.0 + 1.0, 1e-9);
+    close(cpu_ms(&t, "C3", 0.5), 2.0, 1e-9);
+}
+
+#[test]
+fn quota_runs_at_full_speed_when_idle() {
+    let quota = |n: u32, q: f64| {
+        format!(
+            "{ROOT}d : Deployable {{ cpuPerReplica = {q:?} quota = true }}\nd.container -- C2\nd.replicas -- r\nd.allowedReplicas -- r\n\
+             r : ReplicaOption {{ count = {n} }}\ndecisions.deployables -- d\ndecisions.replicaOptions -- r\n"
+        )
+    };
+    // 10 requests/s, Backend and Other on C2: 20 ms each, u = 0.2 cores
+    let t = translated(&chain(10.0, "C2", "C4", "C3", &quota(1, 0.5)));
+    let g = Graph::new(&t.pcm);
+    // speed max(0.5, 1 − 0.2 · 0.5/0.5) = 0.8; utilisation on the capacity 0.5: 0.4
+    assert_eq!(g.str_attr("C2_cpu", "processingRate").as_deref(), Some("800.0"));
+    close(t.utilisation("C2", |n| n.to_string()).unwrap(), 0.4, 1e-9);
+    // the no-load time is at full speed (34 ms), as msa's
+    close(no_load_ms(&t), 34.0, 1e-9);
+    // a limit of 2.4 cores: 3 cores at max(0.8, 1 − 0.2/3 · 0.25)
+    let t = translated(&chain(10.0, "C2", "C4", "C3", &quota(1, 2.4)));
+    let g = Graph::new(&t.pcm);
+    assert_eq!(g.num_attr("C2_cpu", "numberOfReplicas"), Some(3.0));
+    close(g.str_attr("C2_cpu", "processingRate").unwrap().parse().unwrap(), 1000.0 * (1.0 - 0.2 / 3.0 * 0.25), 1e-12);
+    close(t.utilisation("C2", |n| n.to_string()).unwrap(), 0.2 / 2.4, 1e-9);
+    // limit-speed for comparison: Backend's 20 ms at half speed: 34 + 20
+    let t = translated(&chain(10.0, "C2", "C4", "C3", &quota(1, 0.5).replace(" quota = true", "")));
+    close(no_load_ms(&t), 54.0, 1e-9);
+}
+
+#[test]
+fn a_write_publishes_once_for_all_its_copies() {
+    // Frontend's CPU action writes; Backend (C2) and Gateway (C0) keep copies of it
+    let hdd = |c: &str| {
+        format!(
+            "{c}.activeResourceSpecifications -- {c}_hdd\n{c}_hdd : ProcessingResourceSpecification {{ \
+             schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
+             processingRate = \"1000\" numberOfReplicas = 1 }}\n"
+        )
+    };
+    let mut d = chain_remote() + CHAIN_BROKER + &hdd("C0") + &hdd("C2");
+    d += "copy : LocalCopy { readDbMs = 0.3 writeCpuMs = 1.0 writeDbMs = 0.9 }\ndecisions.mechanisms -- copy\n\
+          ms : MicroserviceDecisions { }\n";
+    for (s, call, store) in [("sa", "Backend_query_callOther", "Assembly_Backend"), ("sb", "Backend_update_callNotify", "Assembly_Gateway")] {
+        d += &format!(
+            "{s} : CallSite {{ }}\n{s}.call -- {call}\n{s}.mechanism -- copy\n{s}.allowed -- copy\ndecisions.callSites -- {s}\n\
+             ms.copyFeeds -- feed_{s}\nfeed_{s} : CopyFeed {{ }}\nfeed_{s}.site -- {s}\nfeed_{s}.writers -- Frontend_handle_cpu\n\
+             feed_{s}.store -- {store}\n"
+        );
+    }
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &d));
+    let g = Graph::new(&t.pcm);
+    // one publish (the publisher's), two messages through the broker
+    assert_eq!(demands_of(&g, "publish"), vec![("CPU".into(), 0.5)]);
+    close(cpu_ms(&t, "C5", 0.5), 2.0, 1e-9);
+    // Frontend's container: 3 + 5 + 2 + 2 (its stubs) + 0.5 (one publish)
+    close(cpu_ms(&t, "C1", 0.5), 3.0 + 5.0 + 2.0 + 2.0 + 0.5, 1e-9);
+    // each copy: deliver 0.7 + write 1.0 on the holder's CPU (Gateway's container also serves
+    // Backend's read of the copy it keeps: 3 ms callee CPU)
+    close(cpu_ms(&t, "C0", 0.5), 1.0 + 2.0 + 3.0 + 0.7 + 1.0, 1e-9);
 }

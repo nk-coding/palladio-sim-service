@@ -6,6 +6,7 @@
 //! val cost = archCost()                          // from the CostModel
 //! val mq = archModularity()                      // cohesive MQ, containers as clusters (D32)
 //! val u = archUtilisation("Server1")             // offered load of a container ("" = highest)
+//! val t = archNoLoadTime("login")                // rate-weighted no-load response time, no simulation
 //! ```
 
 use crate::translate::Translation;
@@ -72,6 +73,8 @@ const STAT_PARAMS: [Param; 8] = [
 
 const UTIL_PARAMS: [Param; 1] = [p("element", Ty::String, Default::Str(""))];
 
+const NO_LOAD_PARAMS: [Param; 1] = [p("exclude", Ty::String, Default::Str(""))];
+
 struct Function {
     name: &'static str,
     params: &'static [Param],
@@ -86,6 +89,7 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "archModularity", params: &[], returns: Ty::Double, simulates: false },
     Function { name: "archUtilisation", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "archInfo", params: &[], returns: Ty::Record("ArchInfo"), simulates: false },
+    Function { name: "archNoLoadTime", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -227,7 +231,7 @@ pub fn manifest() -> Value {
         "languagePlugins": [],
         "contributionPlugins": [{
             "languageId": "script",
-            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
+            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
             "additionalKeywords": [],
             "serverContributionPlugins": [{
                 "type": "script-language-contribution",
@@ -317,6 +321,11 @@ pub async fn call(
         "archModularity" => double(translation.modularity),
         "archUtilisation" => double(translation.utilisation(&a.string("element")?, entity)?),
         "archInfo" => Ok(info(translation, next_id)),
+        "archNoLoadTime" => {
+            let excluded: Vec<String> =
+                a.string("exclude")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            double(translation.no_load_time(&excluded, entity))
+        }
         "archSimulate" => {
             let prepared = prepared.ok_or("no model")?;
             let params = a.run_params()?;

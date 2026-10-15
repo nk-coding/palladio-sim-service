@@ -35,10 +35,15 @@ pub struct ResourceLoad {
     pub replicas: f64,
     /// Expected busy replicas (Σ arrival rate × units / rate).
     pub busy: f64,
+    /// The utilisation on another basis than busy / replicas (a CPU quota: on its capacity).
+    pub capacity_basis: Option<f64>,
 }
 
 impl ResourceLoad {
     pub fn utilisation(&self) -> f64 {
+        if let Some(u) = self.capacity_basis {
+            return u;
+        }
         if self.kind == "DELAY" || self.replicas <= 0.0 { 0.0 } else { self.busy / self.replicas }
     }
 }
@@ -55,6 +60,10 @@ pub struct Loads {
     pub executions: BTreeMap<String, f64>,
     /// Arrival rate per usage scenario.
     pub arrivals: BTreeMap<String, f64>,
+    /// Expected response time per usage scenario without contention (the no-load time, in model
+    /// time units): every demand at its resource's rate, the longest branch of a synchronous
+    /// fork, nothing for asynchronous work.
+    pub times: BTreeMap<String, f64>,
     pub warnings: Vec<String>,
 }
 
@@ -542,6 +551,7 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
     let mut action_calls: BTreeMap<(String, String, String), f64> = BTreeMap::new();
     let mut executions: BTreeMap<String, f64> = BTreeMap::new();
     let mut arrivals = BTreeMap::new();
+    let mut times = BTreeMap::new();
     for sc in g.all("UsageScenario") {
         let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
         let mut walk = Walk {
@@ -592,6 +602,7 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
             _ => 0.0,
         };
         arrivals.insert(sc.clone(), rate);
+        times.insert(sc.clone(), time);
         for (spec, units) in demand {
             *busy.entry(spec).or_default() += rate * units;
         }
@@ -619,10 +630,11 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
                 rate,
                 replicas,
                 busy: if rate > 0.0 { units / rate } else { 0.0 },
+                capacity_basis: None,
             });
         }
     }
-    Loads { resources, calls, action_calls, executions, arrivals, warnings: ex.warnings }
+    Loads { resources, calls, action_calls, executions, arrivals, times, warnings: ex.warnings }
 }
 
 /// The mean of a variable-free StoEx (e.g. a processing rate), if it has one.

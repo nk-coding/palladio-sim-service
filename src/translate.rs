@@ -1,13 +1,19 @@
 //! The completion: architecture decisions (layers 2 and 3) → plain PCM (DESIGN.md §4, §5).
 //!
 //! Applied to a copy of the model, in this order:
-//! 0. layer 3: a call with a `LocalCopy` mechanism reads the copy; every feeding write sends the
-//!    copy an asynchronous message;
-//! 1. mechanisms: `AsyncCall` wraps the call in an asynchronous fork, `CachedCall` in a
-//!    probabilistic branch;
+//! 0. calls that change hands: an orchestrated `Workflow` moves its steps into the trigger's
+//!    SEFF; across containers, a `Bypass` becomes the callee's own work and its direct calls, and
+//!    a `ComposedCall` moves to its composer;
+//!    layer 3: a call with a `LocalCopy` mechanism reads the copy; every feeding write publishes
+//!    once and sends each copy an asynchronous message; a `Projection` whose read side sits
+//!    apart adds the projection to every writer;
+//! 1. mechanisms: `AsyncCall` wraps the call in an asynchronous fork (through the broker: the
+//!    stub publishes on the caller's path and forks the rest), `CachedCall` in a probabilistic
+//!    branch;
 //! 2. remote calls: a stub (with the caller) and a skeleton (with the callee) on every assembly
 //!    connector between two containers;
-//! 3. replicas: n replicas of q cores become n·⌈q⌉ cores at speed q/⌈q⌉;
+//! 3. replicas: n replicas of q cores become n·⌈q⌉ cores at speed q/⌈q⌉ (a quota: full speed
+//!    when idle, slower with load);
 //! 4. nodes: the M/M/c slowdown of each node caps the speed of its CPUs.
 //!
 //! Every step works in a fixed order (decisions and connectors by name), and generated names
@@ -36,6 +42,10 @@ pub struct Translation {
     pub warnings: Vec<String>,
     /// Whether the model had any decision to translate.
     pub translated: bool,
+    /// Per usage scenario: (arrival rate, no-load response time), both in model time units. The
+    /// no-load time is the expected-value walk of D11 on the translated model without contention:
+    /// replicas at their limit speed, a quota at full speed, no node slowdown.
+    pub no_load: BTreeMap<String, (f64, f64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +58,20 @@ pub struct NodeLoad {
 }
 
 impl Translation {
+    /// The rate-weighted mean no-load response time over the usage scenarios, leaving out those
+    /// `excluded` names (instance or entity names), in model time units.
+    pub fn no_load_time(&self, excluded: &[String], entity: impl Fn(&str) -> String) -> f64 {
+        let (mut sum, mut rate) = (0.0, 0.0);
+        for (sc, (r, time)) in &self.no_load {
+            if excluded.iter().any(|x| x == sc || *x == entity(sc)) {
+                continue;
+            }
+            sum += r * time;
+            rate += r;
+        }
+        if rate > 0.0 { sum / rate } else { 0.0 }
+    }
+
     /// Utilisation of a container (the highest of its CPU and HDD resources), a node, or, for
     /// "" or "max", the highest of all.
     pub fn utilisation(&self, element: &str, entity: impl Fn(&str) -> String) -> Result<f64, String> {
@@ -86,6 +110,38 @@ enum Mechanism {
     Async,
     Cached { hit_ratio: f64, hit_cpu_ms: f64 },
     LocalCopy { read_db_ms: f64, read_cpu_ms: f64, write_cpu_ms: f64, write_db_ms: f64 },
+    /// Across containers: made by the composer; `cache` = (hit ratio, hit CPU ms) at the composer.
+    Composed { compose_cpu_ms: f64, cache: Option<(f64, f64)> },
+    /// Across containers: the callee's own work and direct calls, made by the caller.
+    Bypass { latency_ms: f64 },
+}
+
+#[derive(Clone, Debug)]
+struct Deployable {
+    container: String,
+    replicas: f64,
+    cpu_per_replica: f64,
+    sidecar_cores: f64,
+    quota: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Workflow {
+    name: String,
+    trigger: String,
+    steps: Vec<String>,
+    /// `Some(stepCpuMs)` when orchestrated.
+    orchestrated: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct Projection {
+    name: String,
+    reads: String,
+    source: String,
+    writers: Vec<String>,
+    apply: String,
+    cpu_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -104,8 +160,12 @@ struct RemoteCalls {
 struct Decisions {
     ms_per_unit: f64,
     sites: Vec<(String, String, Mechanism)>, // (call site, call, mechanism)
+    /// call → the composer's call after which a ComposedCall makes it
+    composers: BTreeMap<String, String>,
     remote: Option<RemoteCalls>,
-    deployables: Vec<(String, f64, f64, f64)>, // (container, replicas, cpu per replica, sidecar cores)
+    deployables: Vec<Deployable>,
+    workflows: Vec<Workflow>,
+    projections: Vec<Projection>,
     nodes: Vec<(String, f64, f64, Vec<String>)>, // (name, cores, background, containers)
     cost: Option<[f64; 4]>,                  // perContainer, perCore, perReplicaOverhead, perCache
     prices: BTreeMap<String, f64>,           // container → fixed price (ContainerPrice)
@@ -124,6 +184,33 @@ fn one(g: &Graph, x: &str, feature: &str) -> Result<String, String> {
 fn sorted(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v
+}
+
+/// The caller's assembly and the providing assembly of a call, through the connector of its
+/// role from the first assembly of the caller's component.
+fn call_target(g: &Graph, call: &str) -> Option<(String, String)> {
+    let mut comp = call.to_string();
+    for _ in 0..64 {
+        comp = g.container(&comp)?;
+        if g.is_a(&comp, "BasicComponent") {
+            break;
+        }
+    }
+    let asm = sorted(g.referrers(&comp, "encapsulatedComponent")).into_iter().next()?;
+    let role = g.ref1(call, "role")?;
+    let conn = g
+        .referrers(&asm, "requiringAssemblyContext")
+        .into_iter()
+        .find(|c| g.ref1(c, "requiredRole").as_deref() == Some(role.as_str()))?;
+    Some((asm, g.ref1(&conn, "providingAssemblyContext")?))
+}
+
+/// The container an assembly is allocated to.
+fn allocated(g: &Graph, asm: &str) -> Option<String> {
+    g.referrers(asm, "assemblyContext")
+        .into_iter()
+        .find(|a| g.class(a) == "AllocationContext")
+        .and_then(|a| g.ref1(&a, "resourceContainer"))
 }
 
 impl Decisions {
@@ -156,10 +243,24 @@ impl Decisions {
                     write_cpu_ms: num(g, m, "writeCpuMs")?,
                     write_db_ms: num(g, m, "writeDbMs")?,
                 },
+                "ComposedCall" => {
+                    let cache = match g.num_attr(m, "hitRatio") {
+                        Some(h) if h > 0.0 => {
+                            if h > 1.0 {
+                                return Err(format!("{m}: hitRatio {h} is not a probability"));
+                            }
+                            Some((h, g.num_attr(m, "hitCpuMs").unwrap_or(0.0)))
+                        }
+                        _ => None,
+                    };
+                    Mechanism::Composed { compose_cpu_ms: num(g, m, "composeCpuMs")?, cache }
+                }
+                "Bypass" => Mechanism::Bypass { latency_ms: num(g, m, "latencyMs")? },
                 other => return Err(format!("{m}: unknown mechanism class {other}")),
             })
         };
         let mut sites = Vec::new();
+        let mut composers = BTreeMap::new();
         let mut seen_calls = BTreeSet::new();
         for cs in sorted(g.all("CallSite")) {
             let call = one(g, &cs, "call")?;
@@ -173,7 +274,17 @@ impl Decisions {
             if !g.refs(&cs, "allowed").contains(&m) {
                 warnings.push(format!("{cs}: mechanism {m} is not among the allowed ones"));
             }
-            sites.push((cs.clone(), call, mechanism(&m)?));
+            let mech = mechanism(&m)?;
+            match (g.ref1(&cs, "composer"), &mech) {
+                (Some(c), _) => {
+                    composers.insert(call.clone(), c);
+                }
+                (None, Mechanism::Composed { .. }) => {
+                    warnings.push(format!("{cs}: a ComposedCall needs a composer; the call stays with its caller"));
+                }
+                _ => {}
+            }
+            sites.push((cs.clone(), call, mech));
         }
         let rcs = g.all("RemoteCalls");
         if rcs.len() > 1 {
@@ -212,7 +323,43 @@ impl Decisions {
             if !(sc >= 1.0) {
                 return Err(format!("{d}: sidecarCores must be at least 1"));
             }
-            deployables.push((c, n.floor(), q, sc.floor()));
+            deployables.push(Deployable {
+                container: c,
+                replicas: n.floor(),
+                cpu_per_replica: q,
+                sidecar_cores: sc.floor(),
+                quota: g.bool_attr(&d, "quota").unwrap_or(false),
+            });
+        }
+        let mut workflows = Vec::new();
+        for w in sorted(g.all("Workflow")) {
+            let style = one(g, &w, "style")?;
+            if !g.refs(&w, "allowed").contains(&style) {
+                warnings.push(format!("{w}: style {style} is not among the allowed ones"));
+            }
+            let orchestrated = match g.class(&style) {
+                "Orchestrated" => Some(num(g, &style, "stepCpuMs")?),
+                "Choreographed" => None,
+                other => return Err(format!("{style}: unknown coordination class {other}")),
+            };
+            let steps = sorted(g.refs(&w, "steps"));
+            for s in &steps {
+                if !g.is_a(s, "ExternalCallAction") {
+                    return Err(format!("{w}: step {s} is a {}, not an ExternalCallAction", g.class(s)));
+                }
+            }
+            workflows.push(Workflow { name: w.clone(), trigger: one(g, &w, "trigger")?, steps, orchestrated });
+        }
+        let mut projections = Vec::new();
+        for p in sorted(g.all("Projection")) {
+            projections.push(Projection {
+                name: p.clone(),
+                reads: one(g, &p, "reads")?,
+                source: one(g, &p, "source")?,
+                writers: sorted(g.refs(&p, "writers")),
+                apply: one(g, &p, "apply")?,
+                cpu_ms: num(g, &p, "cpuMs")?,
+            });
         }
         let mut nodes = Vec::new();
         for n in sorted(g.all("Node")) {
@@ -248,8 +395,27 @@ impl Decisions {
                 warnings.push(format!("{p}: the component sits on {c}, which is not a candidate"));
             }
         }
-        let any = !sites.is_empty() || remote.is_some() || !deployables.is_empty() || !nodes.is_empty() || !feeds.is_empty();
-        Ok(Decisions { ms_per_unit, sites, remote, deployables, nodes, cost, prices, feeds, any })
+        let any = !sites.is_empty()
+            || remote.is_some()
+            || !deployables.is_empty()
+            || !nodes.is_empty()
+            || !feeds.is_empty()
+            || !workflows.is_empty()
+            || !projections.is_empty();
+        Ok(Decisions {
+            ms_per_unit,
+            sites,
+            composers,
+            remote,
+            deployables,
+            workflows,
+            projections,
+            nodes,
+            cost,
+            prices,
+            feeds,
+            any,
+        })
     }
 }
 
@@ -269,8 +435,31 @@ struct Builder {
     sidecars: BTreeMap<String, String>,
     replicas: HashMap<String, f64>,
     sidecar_cores: HashMap<String, f64>,
-    async_roles: BTreeSet<String>,
+    /// Required roles whose calls are messages, and how (rule 2 builds their stubs).
+    roles: BTreeMap<String, RoleKind>,
+    /// Roles created by `role_to`, by (component, interface, provider, kind).
+    wired: BTreeMap<(String, String, String, Option<RoleKind>), String>,
+    /// Assemblies that run on their caller's sidecar (publishers): connectors into them get no
+    /// stub.
+    local_assemblies: BTreeSet<String>,
+    /// Publisher assembly per container.
+    publishers: BTreeMap<String, (String, String)>,
+    /// Calls an orchestrator makes (rule 1 leaves them alone).
+    orchestrated: BTreeSet<String>,
+    /// Quota containers: (container, replicas, cpu per replica).
+    quota: Vec<(String, f64, f64)>,
     warnings: Vec<String>,
+}
+
+/// How the calls through a role travel as messages (rule 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RoleKind {
+    /// An asynchronous call: publish on the caller's path, the rest in the background.
+    Async,
+    /// A copy update in a writer's background fork, published once per write elsewhere.
+    Feed,
+    /// An orchestrated asynchronous step: request and reply through the broker, the caller waits.
+    Reply,
 }
 
 fn s(v: impl Into<String>) -> WireValue {
@@ -394,6 +583,208 @@ impl Builder {
         self.g.link(&beh, "steps", new);
         self.g.link(after, "successor", new);
         Ok(())
+    }
+
+    /// The SEFF that `action` belongs to (through loops, branches and forks).
+    fn seff_of(&self, action: &str) -> Option<String> {
+        let mut cur = action.to_string();
+        for _ in 0..64 {
+            let up = self.g.container(&cur)?;
+            if self.g.class(&up) == "ResourceDemandingSEFF" {
+                return Some(up);
+            }
+            cur = up;
+        }
+        None
+    }
+
+    /// The action of its SEFF's own chain that holds `action`: itself, or the loop, branch or fork
+    /// around it.
+    fn top_level(&self, action: &str) -> Option<String> {
+        let seff = self.seff_of(action)?;
+        let mut cur = action.to_string();
+        for _ in 0..64 {
+            let up = self.g.container(&cur)?;
+            if up == seff {
+                return Some(cur);
+            }
+            cur = up;
+        }
+        None
+    }
+
+    /// The position of `action` in its behaviour's chain (0 = the start action).
+    fn chain_index(&self, action: &str) -> usize {
+        let mut n = 0;
+        let mut cur = action.to_string();
+        while let Some(p) = self.g.ref1(&cur, "predecessor") {
+            n += 1;
+            cur = p;
+            if n > 100_000 {
+                break;
+            }
+        }
+        n
+    }
+
+    /// Takes `action` out of its behaviour; its predecessor and successor are joined.
+    fn detach(&mut self, action: &str) -> Result<(), String> {
+        let beh = self.g.container(action).ok_or_else(|| format!("{action} is in no behaviour"))?;
+        let pred = self.g.ref1(action, "predecessor");
+        let succ = self.g.ref1(action, "successor");
+        if let Some(p) = &pred {
+            self.g.unlink(p, "successor", action);
+        }
+        if let Some(n) = &succ {
+            self.g.unlink(action, "successor", n);
+        }
+        self.g.unlink(&beh, "steps", action);
+        if let (Some(p), Some(n)) = (&pred, &succ) {
+            self.g.link(p, "successor", n);
+        }
+        Ok(())
+    }
+
+    /// Inserts `actions` one after the other, right after `after`.
+    fn insert_all_after(&mut self, after: &str, actions: &[String]) -> Result<(), String> {
+        let mut prev = after.to_string();
+        for a in actions {
+            self.insert_after(&prev, a)?;
+            prev = a.clone();
+        }
+        Ok(())
+    }
+
+    /// The caller's assembly and the providing assembly of a call (through its role's connector).
+    fn target_of(&self, call: &str) -> Option<(String, String)> {
+        call_target(&self.g, call)
+    }
+
+    /// The interface a call's role requires.
+    fn interface_of(&self, call: &str) -> Result<String, String> {
+        let role = one(&self.g, call, "role")?;
+        one(&self.g, &role, "requiredInterface")
+    }
+
+    /// The role of `asm`'s component that provides `iface`.
+    fn provided_role(&self, asm: &str, iface: &str) -> Option<String> {
+        let comp = self.g.ref1(asm, "encapsulatedComponent")?;
+        sorted(self.g.refs(&comp, "providedRoles"))
+            .into_iter()
+            .find(|r| self.g.ref1(r, "providedInterface").as_deref() == Some(iface))
+    }
+
+    /// A required role of `comp` for `iface`, wired from every assembly of `comp` to `provider`:
+    /// an existing plain one when `kind` is None, else a role of its own for messages of `kind`.
+    fn role_to(&mut self, comp: &str, iface: &str, provider: &str, kind: Option<RoleKind>) -> Result<String, String> {
+        let asms = self.assemblies_of(comp);
+        if kind.is_none()
+            && let Some(asm) = asms.first()
+        {
+            for conn in sorted(self.g.referrers(asm, "requiringAssemblyContext")) {
+                if self.g.ref1(&conn, "providingAssemblyContext").as_deref() != Some(provider) {
+                    continue;
+                }
+                let Some(r) = self.g.ref1(&conn, "requiredRole") else { continue };
+                if !self.roles.contains_key(&r) && self.g.ref1(&r, "requiredInterface").as_deref() == Some(iface) {
+                    return Ok(r);
+                }
+            }
+        }
+        let key = (comp.to_string(), iface.to_string(), provider.to_string(), kind);
+        if let Some(r) = self.wired.get(&key) {
+            return Ok(r.clone());
+        }
+        let prole = self
+            .provided_role(provider, iface)
+            .ok_or_else(|| format!("{} does not provide {}", self.g.entity(provider), self.g.entity(iface)))?;
+        let r = self.role(comp, iface, false);
+        if let Some(k) = kind {
+            let label = match k {
+                RoleKind::Async => "async",
+                RoleKind::Feed => "feed",
+                RoleKind::Reply => "reply",
+            };
+            self.g.set_attr(&r, "entityName", s(format!("{}_{label}", self.g.entity(&r))));
+            self.roles.insert(r.clone(), k);
+        }
+        for asm in asms {
+            self.connector(&asm, &r, provider, &prole);
+        }
+        self.wired.insert(key, r.clone());
+        Ok(r)
+    }
+
+    /// An asynchronous fork that runs `actions` in the background.
+    fn async_fork(&mut self, base: &str, actions: &[String]) -> String {
+        let fork = self.named(base, "ForkAction", None);
+        let fb = self.named(&format!("{fork}_behaviour"), "ForkedBehaviour", None);
+        self.g.link(&fork, "asynchronousForkedBehaviours", &fb);
+        self.fill(&fb, actions);
+        fork
+    }
+
+    /// A fork that runs every sequence of `branches` at once and waits for all of them.
+    fn parallel(&mut self, base: &str, branches: &[Vec<String>]) -> String {
+        let fork = self.named(base, "ForkAction", None);
+        let sp = self.named(&format!("{fork}_join"), "SynchronisationPoint", None);
+        self.g.link(&fork, "synchronisingBehaviours", &sp);
+        for (i, br) in branches.iter().enumerate() {
+            let fb = self.named(&format!("{fork}_branch{}", i + 1), "ForkedBehaviour", None);
+            self.g.link(&sp, "synchronousForkedBehaviours", &fb);
+            self.fill(&fb, br);
+        }
+        fork
+    }
+
+    /// A cache in front of `call` (not in any behaviour): hit = `hit_units` of CPU, miss = the call.
+    fn cache_branch(&mut self, call: &str, hit_ratio: f64, hit_units: f64) -> String {
+        let branch = self.named(&format!("{call}_cache"), "BranchAction", Some("cache"));
+        let hit = self.named(&format!("{branch}_hit"), "ProbabilisticBranchTransition", Some("hit"));
+        let miss = self.named(&format!("{branch}_miss"), "ProbabilisticBranchTransition", Some("miss"));
+        self.g.set_attr(&hit, "branchProbability", WireValue::Double(hit_ratio));
+        self.g.set_attr(&miss, "branchProbability", WireValue::Double(1.0 - hit_ratio));
+        self.g.link(&branch, "branches", &hit);
+        self.g.link(&branch, "branches", &miss);
+        let hb = self.named(&format!("{hit}_body"), "ResourceDemandingBehaviour", None);
+        let mb = self.named(&format!("{miss}_body"), "ResourceDemandingBehaviour", None);
+        self.g.link(&hit, "branchBehaviour", &hb);
+        self.g.link(&miss, "branchBehaviour", &mb);
+        let work = self.internal(&hit, "cacheHit", &[("CPU", hit_units)]);
+        self.fill(&hb, &[work]);
+        self.fill(&mb, &[call.to_string()]);
+        branch
+    }
+
+    /// The container of a component's first assembly.
+    fn container_of_component(&self, comp: &str) -> Result<String, String> {
+        let asm = self.assemblies_of(comp).into_iter().next().ok_or_else(|| format!("{} is not in the system", self.g.entity(comp)))?;
+        self.container_of(&asm).ok_or_else(|| format!("{asm} is not allocated"))
+    }
+
+    /// The publisher of a container: a component on its sidecar (or on the container itself)
+    /// whose one operation is the publish CPU of a message. Returns (assembly, interface).
+    fn publisher(&mut self, container: &str, rc: &RemoteCalls) -> Result<(String, String), String> {
+        if let Some(p) = self.publishers.get(container) {
+            return Ok(p.clone());
+        }
+        let host = if rc.sidecar { self.sidecar(container)? } else { container.to_string() };
+        let label = self.g.entity(container);
+        let iface = self.named(&format!("publishing_{label}"), "OperationInterface", Some(&format!("publishing_{label}")));
+        let repo = self.repo.clone();
+        self.g.link(&repo, "interfaces", &iface);
+        let sig = self.named(&format!("{iface}_publish"), "OperationSignature", Some("publish"));
+        self.g.link(&iface, "signatures", &sig);
+        let comp = self.component(&format!("publisher_{label}"));
+        self.role(&comp, &iface, true);
+        let seff = self.seff(&comp, &sig);
+        let units = self.cpu_units(&host, rc.publish_cpu_ms)?;
+        let a = self.internal(&seff, "publish", &[("CPU", units)]);
+        self.fill(&seff, &[a]);
+        let asm = self.assembly(&comp, &host);
+        self.local_assemblies.insert(asm.clone());
+        self.publishers.insert(container.to_string(), (asm.clone(), iface.clone()));
+        Ok((asm, iface))
     }
 
     fn component(&mut self, base: &str) -> String {
@@ -612,9 +1003,24 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
     let g = Graph::new(model);
     let mut warnings = Vec::new();
     let d = Decisions::read(&g, &mut warnings)?;
-    let copies: BTreeSet<String> =
-        d.sites.iter().filter(|(_, _, m)| matches!(m, Mechanism::LocalCopy { .. })).map(|(_, call, _)| call.clone()).collect();
-    let original = load::analyse_skipping(&g, &copies);
+    // Calls that do not run their callee: local-copy reads, and bypasses across containers.
+    let mut skipped: BTreeSet<String> = BTreeSet::new();
+    for (_, call, m) in &d.sites {
+        match m {
+            Mechanism::LocalCopy { .. } => {
+                skipped.insert(call.clone());
+            }
+            Mechanism::Bypass { .. } => {
+                if let Some((a, p)) = call_target(&g, call)
+                    && allocated(&g, &a) != allocated(&g, &p)
+                {
+                    skipped.insert(call.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let original = load::analyse_skipping(&g, &skipped);
     warnings.extend(original.warnings.iter().cloned());
     let mut placement = BTreeMap::new();
     for a in g.all("AllocationContext") {
@@ -627,6 +1033,7 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
 
     if !d.any {
         let pcm = g.to_wire(|x| is_pcm(&x.class_name));
+        let no_load = original.arrivals.iter().map(|(sc, r)| (sc.clone(), (*r, original.times.get(sc).copied().unwrap_or(0.0)))).collect();
         return Ok(Translation {
             pcm,
             loads: original.clone(),
@@ -637,6 +1044,7 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
             modularity,
             warnings,
             translated: false,
+            no_load,
         });
     }
 
@@ -650,9 +1058,14 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         base_cpu: HashMap::new(),
         base_hdd: HashMap::new(),
         sidecars: BTreeMap::new(),
-        replicas: d.deployables.iter().map(|(c, n, _, _)| (c.clone(), *n)).collect(),
-        sidecar_cores: d.deployables.iter().map(|(c, _, _, s)| (c.clone(), *s)).collect(),
-        async_roles: BTreeSet::new(),
+        replicas: d.deployables.iter().map(|x| (x.container.clone(), x.replicas)).collect(),
+        sidecar_cores: d.deployables.iter().map(|x| (x.container.clone(), x.sidecar_cores)).collect(),
+        roles: BTreeMap::new(),
+        wired: BTreeMap::new(),
+        local_assemblies: BTreeSet::new(),
+        publishers: BTreeMap::new(),
+        orchestrated: BTreeSet::new(),
+        quota: Vec::new(),
         warnings,
         g,
     };
@@ -669,14 +1082,26 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
             }
         }
     }
+    workflows(&mut b, &d)?;
+    bypasses(&mut b, &d)?;
+    composed_calls(&mut b, &d)?;
     local_copies(&mut b, &d)?;
+    projections(&mut b, &d)?;
     mechanisms(&mut b, &d)?;
     if let Some(rc) = &d.remote {
         remote_calls(&mut b, rc)?;
     }
     replicas(&mut b, &d)?;
-    let nodes = nodes(&mut b, &d);
-    let loads = load::analyse(&b.g);
+    let (nodes, idle) = contention(&mut b, &d);
+    let no_load = idle.arrivals.iter().map(|(sc, r)| (sc.clone(), (*r, idle.times.get(sc).copied().unwrap_or(0.0)))).collect();
+    let mut loads = load::analyse(&b.g);
+    // A quota container's utilisation is on its capacity, n·q cores.
+    for (c, n, q) in &b.quota {
+        let full: f64 = idle.resources.iter().filter(|r| &r.container == c && r.kind == "CPU").map(|r| r.busy).sum();
+        for r in loads.resources.iter_mut().filter(|r| &r.container == c && r.kind == "CPU") {
+            r.capacity_basis = Some(full / (n * q));
+        }
+    }
     let mut warnings = b.warnings;
     for w in &loads.warnings {
         if !warnings.contains(w) {
@@ -684,7 +1109,277 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         }
     }
     let pcm = b.g.to_wire(|x| is_pcm(&x.class_name));
-    Ok(Translation { pcm, loads, calls: original.calls, placement, nodes, cost, modularity, warnings, translated: true })
+    Ok(Translation { pcm, loads, calls: original.calls, placement, nodes, cost, modularity, warnings, translated: true, no_load })
+}
+
+/// Rule 0: orchestrated workflows. The orchestrator (the trigger's component) makes every step
+/// at the end of the trigger's SEFF, as msa-sim-service does (DESIGN E8 there): per step its
+/// coordination CPU, then the step (the call with its own loop or branch); a step after the
+/// steps it follows; parallel where the steps form a forest, else level by level; all of it in
+/// the background when the first step is an asynchronous call to another container.
+fn workflows(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    let mech: HashMap<&String, &Mechanism> = d.sites.iter().map(|(_, c, m)| (c, m)).collect();
+    for w in &d.workflows {
+        let Some(step_cpu) = w.orchestrated else { continue };
+        let orch = b.g.container(&w.trigger).ok_or_else(|| format!("{}: the trigger is in no component", w.name))?;
+        let orch_c = b.container_of_component(&orch)?;
+        struct Step {
+            call: String,
+            seff: String,
+            unit: String,
+            provider: String,
+            callee: Option<String>,
+            remote: bool,
+            asynchronous: bool,
+            order: (u8, usize, String),
+        }
+        let mut steps = Vec::new();
+        for call in &w.steps {
+            let seff = b.seff_of(call).ok_or_else(|| format!("{}: step {call} is in no SEFF", w.name))?;
+            let unit = b.top_level(call).ok_or_else(|| format!("{}: step {call} is in no SEFF", w.name))?;
+            let (_, provider) = b.target_of(call).ok_or_else(|| format!("{}: step {call} has no connector", w.name))?;
+            let sig = one(&b.g, call, "calledService")?;
+            let pcomp = one(&b.g, &provider, "encapsulatedComponent")?;
+            let callee = b.g.refs(&pcomp, "serviceEffectSpecifications").into_iter().find(|x| b.g.ref1(x, "describedService").as_deref() == Some(sig.as_str()));
+            let remote = b.container_of(&provider).as_deref() != Some(orch_c.as_str());
+            let asynchronous = matches!(mech.get(call), Some(Mechanism::Async));
+            let order = (u8::from(seff != w.trigger), b.chain_index(&unit), call.clone());
+            steps.push(Step { call: call.clone(), seff, unit, provider, callee, remote, asynchronous, order });
+        }
+        steps.sort_by(|x, y| x.order.cmp(&y.order));
+        let m = steps.len();
+        // b follows a when b's call sits in the SEFF that a calls
+        let pred: Vec<Vec<usize>> =
+            (0..m).map(|i| (0..m).filter(|&j| j != i && steps[j].callee.as_deref() == Some(steps[i].seff.as_str())).collect()).collect();
+        let mut succ = vec![Vec::new(); m];
+        for (i, ps) in pred.iter().enumerate() {
+            for &j in ps {
+                succ[j].push(i);
+            }
+        }
+        let mut level = vec![usize::MAX; m];
+        let mut indeg: Vec<usize> = pred.iter().map(Vec::len).collect();
+        let mut queue: Vec<usize> = (0..m).filter(|&i| indeg[i] == 0).collect();
+        for &q in &queue {
+            level[q] = 0;
+        }
+        let mut qi = 0;
+        while qi < queue.len() {
+            let x = queue[qi];
+            qi += 1;
+            for &y in &succ[x] {
+                level[y] = if level[y] == usize::MAX { level[x] + 1 } else { level[y].max(level[x] + 1) };
+                indeg[y] -= 1;
+                if indeg[y] == 0 {
+                    queue.push(y);
+                }
+            }
+        }
+        let max_level = level.iter().filter(|&&l| l != usize::MAX).max().copied().unwrap_or(0);
+        let cyclic = level.iter().any(|&l| l == usize::MAX);
+        for l in &mut level {
+            if *l == usize::MAX {
+                *l = max_level + 1;
+            }
+        }
+        let forest = pred.iter().all(|p| p.len() <= 1) && !cyclic;
+        // take every step out of its SEFF; the orchestrator calls it
+        let units = b.cpu_units(&orch_c, step_cpu)?;
+        let mut nodes: Vec<Vec<String>> = Vec::new();
+        for st in &steps {
+            b.detach(&st.unit)?;
+            let iface = b.interface_of(&st.call)?;
+            let kind = if st.asynchronous && st.remote { Some(RoleKind::Reply) } else { None };
+            let r = b.role_to(&orch, &iface, &st.provider, kind)?;
+            b.g.set_ref(&st.call, "role", &r);
+            b.orchestrated.insert(st.call.clone());
+            let coord = b.internal(&st.unit, "coordinate", &[("CPU", units)]);
+            nodes.push(vec![coord, st.unit.clone()]);
+        }
+        let name = format!("{}_orchestration", b.g.entity(&w.trigger));
+        let roots: Vec<usize> = (0..m).filter(|&i| level[i] == 0).collect();
+        let body: Vec<String> = if forest {
+            fn sub(b: &mut Builder, i: usize, succ: &[Vec<usize>], nodes: &[Vec<String>], name: &str) -> Vec<String> {
+                let mut out = nodes[i].clone();
+                let kids: Vec<Vec<String>> = succ[i].iter().map(|&j| sub(b, j, succ, nodes, name)).collect();
+                match kids.len() {
+                    0 => {}
+                    1 => out.extend(kids.into_iter().next().unwrap()),
+                    _ => out.push(b.parallel(&format!("{name}_after_{}", b.g.entity(&nodes[i][1])), &kids)),
+                }
+                out
+            }
+            let kids: Vec<Vec<String>> = roots.iter().map(|&r| sub(b, r, &succ, &nodes, &name)).collect();
+            if kids.len() == 1 { kids.into_iter().next().unwrap() } else { vec![b.parallel(&format!("{name}_roots"), &kids)] }
+        } else {
+            let mut out = Vec::new();
+            for l in 0..=max_level + 1 {
+                let group: Vec<Vec<String>> = (0..m).filter(|&i| level[i] == l).map(|i| nodes[i].clone()).collect();
+                match group.len() {
+                    0 => {}
+                    1 => out.extend(group.into_iter().next().unwrap()),
+                    _ => out.push(b.parallel(&format!("{name}_level{l}"), &group)),
+                }
+            }
+            out
+        };
+        let in_background = roots.first().is_some_and(|&r| steps[r].asynchronous && steps[r].remote);
+        let actions = if in_background { vec![b.async_fork(&name, &body)] } else { body };
+        let stop = b
+            .g
+            .refs(&w.trigger, "steps")
+            .into_iter()
+            .find(|x| b.g.is_a(x, "StopAction"))
+            .ok_or_else(|| format!("{}: the trigger has no stop action", w.name))?;
+        let last = one(&b.g, &stop, "predecessor")?;
+        b.insert_all_after(&last, &actions)?;
+    }
+    Ok(())
+}
+
+/// Rule 0: bypasses. Across containers the caller does the callee's own CPU work, waits the
+/// latency, and makes the callee's calls into direct containers itself (msa SHARED_DB).
+fn bypasses(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    let direct: BTreeSet<String> = d.remote.as_ref().map(|r| r.direct.clone()).unwrap_or_default();
+    for (cs, call, m) in &d.sites {
+        let Mechanism::Bypass { latency_ms } = m else { continue };
+        let (caller_asm, provider) = b.target_of(call).ok_or_else(|| format!("{cs}: {call} has no connector"))?;
+        let (Some(cc), Some(pc)) = (b.container_of(&caller_asm), b.container_of(&provider)) else { continue };
+        if cc == pc {
+            continue;
+        }
+        let caller = b.component_of(call).ok_or_else(|| format!("{call} is in no component"))?;
+        let sig = one(&b.g, call, "calledService")?;
+        let pcomp = one(&b.g, &provider, "encapsulatedComponent")?;
+        let seff = b
+            .g
+            .refs(&pcomp, "serviceEffectSpecifications")
+            .into_iter()
+            .find(|x| b.g.ref1(x, "describedService").as_deref() == Some(sig.as_str()))
+            .ok_or_else(|| format!("{cs}: {} has no SEFF for {}", b.g.entity(&pcomp), b.g.entity(&sig)))?;
+        let ratio = match (b.base_cpu.get(&cc), b.base_cpu.get(&pc)) {
+            (Some(x), Some(y)) if *y > 0.0 => x / y,
+            _ => 1.0,
+        };
+        let mut work: BTreeMap<String, f64> = BTreeMap::new();
+        let mut directs = Vec::new();
+        let mut cur = b.g.refs(&seff, "steps").into_iter().find(|x| b.g.is_a(x, "StartAction"));
+        while let Some(a) = cur {
+            match b.g.class(&a) {
+                "InternalAction" => {
+                    for dm in b.g.refs(&a, "resourceDemand") {
+                        let ty = b.g.str_attr(&dm, "requiredResource").unwrap_or_else(|| "CPU".into());
+                        match b.g.str_attr(&dm, "specification").and_then(|x| load::mean_of(&x)) {
+                            Some(u) => *work.entry(ty.clone()).or_default() += if ty == "CPU" { u * ratio } else { u },
+                            None => b.warnings.push(format!("{cs}: a demand of {} depends on parameters; the bypass leaves it out", b.g.entity(&a))),
+                        }
+                    }
+                }
+                "ExternalCallAction" => {
+                    if let Some((_, t)) = b.target_of(&a)
+                        && b.container_of(&t).is_some_and(|c| direct.contains(&c))
+                    {
+                        directs.push((a.clone(), t));
+                    }
+                }
+                _ => {}
+            }
+            cur = b.g.ref1(&a, "successor");
+        }
+        let demands: Vec<(&str, f64)> = work.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let mut actions = vec![b.internal(call, "bypass", &demands)];
+        if *latency_ms > 0.0 {
+            b.ensure_delay(&cc);
+            let units = latency_ms / b.ms * b.delay_rate(&cc);
+            actions.push(b.internal(call, "bypassLatency", &[("DELAY", units)]));
+        }
+        for (a, t) in directs {
+            let iface = b.interface_of(&a)?;
+            let r = b.role_to(&caller, &iface, &t, None)?;
+            let s_ = one(&b.g, &a, "calledService")?;
+            actions.push(b.external(&format!("{call}_{}", b.g.entity(&a)), &r, &s_));
+        }
+        b.replace_in_chain(call, &actions[0])?;
+        b.insert_all_after(&actions[0].clone(), &actions[1..])?;
+        b.g.remove(call);
+    }
+    Ok(())
+}
+
+/// Rule 0: composed calls. Across containers the composer makes the call right after its own
+/// call into the caller's operation: composeCpuMs, then (with a cache) the hit branch or the
+/// call. Several composed calls after one composer call run in parallel (msa GATEWAY_JOIN).
+fn composed_calls(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    let mut groups: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+    for (cs, call, m) in &d.sites {
+        let Mechanism::Composed { compose_cpu_ms, cache } = m else { continue };
+        let Some(after) = d.composers.get(call) else { continue };
+        let (caller_asm, provider) = b.target_of(call).ok_or_else(|| format!("{cs}: {call} has no connector"))?;
+        if b.container_of(&caller_asm) == b.container_of(&provider) {
+            continue;
+        }
+        let composer = b.component_of(after).ok_or_else(|| format!("{cs}: the composer {after} is in no component"))?;
+        let cc = b.container_of_component(&composer)?;
+        let unit = b.top_level(call).ok_or_else(|| format!("{cs}: {call} is in no SEFF"))?;
+        let pred = one(&b.g, call, "predecessor")?;
+        b.detach(call)?;
+        let iface = b.interface_of(call)?;
+        let r = b.role_to(&composer, &iface, &provider, None)?;
+        b.g.set_ref(call, "role", &r);
+        let compose = b.internal(call, "compose", &[("CPU", b.cpu_units(&cc, *compose_cpu_ms)?)]);
+        let access = match cache {
+            Some((h, hit_ms)) => {
+                let units = b.cpu_units(&cc, *hit_ms)?;
+                b.cache_branch(call, *h, units)
+            }
+            None => call.clone(),
+        };
+        let seq = if &unit == call {
+            vec![compose, access]
+        } else {
+            b.insert_all_after(&pred, &[compose, access])?;
+            b.detach(&unit)?;
+            vec![unit]
+        };
+        groups.entry(after.clone()).or_default().push(seq);
+    }
+    for (after, seqs) in groups {
+        if seqs.len() == 1 {
+            b.insert_all_after(&after, &seqs[0])?;
+        } else {
+            let fork = b.parallel(&format!("{after}_compose"), &seqs);
+            b.insert_after(&after, &fork)?;
+        }
+    }
+    Ok(())
+}
+
+/// Layer 3: projections into read stores (CQRS). When the read side sits apart from the write
+/// side, every writer is followed by the projection CPU and an asynchronous call that applies
+/// the write to the read side.
+fn projections(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    for p in &d.projections {
+        let (Some(rc), Some(sc)) = (b.container_of(&p.reads), b.container_of(&p.source)) else {
+            return Err(format!("{}: its read or write side is not allocated", p.name));
+        };
+        if rc == sc {
+            continue;
+        }
+        let iface = b.g.container(&p.apply).ok_or_else(|| format!("{}: apply is in no interface", p.name))?;
+        for w in &p.writers {
+            if !(b.g.is_a(w, "ExternalCallAction") || b.g.is_a(w, "InternalAction")) {
+                return Err(format!("{}: writer {w} is a {}, not an ExternalCallAction or InternalAction", p.name, b.g.class(w)));
+            }
+            let owner = b.component_of(w).ok_or_else(|| format!("{w} is in no component"))?;
+            let oc = b.container_of_component(&owner)?;
+            let r = b.role_to(&owner, &iface, &p.reads, None)?;
+            let cpu = b.internal(w, "project", &[("CPU", b.cpu_units(&oc, p.cpu_ms)?)]);
+            let call = b.external(&format!("{w}_apply"), &r, &p.apply);
+            let fork = b.async_fork(&format!("{w}_projection"), &[call]);
+            b.insert_all_after(w, &[cpu, fork])?;
+        }
+    }
+    Ok(())
 }
 
 /// Layer 3: local copies.
@@ -695,6 +1390,7 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
     let mut roles: BTreeMap<(String, String), String> = BTreeMap::new();
     // writer → forked behaviour that sends its messages
     let mut writer_forks: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    let broker = d.remote.as_ref().is_some_and(|r| r.broker.is_some());
     for (cs, call, m) in &d.sites {
         let Mechanism::LocalCopy { read_db_ms, read_cpu_ms, write_cpu_ms, write_db_ms } = m else { continue };
         let Some((_, _, writers, store)) = d.feeds.iter().find(|f| &f.1 == cs) else {
@@ -758,27 +1454,28 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
             if owner_c.as_deref() == Some(store_c.as_str()) {
                 continue;
             }
-            let role = match roles.get(&(owner.clone(), store.clone())) {
-                Some(r) if b.async_roles.contains(r) => r.clone(),
-                _ => {
-                    let r = b.role(&owner, &iface, false);
-                    for asm_o in b.assemblies_of(&owner) {
-                        b.connector(&asm_o, &r, &asm, &prov);
-                    }
-                    b.async_roles.insert(r.clone());
-                    roles.insert((owner.clone(), store.clone()), r.clone());
-                    r
-                }
-            };
+            // Through the broker, a copy update is a message of its own (rule 2).
+            let kind = if broker { Some(RoleKind::Feed) } else { None };
+            let role = b.role_to(&owner, &iface, &asm, kind)?;
             let send = b.external(&format!("{w}_feed_{cs}"), &role, &write);
             writer_forks.entry(w.clone()).or_insert_with(|| (owner.clone(), Vec::new())).1.push(send);
         }
     }
-    for (w, (_, sends)) in writer_forks {
+    for (w, (owner, sends)) in writer_forks {
+        // One publish per write, whatever the number of copies (msa §3.5); then one message per copy.
+        let mut actions = Vec::new();
+        if broker && let Some(rc) = &d.remote {
+            let oc = b.container_of_component(&owner)?;
+            let (pasm, piface) = b.publisher(&oc, rc)?;
+            let sig = b.g.refs(&piface, "signatures").into_iter().next().ok_or("a publisher without its operation")?;
+            let r = b.role_to(&owner, &piface, &pasm, None)?;
+            actions.push(b.external(&format!("{w}_publish"), &r, &sig));
+        }
+        actions.extend(sends);
         let fork = b.named(&format!("{w}_feed"), "ForkAction", None);
         let fb = b.named(&format!("{w}_feed_async"), "ForkedBehaviour", None);
         b.g.link(&fork, "asynchronousForkedBehaviours", &fb);
-        b.fill(&fb, &sends);
+        b.fill(&fb, &actions);
         b.insert_after(&w, &fork)?;
     }
     Ok(())
@@ -787,68 +1484,43 @@ fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
 /// Rule 1: asynchronous and cached calls.
 fn mechanisms(b: &mut Builder, d: &Decisions) -> Result<(), String> {
     let broker = d.remote.as_ref().and_then(|r| r.broker.clone());
-    let mut async_roles: BTreeMap<(String, String), String> = BTreeMap::new();
+    let direct: BTreeSet<String> = d.remote.as_ref().map(|r| r.direct.clone()).unwrap_or_default();
     for (_, call, m) in &d.sites {
+        if b.orchestrated.contains(call) {
+            continue;
+        }
         match m {
-            Mechanism::Sync | Mechanism::LocalCopy { .. } => {}
+            Mechanism::Sync | Mechanism::LocalCopy { .. } | Mechanism::Composed { .. } | Mechanism::Bypass { .. } => {}
             Mechanism::Async => {
+                // Through the broker to another container: the stub publishes on the caller's
+                // path and forks the rest (rule 2), as msa-sim-service does (D6 there: E5).
+                let remote = b.target_of(call).and_then(|(a, p)| {
+                    let (ca, cp) = (b.container_of(&a)?, b.container_of(&p)?);
+                    Some(ca != cp && !direct.contains(&cp)).filter(|x| *x).map(|_| p)
+                });
+                if broker.is_some()
+                    && let Some(provider) = remote
+                {
+                    let comp = b.component_of(call).ok_or_else(|| format!("{call} is in no component"))?;
+                    let iface = b.interface_of(call)?;
+                    let r = b.role_to(&comp, &iface, &provider, Some(RoleKind::Async))?;
+                    b.g.set_ref(call, "role", &r);
+                    continue;
+                }
                 let fork = b.named(&format!("{call}_async"), "ForkAction", None);
                 let fb = b.named(&format!("{call}_async_behaviour"), "ForkedBehaviour", None);
                 b.g.link(&fork, "asynchronousForkedBehaviours", &fb);
                 b.replace_in_chain(call, &fork)?;
                 b.fill(&fb, std::slice::from_ref(call));
-                // Through the broker, an asynchronous call needs a role of its own.
-                if broker.is_some()
-                    && let Some(role) = b.g.ref1(call, "role")
-                    && let Some(comp) = b.component_of(call)
-                {
-                    let key = (comp.clone(), role.clone());
-                    let r = match async_roles.get(&key) {
-                        Some(r) => r.clone(),
-                        None => {
-                            let iface = one(&b.g, &role, "requiredInterface")?;
-                            let r = b.role(&comp, &iface, false);
-                            b.g.set_attr(&r, "entityName", s(format!("{}_async", b.g.entity(&role))));
-                            for asm in b.assemblies_of(&comp) {
-                                let conn = b
-                                    .g
-                                    .referrers(&asm, "requiringAssemblyContext")
-                                    .into_iter()
-                                    .find(|c| b.g.ref1(c, "requiredRole").as_deref() == Some(role.as_str()));
-                                if let Some(conn) = conn {
-                                    let p = one(&b.g, &conn, "providingAssemblyContext")?;
-                                    let pr = one(&b.g, &conn, "providedRole")?;
-                                    b.connector(&asm, &r, &p, &pr);
-                                }
-                            }
-                            b.async_roles.insert(r.clone());
-                            async_roles.insert(key, r.clone());
-                            r
-                        }
-                    };
-                    b.g.set_ref(call, "role", &r);
-                }
             }
             Mechanism::Cached { hit_ratio, hit_cpu_ms } => {
                 let comp = b.component_of(call).ok_or_else(|| format!("{call} is in no component"))?;
-                let asm = b.assemblies_of(&comp).into_iter().next().ok_or_else(|| format!("{} is not in the system", b.g.entity(&comp)))?;
-                let c = b.container_of(&asm).ok_or_else(|| format!("{asm} is not allocated"))?;
+                let c = b.container_of_component(&comp)?;
                 let units = b.cpu_units(&c, *hit_cpu_ms)?;
-                let branch = b.named(&format!("{call}_cache"), "BranchAction", Some("cache"));
-                let hit = b.named(&format!("{branch}_hit"), "ProbabilisticBranchTransition", Some("hit"));
-                let miss = b.named(&format!("{branch}_miss"), "ProbabilisticBranchTransition", Some("miss"));
-                b.g.set_attr(&hit, "branchProbability", WireValue::Double(*hit_ratio));
-                b.g.set_attr(&miss, "branchProbability", WireValue::Double(1.0 - hit_ratio));
-                b.g.link(&branch, "branches", &hit);
-                b.g.link(&branch, "branches", &miss);
-                let hb = b.named(&format!("{hit}_body"), "ResourceDemandingBehaviour", None);
-                let mb = b.named(&format!("{miss}_body"), "ResourceDemandingBehaviour", None);
-                b.g.link(&hit, "branchBehaviour", &hb);
-                b.g.link(&miss, "branchBehaviour", &mb);
-                b.replace_in_chain(call, &branch)?;
-                let work = b.internal(&hit, "cacheHit", &[("CPU", units)]);
-                b.fill(&hb, &[work]);
-                b.fill(&mb, std::slice::from_ref(call));
+                let pred = one(&b.g, call, "predecessor")?;
+                b.detach(call)?;
+                let branch = b.cache_branch(call, *hit_ratio, units);
+                b.insert_after(&pred, &branch)?;
             }
         }
     }
@@ -883,11 +1555,11 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
             continue;
         };
         let (Some(cr), Some(cp)) = (b.container_of(&req), b.container_of(&prov)) else { continue };
-        // co-located, reached directly, or a role no call uses (any more)
-        if cr == cp || rc.direct.contains(&cp) || b.g.referrers(&role, "role").is_empty() {
+        // co-located, reached directly, a publisher on the caller's sidecar, or a role no call uses
+        if cr == cp || rc.direct.contains(&cp) || b.local_assemblies.contains(&prov) || b.g.referrers(&role, "role").is_empty() {
             continue;
         }
-        let via_broker = b.async_roles.contains(&role) && broker.is_some();
+        let kind = b.roles.get(&role).copied();
         let iface = one(&b.g, &prole, "providedInterface")?;
         let caller_comp = one(&b.g, &req, "encapsulatedComponent")?;
         let (stub_c, skel_c) = if rc.sidecar { (b.sidecar(&cr)?, b.sidecar(&cp)?) } else { (cr.clone(), cp.clone()) };
@@ -899,34 +1571,73 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
         let skel = b.component(&format!("skeleton_{pair}"));
         let k_p = b.role(&skel, &iface, true);
         let k_r = b.role(&skel, &iface, false);
-        let s_b = match (&broker, via_broker) {
-            (Some((_, _, biface, _)), true) => Some(b.role(&stub, biface, false)),
+        let s_b = match (&broker, kind) {
+            (Some((_, _, biface, _)), Some(_)) => Some(b.role(&stub, biface, false)),
             _ => None,
         };
-        let (out_ms, in_ms) = if via_broker { (rc.publish_cpu_ms, rc.deliver_cpu_ms) } else { (rc.caller_cpu_ms, rc.callee_cpu_ms) };
-        let out_units = b.cpu_units(&stub_c, out_ms)?;
-        let in_units = b.cpu_units(&skel_c, in_ms)?;
+        let cpu = |b: &Builder, c: &str, ms: f64| b.cpu_units(c, ms);
+        let caller_units = cpu(b, &stub_c, rc.caller_cpu_ms)?;
+        let callee_units = cpu(b, &skel_c, rc.callee_cpu_ms)?;
+        let publish_out = cpu(b, &stub_c, rc.publish_cpu_ms)?;
+        let deliver_back = cpu(b, &stub_c, rc.deliver_cpu_ms)?;
+        let deliver_in = cpu(b, &skel_c, rc.deliver_cpu_ms)?;
+        let publish_back = cpu(b, &skel_c, rc.publish_cpu_ms)?;
         if rc.latency_ms > 0.0 {
             b.ensure_delay(&stub_c);
         }
         let latency_units = rc.latency_ms / b.ms * b.delay_rate(&stub_c);
         for sig in b.g.refs(&iface, "signatures") {
             let (inputs, returns) = b.forwarding(&caller_comp, &role, &sig);
-            // stub: caller CPU, (broker), latency, call on
             let seff = b.seff(&stub, &sig);
-            let mut steps = vec![b.internal(&seff, if via_broker { "publish" } else { "marshal" }, &[("CPU", out_units)])];
+            // the trip: (broker), latency, call
+            let mut trip = Vec::new();
             if let (Some(sb), Some((_, _, _, bsig))) = (&s_b, &broker) {
-                steps.push(b.external(&format!("{seff}_broker"), sb, bsig));
+                trip.push(b.external(&format!("{seff}_broker"), sb, bsig));
             }
             if latency_units > 0.0 {
-                steps.push(b.internal(&seff, "latency", &[("DELAY", latency_units)]));
+                trip.push(b.internal(&seff, "latency", &[("DELAY", latency_units)]));
             }
-            steps.extend(b.forward_call(&format!("{seff}_call"), &s_r, &sig, &inputs, &returns));
+            trip.extend(b.forward_call(&format!("{seff}_call"), &s_r, &sig, &inputs, &returns));
+            let steps = match kind {
+                // caller CPU, the trip
+                None => {
+                    let mut v = vec![b.internal(&seff, "marshal", &[("CPU", caller_units)])];
+                    v.extend(trip);
+                    v
+                }
+                // publish on the caller's path, the trip in the background
+                Some(RoleKind::Async) => {
+                    let p = b.internal(&seff, "publish", &[("CPU", publish_out)]);
+                    let f = b.async_fork(&format!("{seff}_send"), &trip);
+                    vec![p, f]
+                }
+                // published once by the writer's publisher: the trip only
+                Some(RoleKind::Feed) => trip,
+                // request and reply: publish, the trip, then the reply's broker, latency, deliver
+                Some(RoleKind::Reply) => {
+                    let mut v = vec![b.internal(&seff, "publish", &[("CPU", publish_out)])];
+                    v.extend(trip);
+                    if let (Some(sb), Some((_, _, _, bsig))) = (&s_b, &broker) {
+                        v.push(b.external(&format!("{seff}_replyBroker"), sb, bsig));
+                    }
+                    if latency_units > 0.0 {
+                        v.push(b.internal(&seff, "replyLatency", &[("DELAY", latency_units)]));
+                    }
+                    v.push(b.internal(&seff, "replyDeliver", &[("CPU", deliver_back)]));
+                    v
+                }
+            };
             b.fill(&seff, &steps);
-            // skeleton: callee CPU, call the component
+            // skeleton: callee CPU (or deliver), call the component (a reply publishes after it)
             let seff = b.seff(&skel, &sig);
-            let mut steps = vec![b.internal(&seff, if via_broker { "deliver" } else { "unmarshal" }, &[("CPU", in_units)])];
+            let mut steps = vec![match kind {
+                None => b.internal(&seff, "unmarshal", &[("CPU", callee_units)]),
+                Some(_) => b.internal(&seff, "deliver", &[("CPU", deliver_in)]),
+            }];
             steps.extend(b.forward_call(&format!("{seff}_call"), &k_r, &sig, &inputs, &returns));
+            if kind == Some(RoleKind::Reply) {
+                steps.push(b.internal(&seff, "replyPublish", &[("CPU", publish_back)]));
+            }
             b.fill(&seff, &steps);
         }
         let a_s = b.assembly(&stub, &stub_c);
@@ -942,29 +1653,37 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
     Ok(())
 }
 
-/// Rule 3: replicas with a CPU limit each.
+/// Rule 3: replicas with a CPU limit each. A quota container stays at full speed here; rule 4
+/// sets its speed from its load.
 fn replicas(b: &mut Builder, d: &Decisions) -> Result<(), String> {
-    for (c, n, q, _) in &d.deployables {
+    for x in &d.deployables {
+        let c = &x.container;
         let base = *b.base_cpu.get(c).ok_or_else(|| format!("container {} has no CPU", b.g.entity(c)))?;
+        let (n, q) = (x.replicas, x.cpu_per_replica);
         let per = q.ceil();
+        let rate = if x.quota { base } else { base * q / per };
         for r in b.g.refs(c, "activeResourceSpecifications") {
             if b.g.str_attr(&r, "activeResourceType").as_deref() != Some("CPU") {
                 continue;
             }
             b.g.set_attr(&r, "numberOfReplicas", WireValue::Int((n * per) as i32));
-            b.g.set_attr(&r, "processingRate", s(lit(base * q / per)));
+            b.g.set_attr(&r, "processingRate", s(lit(rate)));
+        }
+        if x.quota {
+            b.quota.push((c.clone(), n, q));
         }
     }
     Ok(())
 }
 
-/// Rule 4: node contention.
-fn nodes(b: &mut Builder, d: &Decisions) -> Vec<NodeLoad> {
-    if d.nodes.is_empty() {
-        return Vec::new();
-    }
+/// Rule 4: the load-dependent speeds. One load analysis of the model as rules 0 to 3 left it
+/// (replicas at their limit speed, quota containers at full speed: the no-load state, which it
+/// returns); from it the quota speed of each quota container (msa-sim-service's `quota` rule)
+/// and the slowdown of each node, which caps the speed of the node's CPUs.
+fn contention(b: &mut Builder, d: &Decisions) -> (Vec<NodeLoad>, Loads) {
     let loads = load::analyse(&b.g);
     let mut out = Vec::new();
+    let mut slowdowns: Vec<(Vec<String>, f64)> = Vec::new();
     for (name, cores, background, containers) in &d.nodes {
         let mut members: Vec<String> = containers.clone();
         for c in containers {
@@ -986,23 +1705,40 @@ fn nodes(b: &mut Builder, d: &Decisions) -> Vec<NodeLoad> {
             b.warnings.push(format!("node {name} is saturated: {u:.3} cores of work on {cores} cores"));
             slow = MAX_SLOWDOWN;
         }
-        if slow > 1.0 {
-            for c in &members {
-                let Some(base) = b.base_cpu.get(c).copied() else { continue };
-                for r in b.g.refs(c, "activeResourceSpecifications") {
-                    if b.g.str_attr(&r, "activeResourceType").as_deref() != Some("CPU") {
-                        continue;
-                    }
-                    let rate = b.g.str_attr(&r, "processingRate").and_then(|x| load::mean_of(&x)).unwrap_or(base);
-                    if base / slow < rate {
-                        b.g.set_attr(&r, "processingRate", s(lit(base / slow)));
-                    }
+        slowdowns.push((members, slow));
+        out.push(NodeLoad { name: name.clone(), cores: *cores, load: u, slowdown: slow });
+    }
+    // quota: full speed when idle, max(q', 1 − u/(n⌈q⌉) · (1 − q')/q') of it under load u
+    for (c, n, q) in b.quota.clone() {
+        let Some(base) = b.base_cpu.get(&c).copied() else { continue };
+        let u: f64 = loads.resources.iter().filter(|r| r.container == c && r.kind == "CPU").map(|r| r.busy * r.rate / base).sum();
+        let per = q.ceil();
+        let qp = q / per;
+        let speed = if qp >= 1.0 { 1.0 } else { qp.max(1.0 - u / (n * per) * (1.0 - qp) / qp) };
+        for r in b.g.refs(&c, "activeResourceSpecifications") {
+            if b.g.str_attr(&r, "activeResourceType").as_deref() == Some("CPU") {
+                b.g.set_attr(&r, "processingRate", s(lit(base * speed)));
+            }
+        }
+    }
+    for (members, slow) in slowdowns {
+        if slow <= 1.0 {
+            continue;
+        }
+        for c in &members {
+            let Some(base) = b.base_cpu.get(c).copied() else { continue };
+            for r in b.g.refs(c, "activeResourceSpecifications") {
+                if b.g.str_attr(&r, "activeResourceType").as_deref() != Some("CPU") {
+                    continue;
+                }
+                let rate = b.g.str_attr(&r, "processingRate").and_then(|x| load::mean_of(&x)).unwrap_or(base);
+                if base / slow < rate {
+                    b.g.set_attr(&r, "processingRate", s(lit(base / slow)));
                 }
             }
         }
-        out.push(NodeLoad { name: name.clone(), cores: *cores, load: u, slowdown: slow });
     }
-    out
+    (out, loads)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1022,8 +1758,8 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
             total += p;
             continue;
         }
-        let (cores, replicas) = match d.deployables.iter().find(|(x, _, _, _)| x == c) {
-            Some((_, n, q, _)) => (n * q, *n),
+        let (cores, replicas) = match d.deployables.iter().find(|x| &x.container == c) {
+            Some(x) => (x.replicas * x.cpu_per_replica, x.replicas),
             None => {
                 let cores = g
                     .refs(c, "activeResourceSpecifications")
@@ -1036,17 +1772,23 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
         };
         total += per_container + per_core * cores + per_replica * replicas;
     }
-    let caches = d.sites.iter().filter(|(_, _, m)| matches!(m, Mechanism::Cached { .. })).count();
+    let caches = d
+        .sites
+        .iter()
+        .filter(|(_, _, m)| matches!(m, Mechanism::Cached { .. } | Mechanism::Composed { cache: Some(_), .. }))
+        .count();
     total + per_cache * caches as f64
 }
 
-/// How much a call between two containers couples them, by mechanism (DESIGN §12 D32, as
-/// msa's coupling weights): a synchronous or cached call 1, a local copy 0.5, an asynchronous
-/// call 0.3. A call inside one container counts 1 whatever its mechanism.
+/// How much a call between two containers couples them, by mechanism (DESIGN §12 D32, D44, as
+/// msa's coupling weights): a bypass 2, a synchronous or cached call 1, a composed call and a
+/// local copy 0.5, an asynchronous call 0.3. A call inside one container counts 1 whatever its
+/// mechanism.
 fn coupling_weight(m: &Mechanism) -> f64 {
     match m {
+        Mechanism::Bypass { .. } => 2.0,
         Mechanism::Sync | Mechanism::Cached { .. } => 1.0,
-        Mechanism::LocalCopy { .. } => 0.5,
+        Mechanism::LocalCopy { .. } | Mechanism::Composed { .. } => 0.5,
         Mechanism::Async => 0.3,
     }
 }

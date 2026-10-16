@@ -64,6 +64,9 @@ pub struct Loads {
     /// time units): every demand at its resource's rate, the longest branch of a synchronous
     /// fork, nothing for asynchronous work.
     pub times: BTreeMap<String, f64>,
+    /// Per usage scenario, expected calls per request of every external call action: (caller,
+    /// callee, action). Only filled by `analyse_with(.., per_scenario = true)`.
+    pub scenario_calls: BTreeMap<String, BTreeMap<(String, String, String), f64>>,
     pub warnings: Vec<String>,
 }
 
@@ -251,6 +254,8 @@ struct Walk<'a, 'b> {
     executions: HashMap<String, f64>,
     /// Calls that do not reach their callee for `executions` and `action_calls` (a local copy).
     skip: &'b BTreeSet<String>,
+    /// Calls whose callee runs with this share of the caller's weight (a cache miss: 1 − hit).
+    scale: &'b HashMap<String, f64>,
     /// > 0 inside such a call.
     skipping: usize,
     random: bool,
@@ -396,7 +401,8 @@ impl Walk<'_, '_> {
                 let mut callee = Frame::default();
                 let inputs = g.refs(a, "inputVariableUsages");
                 self.bind(&inputs, frame, &mut callee);
-                let (ret, t) = self.call(&target, &sig, callee, w);
+                let wc = w * self.scale.get(a).copied().unwrap_or(1.0);
+                let (ret, t) = self.call(&target, &sig, callee, wc);
                 self.skipping -= skipped as usize;
                 // return values: evaluated against the callee's result (RETURN.*)
                 let mut ret_env = ret.clone();
@@ -544,6 +550,13 @@ pub fn analyse(g: &Graph) -> Loads {
 /// not count in `executions` and `action_calls` (the call itself does): a call that reads a local
 /// copy does not run its callee.
 pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
+    analyse_with(g, skip, &HashMap::new(), false)
+}
+
+/// As `analyse_skipping`; besides, the callee of a call in `scale` runs with that share of the
+/// caller's weight (everything below it too), and with `per_scenario` the expected calls per
+/// request of each scenario are kept (`scenario_calls`).
+pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, f64>, per_scenario: bool) -> Loads {
     let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
     let ix = Index::new(g, &mut ex);
     let mut busy: HashMap<String, f64> = HashMap::new();
@@ -552,6 +565,7 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
     let mut executions: BTreeMap<String, f64> = BTreeMap::new();
     let mut arrivals = BTreeMap::new();
     let mut times = BTreeMap::new();
+    let mut scenario_calls = BTreeMap::new();
     for sc in g.all("UsageScenario") {
         let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
         let mut walk = Walk {
@@ -563,6 +577,7 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
             action_calls: HashMap::new(),
             executions: HashMap::new(),
             skip,
+            scale,
             skipping: 0,
             random: false,
             depth: 0,
@@ -609,6 +624,9 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
         for (k, v) in sc_calls {
             *calls.entry(k).or_default() += rate * v;
         }
+        if per_scenario {
+            scenario_calls.insert(sc.clone(), sc_action_calls.iter().cloned().collect::<BTreeMap<_, _>>());
+        }
         for (k, v) in sc_action_calls {
             *action_calls.entry(k).or_default() += rate * v;
         }
@@ -634,7 +652,182 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
             });
         }
     }
-    Loads { resources, calls, action_calls, executions, arrivals, times, warnings: ex.warnings }
+    Loads { resources, calls, action_calls, executions, arrivals, times, scenario_calls, warnings: ex.warnings }
+}
+
+/// Per usage scenario: the probability that one request needs each container on its
+/// synchronous path (DESIGN.md D53, PCM reliability semantics after Brosch et al.). A SEFF marks
+/// its container; a probabilistic branch scales by its probability; a loop with at least one
+/// iteration counts once; asynchronous forked behaviours are not followed (their work is
+/// queued); synchronous forks are. A container already on the current call chain is not marked
+/// again (the callee runs only if its caller does); marks from separate calls combine as
+/// independent events, 1 − Π(1 − p). A guarded branch takes each of its n transitions with 1/n, with a warning.
+/// `fate` maps a container to the one whose fate it shares (a sidecar to its container).
+pub fn sync_dependencies(g: &Graph, fate: &HashMap<String, String>) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
+    let ix = Index::new(g, &mut ex);
+    let mut out = BTreeMap::new();
+    let mut d = Deps { ix: &ix, ex: &mut ex, fate, depth: 0, chain: Vec::new(), warned: Default::default() };
+    for sc in g.all("UsageScenario") {
+        let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
+        let mut acc = BTreeMap::new();
+        d.scenario(&beh, 1.0, &mut acc);
+        out.insert(sc.clone(), acc);
+    }
+    (out, ex.warnings)
+}
+
+struct Deps<'a, 'b> {
+    ix: &'b Index<'a>,
+    ex: &'b mut Exprs,
+    fate: &'b HashMap<String, String>,
+    depth: usize,
+    /// Containers of the calls on the current chain.
+    chain: Vec<String>,
+    warned: std::collections::HashSet<String>,
+}
+
+impl Deps<'_, '_> {
+    fn warn(&mut self, w: String) {
+        if self.warned.insert(w.clone()) {
+            self.ex.warnings.push(w);
+        }
+    }
+
+    fn mark(acc: &mut BTreeMap<String, f64>, c: &str, p: f64) {
+        let e = acc.entry(c.to_string()).or_insert(0.0);
+        *e = 1.0 - (1.0 - *e) * (1.0 - p.clamp(0.0, 1.0));
+    }
+
+    /// The probability factor of a loop body: once if it runs at least once on average.
+    fn once(&mut self, src: Option<String>) -> f64 {
+        match src.map(|s| self.ex.mean(&s)) {
+            Some(Some(k)) => k.clamp(0.0, 1.0),
+            Some(None) => {
+                self.warn("a loop count depends on parameters: its body counts once".into());
+                1.0
+            }
+            None => 1.0,
+        }
+    }
+
+    fn call(&mut self, asm: &str, sig: &str, p: f64, acc: &mut BTreeMap<String, f64>) {
+        let g = self.ix.g;
+        if self.depth > 64 || p <= 0.0 {
+            return;
+        }
+        let c = self.ix.container_of.get(asm).cloned().unwrap_or_default();
+        let c = self.fate.get(&c).cloned().unwrap_or(c);
+        if !self.chain.contains(&c) {
+            Self::mark(acc, &c, p);
+        }
+        let Some(comp) = g.ref1(asm, "encapsulatedComponent") else { return };
+        let Some(seff) = self.ix.seffs.get(&(comp, sig.to_string())).cloned() else { return };
+        self.depth += 1;
+        self.chain.push(c);
+        self.behaviour(asm, &seff, p, acc);
+        self.chain.pop();
+        self.depth -= 1;
+    }
+
+    fn behaviour(&mut self, asm: &str, beh: &str, p: f64, acc: &mut BTreeMap<String, f64>) {
+        let g = self.ix.g;
+        let steps = g.refs(beh, "steps");
+        let mut cur = steps.iter().find(|s| g.is_a(s, "StartAction")).cloned();
+        let mut n = 0;
+        while let Some(a) = cur {
+            n += 1;
+            if n > 10_000 {
+                break;
+            }
+            match g.class(&a) {
+                "ExternalCallAction" => {
+                    if let (Some(role), Some(sig)) = (g.ref1(&a, "role"), g.ref1(&a, "calledService"))
+                        && let Some(target) = self.ix.connectors.get(&(asm.to_string(), role)).cloned()
+                    {
+                        self.call(&target, &sig, p, acc);
+                    }
+                }
+                "BranchAction" => {
+                    let ts = g.refs(&a, "branches");
+                    let k = ts.len().max(1) as f64;
+                    for t in &ts {
+                        let Some(body) = g.ref1(t, "branchBehaviour") else { continue };
+                        let q = if g.class(t) == "ProbabilisticBranchTransition" {
+                            g.num_attr(t, "branchProbability").unwrap_or(0.0)
+                        } else {
+                            self.warn(format!("{}: a guarded branch counts each transition with 1/{k}", g.entity(&a)));
+                            1.0 / k
+                        };
+                        self.behaviour(asm, &body, p * q, acc);
+                    }
+                }
+                "LoopAction" => {
+                    let q = self.once(g.str_attr(&a, "iterationCount"));
+                    if let Some(body) = g.ref1(&a, "bodyBehaviour") {
+                        self.behaviour(asm, &body, p * q, acc);
+                    }
+                }
+                "CollectionIteratorAction" => {
+                    if let Some(body) = g.ref1(&a, "bodyBehaviour") {
+                        self.behaviour(asm, &body, p, acc);
+                    }
+                }
+                "ForkAction" => {
+                    for sp in g.refs(&a, "synchronisingBehaviours") {
+                        for fb in g.refs(&sp, "synchronousForkedBehaviours") {
+                            self.behaviour(asm, &fb, p, acc);
+                        }
+                    }
+                }
+                "InternalCallAction" => {
+                    if let Some(b) = g.ref1(&a, "calledResourceDemandingInternalBehaviour") {
+                        self.behaviour(asm, &b, p, acc);
+                    }
+                }
+                _ => {}
+            }
+            cur = g.ref1(&a, "successor");
+        }
+    }
+
+    fn scenario(&mut self, beh: &str, p: f64, acc: &mut BTreeMap<String, f64>) {
+        let g = self.ix.g;
+        let actions = g.refs(beh, "actions");
+        let mut cur = actions.iter().find(|s| g.is_a(s, "Start")).cloned();
+        let mut n = 0;
+        while let Some(a) = cur {
+            n += 1;
+            if n > 10_000 {
+                break;
+            }
+            match g.class(&a) {
+                "EntryLevelSystemCall" => {
+                    if let (Some(role), Some(sig)) = (g.ref1(&a, "providedRole"), g.ref1(&a, "operationSignature"))
+                        && let Some(asm) = self.ix.delegations.get(&role).cloned()
+                    {
+                        self.call(&asm, &sig, p, acc);
+                    }
+                }
+                "Branch" => {
+                    for t in g.refs(&a, "branchTransitions") {
+                        let q = g.num_attr(&t, "branchProbability").unwrap_or(0.0);
+                        if let Some(b) = g.ref1(&t, "branchedBehaviour") {
+                            self.scenario(&b, p * q, acc);
+                        }
+                    }
+                }
+                "Loop" => {
+                    let q = self.once(g.str_attr(&a, "loopIteration"));
+                    if let Some(b) = g.ref1(&a, "bodyBehaviour") {
+                        self.scenario(&b, p * q, acc);
+                    }
+                }
+                _ => {}
+            }
+            cur = g.ref1(&a, "successor");
+        }
+    }
 }
 
 /// The mean of a variable-free StoEx (e.g. a processing rate), if it has one.

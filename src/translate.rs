@@ -26,6 +26,9 @@ use crate::load::{self, Loads};
 use palladio_sim_service::protocol::{WireModel, WireValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod quality;
+pub use quality::{Quality, weighted};
+
 /// The result of translating a model.
 #[derive(Clone, Debug)]
 pub struct Translation {
@@ -50,6 +53,9 @@ pub struct Translation {
     /// Replicas of every container with a Deployable, as simulated (fixed or autoscaled at the
     /// model's own workload, D50).
     pub replicas: BTreeMap<String, f64>,
+    /// The analytic quality measures (D53–D55), as far as the model has their data.
+    pub quality: Quality,
+    pub ms_per_unit: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +108,32 @@ impl Translation {
             return Err(format!("no container or node '{element}'; known: {}", known.join(", ")));
         }
         Ok(matching.into_iter().fold(0.0, f64::max))
+    }
+
+    /// C1 (D55): Σ over the request types with a LatencyBudget of max(0, no-load time / budget − 1).
+    pub fn latency_violation(&self) -> f64 {
+        self.quality
+            .budgets
+            .iter()
+            .map(|(sc, ms)| {
+                let t = self.no_load.get(sc).map_or(0.0, |x| x.1) * self.ms_per_unit;
+                if *ms > 0.0 { (t / ms - 1.0).max(0.0) } else { 0.0 }
+            })
+            .sum()
+    }
+
+    /// C2 (D55): the highest utilisation of the PeakCapacity containers at its load factor
+    /// (offered loads scale linearly with the load), and its limit.
+    pub fn peak_utilisation(&self) -> Option<(f64, f64)> {
+        let (factor, limit, containers) = self.quality.peak.as_ref()?;
+        let u = self
+            .loads
+            .resources
+            .iter()
+            .filter(|r| r.kind != "DELAY" && containers.contains(&r.container))
+            .map(|r| r.utilisation() * factor)
+            .fold(0.0, f64::max);
+        Some((u, *limit))
     }
 
     /// Replicas of a container with a Deployable, or for "" the sum over the Deployables whose
@@ -243,6 +275,29 @@ struct Decisions {
     prices: BTreeMap<String, f64>,           // container → fixed price (ContainerPrice)
     feeds: Vec<(String, String, Vec<String>, String)>, // (feed, site, writers, store)
     any: bool,
+    /// The quality model (D53–D55): data, not decisions.
+    q: QualityData,
+}
+
+/// The data of the quality model (layer 2 `Reliability`, `ChangeUnit`, ...).
+#[derive(Clone, Debug, Default)]
+struct QualityData {
+    /// changeFailureRate, restoreHours, periodHours, processUnavailability,
+    /// serverUnavailability, tenantShare
+    reliability: Option<[f64; 6]>,
+    /// (unit, changes, assemblies)
+    units: Vec<(String, f64, Vec<String>)>,
+    contract_break: f64,
+    /// call → breakProbability of its site's mechanism
+    breaks: BTreeMap<String, f64>,
+    /// calls whose site writes
+    writes: BTreeSet<String>,
+    /// syncWriteWeight, asyncWriteWeight
+    consistency: Option<(f64, f64)>,
+    /// (scenario, budget in ms)
+    budgets: Vec<(String, f64)>,
+    /// (factor, limit, containers)
+    peak: Option<(f64, f64, Vec<String>)>,
 }
 
 fn num(g: &Graph, x: &str, key: &str) -> Result<f64, String> {
@@ -331,6 +386,7 @@ impl Decisions {
                 other => return Err(format!("{m}: unknown mechanism class {other}")),
             })
         };
+        let mut q = QualityData::read(g)?;
         let mut sites = Vec::new();
         let mut composers = BTreeMap::new();
         let mut seen_calls = BTreeSet::new();
@@ -347,6 +403,12 @@ impl Decisions {
                 warnings.push(format!("{cs}: mechanism {m} is not among the allowed ones"));
             }
             let mech = mechanism(&m)?;
+            if let Some(b) = g.num_attr(&m, "breakProbability") {
+                q.breaks.insert(call.clone(), b);
+            }
+            if g.bool_attr(&cs, "writes").unwrap_or(false) {
+                q.writes.insert(call.clone());
+            }
             match (g.ref1(&cs, "composer"), &mech) {
                 (Some(c), _) => {
                     composers.insert(call.clone(), c);
@@ -498,7 +560,51 @@ impl Decisions {
             prices,
             feeds,
             any,
+            q,
         })
+    }
+}
+
+impl QualityData {
+    fn read(g: &Graph) -> Result<QualityData, String> {
+        let first = |class: &str| g.all(class).into_iter().next();
+        let reliability = match first("Reliability") {
+            None => None,
+            Some(r) => Some([
+                num(g, &r, "changeFailureRate")?,
+                num(g, &r, "restoreHours")?,
+                num(g, &r, "periodHours")?,
+                num(g, &r, "processUnavailability")?,
+                num(g, &r, "serverUnavailability")?,
+                num(g, &r, "tenantShare")?,
+            ]),
+        };
+        if let Some(r) = &reliability
+            && !(r[2] > 0.0)
+        {
+            return Err("Reliability.periodHours must be positive".into());
+        }
+        let mut units = Vec::new();
+        for u in sorted(g.all("ChangeUnit")) {
+            units.push((u.clone(), num(g, &u, "changes")?, sorted(g.refs(&u, "components"))));
+        }
+        let contract_break = match first("ChangeCoupling") {
+            Some(c) => num(g, &c, "contractBreak")?,
+            None => 0.15,
+        };
+        let consistency = match first("Consistency") {
+            Some(c) => Some((num(g, &c, "syncWriteWeight")?, num(g, &c, "asyncWriteWeight")?)),
+            None => None,
+        };
+        let mut budgets = Vec::new();
+        for b in sorted(g.all("LatencyBudget")) {
+            budgets.push((one(g, &b, "scenario")?, num(g, &b, "ms")?));
+        }
+        let peak = match first("PeakCapacity") {
+            Some(c) => Some((num(g, &c, "factor")?, num(g, &c, "limit")?, sorted(g.refs(&c, "containers")))),
+            None => None,
+        };
+        Ok(QualityData { reliability, units, contract_break, breaks: BTreeMap::new(), writes: BTreeSet::new(), consistency, budgets, peak })
     }
 }
 
@@ -1112,6 +1218,7 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         }
     }
     let modularity = modularity(&g, &d, &original, &placement);
+    let mut quality = quality::before(&g, &d, &placement, &mut warnings);
 
     if !d.any {
         let cost = cost(&g, &d, &placement, &mut warnings);
@@ -1129,6 +1236,8 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
             translated: false,
             no_load,
             replicas: BTreeMap::new(),
+            quality,
+            ms_per_unit: d.ms_per_unit,
         });
     }
 
@@ -1196,7 +1305,22 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
     }
     let pcm = b.g.to_wire(|x| is_pcm(&x.class_name));
     let replicas = d.deployables.iter().map(|x| (x.container.clone(), x.replicas)).collect();
-    Ok(Translation { pcm, loads, calls: original.calls, placement, nodes, cost, modularity, warnings, translated: true, no_load, replicas })
+    quality::after(&mut quality, &b.g, &d, &placement, &b.sidecars, &idle, &mut warnings);
+    Ok(Translation {
+        pcm,
+        loads,
+        calls: original.calls,
+        placement,
+        nodes,
+        cost,
+        modularity,
+        warnings,
+        translated: true,
+        no_load,
+        replicas,
+        quality,
+        ms_per_unit: d.ms_per_unit,
+    })
 }
 
 /// Rule 0: orchestrated workflows. The orchestrator (the trigger's component) makes every step

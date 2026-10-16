@@ -882,3 +882,160 @@ fn autoscaler_counts_the_sidecar() {
     let bad = format!("{ROOT}d : Deployable {{ cpuPerReplica = 0.5 }}\nd.container -- C2\ndecisions.deployables -- d\n");
     assert!(translate::translate(&fixture(1.0, "C2", &bad)).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Quality measures (DESIGN D53–D55)
+
+/// Placements of the chain's components (Gateway fixed), change units and the quality model:
+/// units Frontend 10 changes, Backend + Db + DbRead 20, Other 5, Notifier 5; u = changes · 0.1 ·
+/// 1 h / 100 h, so 0.01, 0.02, 0.005, 0.005; u_proc 0.001, u_db 0.002, κ 0.5.
+fn chain_quality() -> String {
+    let mut s = chain_remote();
+    for (p, alloc, cands) in [
+        ("pf", "alloc_Frontend", "C1 C2"),
+        ("pb", "alloc_Backend", "C1 C2"),
+        ("po", "alloc_Other", "C1 C2"),
+        ("pn", "alloc_Notifier", "C4 C1"),
+        ("pdb", "alloc_Db", "C3 C6"),
+        ("pdr", "alloc_DbRead", "C3 C6"),
+    ] {
+        s += &format!("{p} : Placement {{ }}\n{p}.allocation -- {alloc}\ndecisions.placements -- {p}\n");
+        for c in cands.split(' ') {
+            s += &format!("{p}.candidates -- {c}\n");
+        }
+    }
+    for (u, n, asms) in [
+        ("uf", 10.0, "Assembly_Frontend"),
+        ("ub", 20.0, "Assembly_Backend Assembly_Db Assembly_DbRead"),
+        ("uo", 5.0, "Assembly_Other"),
+        ("un", 5.0, "Assembly_Notifier"),
+    ] {
+        s += &format!("{u} : ChangeUnit {{ changes = {n:?} }}\ndecisions.changeUnits -- {u}\n");
+        for a in asms.split(' ') {
+            s += &format!("{u}.components -- {a}\n");
+        }
+    }
+    s + "rel : Reliability { changeFailureRate = 0.1 restoreHours = 1.0 periodHours = 100.0 \
+         processUnavailability = 0.001 serverUnavailability = 0.002 tenantShare = 0.5 }\ndecisions.reliability -- rel\n\
+         cc : ChangeCoupling { contractBreak = 0.15 }\ndecisions.changeCoupling -- cc\n\
+         cons : Consistency { syncWriteWeight = 1.0 asyncWriteWeight = 1.5 }\ndecisions.consistency -- cons\n"
+}
+
+fn failure(t: &Translation) -> f64 {
+    translate::weighted(t.quality.failure.as_ref().unwrap(), &[], |n| n.to_string())
+}
+
+fn inconsistency(t: &Translation) -> f64 {
+    translate::weighted(t.quality.inconsistency.as_ref().unwrap(), &[], |n| n.to_string())
+}
+
+/// Two call sites: Frontend's update and Backend's notify, both writes; `notify` is the
+/// mechanism of the latter (m2), `query` an optional mechanism on Frontend's query (m3).
+fn write_sites(notify: &str) -> String {
+    format!(
+        "s1 : CallSite {{ writes = true }}\ns1.call -- Frontend_handle_callUpdate\ns1.mechanism -- m1\ns1.allowed -- m1\n\
+         decisions.callSites -- s1\ndecisions.mechanisms -- m1\nm1 : SyncCall {{ }}\n\
+         s2 : CallSite {{ writes = true }}\ns2.call -- Backend_update_callNotify\ns2.mechanism -- m2\ns2.allowed -- m2\n\
+         decisions.callSites -- s2\ndecisions.mechanisms -- m2\n{notify}\n"
+    )
+}
+
+fn query_site(mechanism: &str) -> String {
+    format!(
+        "s3 : CallSite {{ }}\ns3.call -- Frontend_handle_callQuery\ns3.mechanism -- m3\ns3.allowed -- m3\n\
+         decisions.callSites -- s3\ndecisions.mechanisms -- m3\n{mechanism}\n"
+    )
+}
+
+#[test]
+fn failure_share_follows_the_synchronous_path_with_shared_fate() {
+    let q = chain_quality();
+    // apart: C1 Frontend 0.001 + 0.01; C2 Backend + Other 0.001 + 0.02 + 0.005; C3 (direct) Db and
+    // DbRead of one unit 0.002 + 0.5 · 0.02; C4 Notifier 0.001 + 0.005; the gateway's C0 none
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &q));
+    let u = &t.quality.unavailability;
+    close(u["C1"], 0.011, 1e-12);
+    close(u["C2"], 0.026, 1e-12);
+    close(u["C3"], 0.012, 1e-12);
+    close(u["C4"], 0.006, 1e-12);
+    assert!(!u.contains_key("C0"));
+    let sync = 1.0 - 0.989 * 0.974 * 0.988 * 0.994;
+    close(failure(&t), sync, 1e-9);
+    // with sidecars: each shares its container's fate, the result is the same
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &q.replace("sidecar = false", "sidecar = true")));
+    close(failure(&t), sync, 1e-9);
+    // the notify asynchronous (through the broker): C4 is off the request's path
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}{CHAIN_BROKER}", write_sites("m2 : AsyncCall { }"))));
+    close(failure(&t), 1.0 - 0.989 * 0.974 * 0.988, 1e-9);
+    // a cache in front of the notify (hit 0.75): C4 is needed by a quarter of the requests
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}", write_sites("m2 : CachedCall { hitRatio = 0.75 hitCpuMs = 0.1 }"))));
+    close(failure(&t), 1.0 - 0.989 * 0.974 * 0.988 * (1.0 - 0.25 * 0.006), 1e-9);
+    // Frontend, Backend and Other in one container: one process term, the units add up
+    let t = translated(&chain(0.5, "C1", "C4", "C3", &q));
+    close(t.quality.unavailability["C1"], 0.001 + 0.01 + 0.02 + 0.005, 1e-12);
+    close(failure(&t), 1.0 - 0.964 * 0.988 * 0.994, 1e-9);
+}
+
+#[test]
+fn change_coupling_counts_containers_touched_per_change() {
+    let q = chain_quality();
+    // apart: Frontend 1 (only the fixed gateway calls it); Backend's unit 1 + 0.15 (C1 calls it;
+    // its databases are direct); Other 1 (called inside C2); Notifier 1 + 0.15 (C2 calls it)
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &q));
+    close(t.quality.change_coupling.unwrap(), (10.0 + 20.0 * 1.15 + 5.0 + 5.0 * 1.15) / 40.0, 1e-12);
+    // Frontend's query bypasses Backend (breakProbability 0.6): C1 breaks with 0.6
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}", query_site("m3 : Bypass { latencyMs = 1.0 breakProbability = 0.6 }"))));
+    close(t.quality.change_coupling.unwrap(), (10.0 + 20.0 * 1.6 + 5.0 + 5.0 * 1.15) / 40.0, 1e-12);
+    // Frontend and Backend in one container: only the Notifier is called from elsewhere
+    let t = translated(&chain(0.5, "C1", "C4", "C3", &q));
+    close(t.quality.change_coupling.unwrap(), (10.0 + 20.0 + 5.0 + 5.0 * 1.15) / 40.0, 1e-12);
+}
+
+#[test]
+fn inconsistency_counts_stale_reads_and_remote_writes() {
+    let q = chain_quality();
+    let read_store = "pr : Projection { cpuMs = 0.5 }\npr.reads -- Assembly_DbRead\npr.source -- Assembly_Db\n\
+                      pr.writers -- Backend_update_callWrite\npr.apply -- IDbRead_apply\nmicro : MicroserviceDecisions { }\nmicro.projections -- pr\n";
+    // two synchronous writes to other containers per request
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}", write_sites("m2 : SyncCall { }"))));
+    close(inconsistency(&t), 2.0, 1e-12);
+    // the notify asynchronous: 1 + 1.5
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}{CHAIN_BROKER}", write_sites("m2 : AsyncCall { }"))));
+    close(inconsistency(&t), 2.5, 1e-12);
+    // Backend with Frontend: the update stays in one container
+    let t = translated(&chain(0.5, "C1", "C4", "C3", &format!("{q}{}", write_sites("m2 : SyncCall { }"))));
+    close(inconsistency(&t), 1.0, 1e-12);
+    // a cache on the query (hit 0.75): 0.75 stale reads; with the read store apart (C6), the
+    // quarter of queries that miss reads it: + 0.25
+    let cache = query_site("m3 : CachedCall { hitRatio = 0.75 hitCpuMs = 0.1 }");
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}{cache}", write_sites("m2 : SyncCall { }"))));
+    close(inconsistency(&t), 2.75, 1e-12);
+    let t = translated(&chain(0.5, "C2", "C4", "C6", &format!("{q}{}{cache}{read_store}", write_sites("m2 : SyncCall { }"))));
+    close(inconsistency(&t), 3.0, 1e-12);
+}
+
+#[test]
+fn latency_budget_and_peak_capacity() {
+    let q = chain_quality();
+    // no-load time 70 ms (chain_baseline): a 50 ms budget is exceeded by 40 %, 100 ms is met
+    let budget = |ms: f64| format!("{q}b : LatencyBudget {{ ms = {ms:?} }}\nb.scenario -- scenario\ndecisions.latencyBudgets -- b\n");
+    close(translated(&chain(0.5, "C2", "C4", "C3", &budget(50.0))).latency_violation(), 0.4, 1e-9);
+    assert_eq!(translated(&chain(0.5, "C2", "C4", "C3", &budget(100.0))).latency_violation(), 0.0);
+    // C3 (one core) does Db.write 2 ms and DbRead.read 2 ms per request: at 2/s 0.008, at 10× 0.08;
+    // at 200× 1.6, 0.75 over the limit
+    let peak = |f: f64| format!("{q}pk : PeakCapacity {{ factor = {f:?} limit = 0.85 }}\npk.containers -- C3\ndecisions.peakCapacity -- pk\n");
+    let (u, limit) = translated(&chain(2.0, "C2", "C4", "C3", &peak(10.0))).peak_utilisation().unwrap();
+    close(u, 0.08, 1e-9);
+    assert_eq!(limit, 0.85);
+    close(translated(&chain(2.0, "C2", "C4", "C3", &peak(200.0))).peak_utilisation().unwrap().0, 1.6, 1e-9);
+}
+
+#[test]
+fn autoscaled_cost_at_a_peak_level() {
+    // O1: one level at 10× the workload, weight 1. Backend's 0.1 core becomes 1 core: 3 replicas of
+    // 0.5 at 0.7; the simulated model keeps 1 replica
+    let level = "auto.levels -- peak\npeak : LoadLevel { factor = 10.0 weight = 1.0 }\n";
+    let t = translated(&fixture(10.0, "C2", &autoscaled(0.7, "", level)));
+    assert_eq!(t.replicas_of("C2", |n| n.to_string()).unwrap(), 1.0);
+    close(t.cost, 1.2 + 3.0 * 0.7, 1e-12);
+}

@@ -8,6 +8,11 @@
 //! val u = archUtilisation("Server1")             // offered load of a container ("" = highest)
 //! val t = archNoLoadTime("login")                // rate-weighted no-load response time, no simulation
 //! val n = archReplicas()                         // replicas in use, fixed or autoscaled (D50)
+//! val f = archFailure("login")                   // share of failed requests (D53)
+//! val c = archChangeCoupling()                   // containers touched per change (D54)
+//! val i = archInconsistency("login")             // stale reads + remote writes per request (D54)
+//! val v = archLatencyViolation()                 // C1: over the latency budgets (D55)
+//! val p = archPeakViolation()                    // C2: unscaled containers over their limit at the peak (D55)
 //! ```
 
 use crate::translate::Translation;
@@ -92,6 +97,12 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "archInfo", params: &[], returns: Ty::Record("ArchInfo"), simulates: false },
     Function { name: "archNoLoadTime", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "archReplicas", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archFailure", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archChangeCoupling", params: &[], returns: Ty::Double, simulates: false },
+    Function { name: "archInconsistency", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archLatencyViolation", params: &[], returns: Ty::Double, simulates: false },
+    Function { name: "archPeakUtilisation", params: &[], returns: Ty::Double, simulates: false },
+    Function { name: "archPeakViolation", params: &[], returns: Ty::Double, simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -233,7 +244,7 @@ pub fn manifest() -> Value {
         "languagePlugins": [],
         "contributionPlugins": [{
             "languageId": "script",
-            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
+            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archFailure(), archChangeCoupling(), archInconsistency(), archLatencyViolation(), archPeakUtilisation(), archPeakViolation(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
             "additionalKeywords": [],
             "serverContributionPlugins": [{
                 "type": "script-language-contribution",
@@ -324,11 +335,22 @@ pub async fn call(
         "archUtilisation" => double(translation.utilisation(&a.string("element")?, entity)?),
         "archInfo" => Ok(info(translation, next_id)),
         "archReplicas" => double(translation.replicas_of(&a.string("element")?, entity)?),
-        "archNoLoadTime" => {
-            let excluded: Vec<String> =
-                a.string("exclude")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
-            double(translation.no_load_time(&excluded, entity))
+        "archFailure" => {
+            let per = translation.quality.failure.as_ref().ok_or("archFailure needs a Reliability in the model")?;
+            double(crate::translate::weighted(per, &excluded(&a)?, entity))
         }
+        "archChangeCoupling" => double(translation.quality.change_coupling.ok_or("archChangeCoupling needs ChangeUnits in the model")?),
+        "archInconsistency" => {
+            let per = translation.quality.inconsistency.as_ref().ok_or("archInconsistency needs a Consistency in the model")?;
+            double(crate::translate::weighted(per, &excluded(&a)?, entity))
+        }
+        "archLatencyViolation" => double(translation.latency_violation()),
+        "archPeakUtilisation" => double(translation.peak_utilisation().ok_or("archPeakUtilisation needs a PeakCapacity in the model")?.0),
+        "archPeakViolation" => {
+            let (u, limit) = translation.peak_utilisation().ok_or("archPeakViolation needs a PeakCapacity in the model")?;
+            double((u - limit).max(0.0))
+        }
+        "archNoLoadTime" => double(translation.no_load_time(&excluded(&a)?, entity)),
         "archSimulate" => {
             let prepared = prepared.ok_or("no model")?;
             let params = a.run_params()?;
@@ -347,6 +369,11 @@ pub async fn call(
         }
         _ => unreachable!(),
     }
+}
+
+/// The `exclude` argument: comma-separated scenario names.
+fn excluded(a: &Args) -> Result<Vec<String>, String> {
+    Ok(a.string("exclude")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
 }
 
 fn entity_of(t: &Translation, name: &str) -> String {

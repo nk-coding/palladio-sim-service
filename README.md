@@ -36,6 +36,11 @@ compilation 130–170 ms, simulation of 22 000 measurements 190–240 ms).
 | `archModularity()` | cohesive MQ of the call graph between the movable components, containers as clusters (D32) |
 | `archUtilisation(element = "")` | offered load: of a container (its highest resource), of `node:<name>`, or the highest of all |
 | `archReplicas(element = "")` | the replicas of a container with a `Deployable`, fixed or autoscaled; "" = the sum over those in use (D50) |
+| `archFailure(exclude = "")` | O2: the rate-weighted share of requests that fail (D53): per request, the probability that it needs each container on its synchronous path, times the container's unavailability (shared fate; `Reliability`, `ChangeUnit`) |
+| `archChangeCoupling()` | O3: containers touched per change of a `ChangeUnit`, weighted by its changes: its own deployables plus, per other deployable that calls into it, the largest break probability of those calls (D54) |
+| `archInconsistency(exclude = "")` | O4: per request, stale reads (cache hits, local-copy reads across containers, reads of a read store apart from its source) plus writes to other containers (`CallSite.writes`; weights in `Consistency`) (D54) |
+| `archLatencyViolation()` | C1: Σ over the `LatencyBudget`s of max(0, no-load time / budget − 1) (D55) |
+| `archPeakUtilisation()`, `archPeakViolation()` | C2: the highest utilisation of the `PeakCapacity` containers at its factor, and its excess over the limit (D55) |
 | `archNoLoadTime(exclude = "")` | the rate-weighted mean response time without contention over the usage scenarios (but those named in `exclude`, comma-separated), in model time units: the expected-value walk of the translated model, no simulation (DESIGN D48; static objectives) |
 | `archInfo()` | `ArchInfo`: translated or not, cost, modularity, every resource's load, warnings |
 
@@ -91,7 +96,7 @@ prints every cluster's intra and inter weight to stderr.
 
 ## Verification
 
-`cargo test --release` (27 tests; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
+`cargo test --release` (32 tests; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
 with a database, a read side, a notifier and the placeholders the P6 tests fill in):
 
 | Test | Checks |
@@ -121,6 +126,11 @@ with a database, a read side, a notifier and the placeholders the P6 tests fill 
 | `a_write_publishes_once_for_all_its_copies` | one publish for two copies, two broker messages, deliver and write per copy |
 | `autoscaler_derives_replicas_from_offered_load` | 1 core of load, 0.5-core replicas, target 0.7: 3 replicas, utilisation 2/3, the same PCM as 3 fixed replicas, cost; exactly at the target no extra replica; idle 1; target 0.5: 4; `maxReplicas` caps with a warning |
 | `autoscaler_cost_over_load_levels` | levels 0.5 × (weight 3) and 2 × (weight 1): 2 and 6 replicas, cost on their weighted mean, 3 simulated; a priced container per replica |
+| `failure_share_follows_the_synchronous_path_with_shared_fate` | the chain with four change units: unavailabilities 0.011, 0.026, 0.012 (a database server: u_db + κ·unit), 0.006; failure 1 − Π(1 − u) with everything synchronous, the same with sidecars, without the asynchronous notify's container, with a quarter of it behind a cache; one process term when three components share a container |
+| `change_coupling_counts_containers_touched_per_change` | (10·1 + 20·1.15 + 5·1 + 5·1.15)/40; a bypass with break probability 0.6; co-located callers break nothing |
+| `inconsistency_counts_stale_reads_and_remote_writes` | two remote writes 2; asynchronous 1 + 1.5; co-located 1; a cache 0.75 more; a read store apart 0.25 more for the misses |
+| `latency_budget_and_peak_capacity` | 70 ms against 50 ms: 0.4; against 100 ms: 0; peak utilisation 10 × 0.008 and 200 × 0.008 |
+| `autoscaled_cost_at_a_peak_level` | O1: cost with replicas at 10 × the load, the simulated model at 1 replica |
 | `autoscaler_counts_the_sidecar` | 3 cores of sidecar load → 5 replicas, 5 sidecar cores; a Deployable without replicas or autoscaling is an error |
 | `functions::tests` | the manifest declares every function and record |
 

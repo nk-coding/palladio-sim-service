@@ -180,6 +180,14 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
             "nodes": t.nodes.iter().map(|n| serde_json::json!({"name": n.name, "cores": n.cores, "load": n.load, "slowdown": n.slowdown})).collect::<Vec<_>>(),
             "cost": t.cost, "modularity": t.modularity, "warnings": t.warnings,
             "replicas": t.replicas.iter().map(|(c, n)| (entity(c), *n)).collect::<std::collections::BTreeMap<_, _>>(),
+            "quality": serde_json::json!({
+                "failure": t.quality.failure.as_ref().map(|m| m.iter().map(|(sc, (r, f))| serde_json::json!({"scenario": entity(sc), "rate": r, "value": f})).collect::<Vec<_>>()),
+                "inconsistency": t.quality.inconsistency.as_ref().map(|m| m.iter().map(|(sc, (r, f))| serde_json::json!({"scenario": entity(sc), "rate": r, "value": f})).collect::<Vec<_>>()),
+                "changeCoupling": t.quality.change_coupling,
+                "unavailability": t.quality.unavailability.iter().map(|(c, u)| (entity(c), *u)).collect::<std::collections::BTreeMap<_, _>>(),
+                "latencyViolation": t.latency_violation(),
+                "peak": t.peak_utilisation().map(|(u, l)| serde_json::json!({"utilisation": u, "limit": l})),
+            }),
             "noLoad": t.no_load.iter().map(|(sc, (r, time))| serde_json::json!({"scenario": entity(sc), "rate": r, "time": time})).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
@@ -230,6 +238,22 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
         println!("\nreplicas: {}", scaled.join(", "));
     }
     println!("\ncost: {}\nmodularity: {}", t.cost, t.modularity);
+    let login = vec!["login".to_string()];
+    if let Some(f) = &t.quality.failure {
+        println!("failed requests (all but login): {:.1} ppm", 1e6 * palladio_arch::translate::weighted(f, &login, |n| entity(n)));
+    }
+    if let Some(c) = t.quality.change_coupling {
+        println!("change coupling: {c}");
+    }
+    if let Some(i) = &t.quality.inconsistency {
+        println!("inconsistency exposure (all but login): {}", palladio_arch::translate::weighted(i, &login, |n| entity(n)));
+    }
+    if !t.quality.budgets.is_empty() {
+        println!("latency budget violation: {}", t.latency_violation());
+    }
+    if let Some((u, l)) = t.peak_utilisation() {
+        println!("peak utilisation of unscaled containers: {u:.3} (limit {l})");
+    }
     println!("no-load response time (rate-weighted, all scenarios): {}", t.no_load_time(&[], |x| x.to_string()));
     for w in &t.warnings {
         println!("warning: {w}");

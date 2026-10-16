@@ -13,7 +13,8 @@
 //! 2. remote calls: a stub (with the caller) and a skeleton (with the callee) on every assembly
 //!    connector between two containers;
 //! 3. replicas: n replicas of q cores become n·⌈q⌉ cores at speed q/⌈q⌉ (a quota: full speed
-//!    when idle, slower with load);
+//!    when idle, slower with load); an autoscaled Deployable first gets the smallest n that keeps
+//!    its offered load at its target utilisation (D50);
 //! 4. nodes: the M/M/c slowdown of each node caps the speed of its CPUs.
 //!
 //! Every step works in a fixed order (decisions and connectors by name), and generated names
@@ -46,6 +47,9 @@ pub struct Translation {
     /// no-load time is the expected-value walk of D11 on the translated model without contention:
     /// replicas at their limit speed, a quota at full speed, no node slowdown.
     pub no_load: BTreeMap<String, (f64, f64)>,
+    /// Replicas of every container with a Deployable, as simulated (fixed or autoscaled at the
+    /// model's own workload, D50).
+    pub replicas: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +103,20 @@ impl Translation {
         }
         Ok(matching.into_iter().fold(0.0, f64::max))
     }
+
+    /// Replicas of a container with a Deployable, or for "" the sum over the Deployables whose
+    /// container hosts a component of the model.
+    pub fn replicas_of(&self, element: &str, entity: impl Fn(&str) -> String) -> Result<f64, String> {
+        if element.is_empty() {
+            let used: BTreeSet<&String> = self.placement.values().collect();
+            return Ok(self.replicas.iter().filter(|(c, _)| used.contains(c)).map(|(_, n)| n).sum());
+        }
+        self.replicas
+            .iter()
+            .find(|(c, _)| c.as_str() == element || entity(c) == element)
+            .map(|(_, n)| *n)
+            .ok_or_else(|| format!("no container with a Deployable named '{element}'"))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -119,10 +137,64 @@ enum Mechanism {
 #[derive(Clone, Debug)]
 struct Deployable {
     container: String,
+    /// Replicas at the model's own workload: fixed, or set by the autoscaler (D50).
     replicas: f64,
     cpu_per_replica: f64,
     sidecar_cores: f64,
     quota: bool,
+    autoscale: Option<Autoscale>,
+    /// (weight, replicas) per load level, for the cost: one level of weight 1 unless autoscaled.
+    levels: Vec<(f64, f64)>,
+}
+
+/// An ideal autoscaler (D50).
+#[derive(Clone, Debug)]
+struct Autoscale {
+    target: f64,
+    max: Option<f64>,
+    /// (factor, weight) per load level; the model's workload alone when none is given.
+    levels: Vec<(f64, f64)>,
+}
+
+impl Autoscale {
+    fn read(g: &Graph, a: &str) -> Result<Autoscale, String> {
+        let target = num(g, a, "targetUtilisation")?;
+        if !(target > 0.0 && target <= 1.0) {
+            return Err(format!("{a}: targetUtilisation {target} must be in (0, 1]"));
+        }
+        let max = g.num_attr(a, "maxReplicas");
+        if let Some(m) = max
+            && m < 1.0
+        {
+            return Err(format!("{a}: maxReplicas must be at least 1"));
+        }
+        let mut levels = Vec::new();
+        for l in sorted(g.refs(a, "levels")) {
+            let (f, w) = (num(g, &l, "factor")?, num(g, &l, "weight")?);
+            if !(f > 0.0) || !(w >= 0.0) {
+                return Err(format!("{l}: needs a positive factor and a weight of at least 0"));
+            }
+            levels.push((f, w));
+        }
+        if levels.is_empty() {
+            levels.push((1.0, 1.0));
+        }
+        if !(levels.iter().map(|x| x.1).sum::<f64>() > 0.0) {
+            return Err(format!("{a}: the weights of its levels sum to 0"));
+        }
+        Ok(Autoscale { target, max: max.map(f64::floor), levels })
+    }
+
+    /// The smallest replica count n ≥ 1 with f·u/(n·q) ≤ target and f·u_s/(n·s) ≤ target, capped
+    /// at maxReplicas; whether it was capped.
+    fn count(&self, f: f64, u: f64, q: f64, us: f64, s: f64) -> (f64, bool) {
+        let need = (f * u / (q * self.target)).max(f * us / (s * self.target));
+        let n = (need - 1e-9).ceil().max(1.0);
+        match self.max {
+            Some(m) if n > m => (m, true),
+            _ => (n, false),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -310,11 +382,20 @@ impl Decisions {
             if !seen.insert(c.clone()) {
                 return Err(format!("container {c} has two Deployables"));
             }
-            let opt = one(g, &d, "replicas")?;
-            if !g.refs(&d, "allowedReplicas").contains(&opt) {
-                warnings.push(format!("{d}: replica option {opt} is not among the allowed ones"));
-            }
-            let n = num(g, &opt, "count")?;
+            let autoscale = match g.ref1(&d, "autoscaling") {
+                Some(a) => Some(Autoscale::read(g, &a)?),
+                None => None,
+            };
+            let n = match (&autoscale, g.ref1(&d, "replicas")) {
+                (Some(_), _) => 1.0,
+                (None, Some(opt)) => {
+                    if !g.refs(&d, "allowedReplicas").contains(&opt) {
+                        warnings.push(format!("{d}: replica option {opt} is not among the allowed ones"));
+                    }
+                    num(g, &opt, "count")?
+                }
+                (None, None) => return Err(format!("{d}: needs replicas or an autoscaling")),
+            };
             let q = num(g, &d, "cpuPerReplica")?;
             if n < 1.0 || !(q > 0.0) {
                 return Err(format!("{d}: needs at least one replica and a positive cpuPerReplica"));
@@ -329,6 +410,8 @@ impl Decisions {
                 cpu_per_replica: q,
                 sidecar_cores: sc.floor(),
                 quota: g.bool_attr(&d, "quota").unwrap_or(false),
+                autoscale,
+                levels: vec![(1.0, n.floor())],
             });
         }
         let mut workflows = Vec::new();
@@ -1002,7 +1085,7 @@ const MAX_SLOWDOWN: f64 = 1000.0;
 pub fn translate(model: &WireModel) -> Result<Translation, String> {
     let g = Graph::new(model);
     let mut warnings = Vec::new();
-    let d = Decisions::read(&g, &mut warnings)?;
+    let mut d = Decisions::read(&g, &mut warnings)?;
     // Calls that do not run their callee: local-copy reads, and bypasses across containers.
     let mut skipped: BTreeSet<String> = BTreeSet::new();
     for (_, call, m) in &d.sites {
@@ -1029,9 +1112,9 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         }
     }
     let modularity = modularity(&g, &d, &original, &placement);
-    let cost = cost(&g, &d, &placement, &mut warnings);
 
     if !d.any {
+        let cost = cost(&g, &d, &placement, &mut warnings);
         let pcm = g.to_wire(|x| is_pcm(&x.class_name));
         let no_load = original.arrivals.iter().map(|(sc, r)| (sc.clone(), (*r, original.times.get(sc).copied().unwrap_or(0.0)))).collect();
         return Ok(Translation {
@@ -1045,6 +1128,7 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
             warnings,
             translated: false,
             no_load,
+            replicas: BTreeMap::new(),
         });
     }
 
@@ -1091,6 +1175,8 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
     if let Some(rc) = &d.remote {
         remote_calls(&mut b, rc)?;
     }
+    autoscale(&mut b, &mut d);
+    let cost = cost(&b.g, &d, &placement, &mut b.warnings);
     replicas(&mut b, &d)?;
     let (nodes, idle) = contention(&mut b, &d);
     let no_load = idle.arrivals.iter().map(|(sc, r)| (sc.clone(), (*r, idle.times.get(sc).copied().unwrap_or(0.0)))).collect();
@@ -1109,7 +1195,8 @@ pub fn translate(model: &WireModel) -> Result<Translation, String> {
         }
     }
     let pcm = b.g.to_wire(|x| is_pcm(&x.class_name));
-    Ok(Translation { pcm, loads, calls: original.calls, placement, nodes, cost, modularity, warnings, translated: true, no_load })
+    let replicas = d.deployables.iter().map(|x| (x.container.clone(), x.replicas)).collect();
+    Ok(Translation { pcm, loads, calls: original.calls, placement, nodes, cost, modularity, warnings, translated: true, no_load, replicas })
 }
 
 /// Rule 0: orchestrated workflows. The orchestrator (the trigger's component) makes every step
@@ -1653,6 +1740,48 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
     Ok(())
 }
 
+/// Rule 3a (D50): the replica count of every autoscaled Deployable, from the offered load of the
+/// model as rules 0 to 2 left it (full-speed cores, so the speeds of rules 3 and 4 do not
+/// matter): the smallest n ≥ 1 that keeps its CPU, and its sidecar's, at most at the target
+/// utilisation, at the model's workload (simulated) and at every load level (cost). Sidecars,
+/// created by rule 2 with one replica, get their cores for n replicas.
+fn autoscale(b: &mut Builder, d: &mut Decisions) {
+    if !d.deployables.iter().any(|x| x.autoscale.is_some()) {
+        return;
+    }
+    let loads = load::analyse(&b.g);
+    let work = |c: &str| -> f64 {
+        let Some(base) = b.base_cpu.get(c).copied() else { return 0.0 };
+        loads.resources.iter().filter(|r| r.container == c && r.kind == "CPU").map(|r| r.busy * r.rate / base).sum()
+    };
+    let mut updates = Vec::new();
+    for x in d.deployables.iter_mut() {
+        let Some(a) = &x.autoscale else { continue };
+        let u = work(&x.container);
+        let sidecar = b.sidecars.get(&x.container).cloned();
+        let us = sidecar.as_deref().map(work).unwrap_or(0.0);
+        let (n, capped) = a.count(1.0, u, x.cpu_per_replica, us, x.sidecar_cores);
+        if capped {
+            b.warnings.push(format!(
+                "{}: the autoscaler would need more than {n} replicas (maxReplicas) for {u:.3} cores of load",
+                b.g.entity(&x.container)
+            ));
+        }
+        x.replicas = n;
+        x.levels = a.levels.iter().map(|&(f, w)| (w, a.count(f, u, x.cpu_per_replica, us, x.sidecar_cores).0)).collect();
+        updates.push((x.container.clone(), n, sidecar, x.sidecar_cores));
+    }
+    for (c, n, sidecar, cores) in updates {
+        b.replicas.insert(c, n);
+        let Some(sc) = sidecar else { continue };
+        for r in b.g.refs(&sc, "activeResourceSpecifications") {
+            if b.g.str_attr(&r, "activeResourceType").as_deref() == Some("CPU") {
+                b.g.set_attr(&r, "numberOfReplicas", WireValue::Int((n * cores) as i32));
+            }
+        }
+    }
+}
+
 /// Rule 3: replicas with a CPU limit each. A quota container stays at full speed here; rule 4
 /// sets its speed from its load.
 fn replicas(b: &mut Builder, d: &Decisions) -> Result<(), String> {
@@ -1754,12 +1883,21 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
     let used: BTreeSet<&String> = placement.values().collect();
     let mut total = 0.0;
     for c in used {
+        let deployable = d.deployables.iter().find(|x| &x.container == c);
+        // replicas: the weighted mean over the load levels (D50); 1 without a Deployable
+        let mean_replicas = deployable.map(|x| {
+            let w: f64 = x.levels.iter().map(|l| l.0).sum();
+            x.levels.iter().map(|(wi, n)| wi * n).sum::<f64>() / w
+        });
         if let Some(p) = d.prices.get(c) {
-            total += p;
+            total += p * mean_replicas.unwrap_or(1.0);
             continue;
         }
-        let (cores, replicas) = match d.deployables.iter().find(|x| &x.container == c) {
-            Some(x) => (x.replicas * x.cpu_per_replica, x.replicas),
+        let (cores, replicas) = match deployable {
+            Some(x) => {
+                let n = mean_replicas.unwrap_or(x.replicas);
+                (n * x.cpu_per_replica, n)
+            }
             None => {
                 let cores = g
                     .refs(c, "activeResourceSpecifications")

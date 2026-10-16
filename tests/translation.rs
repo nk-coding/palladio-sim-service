@@ -489,8 +489,8 @@ fn sidecar_cores_per_replica() {
 fn container_prices_replace_the_cost_rule() {
     let priced = everything() + "cost.prices -- price\nprice : ContainerPrice { price = 7.0 }\nprice.containers -- C2\n";
     let t = translated(&fixture(2.0, "C2", &priced));
-    // C1 by the rule: 10 + 5 × 1 core + 1; C2 priced 7; one cache: 2
-    close(t.cost, 16.0 + 7.0 + 2.0, 1e-12);
+    // C1 by the rule: 10 + 5 × 1 core + 1; C2 priced 7 per replica, 2 replicas (D50); one cache: 2
+    close(t.cost, 16.0 + 2.0 * 7.0 + 2.0, 1e-12);
     // a priced container that hosts nothing costs nothing
     let t = translated(&fixture(2.0, "C1", &priced));
     close(t.cost, 16.0 + 2.0, 1e-12);
@@ -814,4 +814,71 @@ fn a_write_publishes_once_for_all_its_copies() {
     // each copy: deliver 0.7 + write 1.0 on the holder's CPU (Gateway's container also serves
     // Backend's read of the copy it keeps: 3 ms callee CPU)
     close(cpu_ms(&t, "C0", 0.5), 1.0 + 2.0 + 3.0 + 0.7 + 1.0, 1e-9);
+}
+
+/// C2 autoscaled at `target` with 0.5-core replicas; `extra` goes into the Autoscaling.
+fn autoscaled(target: f64, attrs: &str, extra: &str) -> String {
+    format!(
+        "{ROOT}d : Deployable {{ cpuPerReplica = 0.5 }}\nd.container -- C2\nd.autoscaling -- auto\ndecisions.deployables -- d\n\
+         auto : Autoscaling {{ targetUtilisation = {target:?} {attrs} }}\ndecisions.autoscalings -- auto\n{extra}\
+         cost : CostModel {{ perContainer = 0.0 perCore = 1.0 perReplicaOverhead = 0.2 perCache = 0.0 }}\ndecisions.costModel -- cost\n"
+    )
+}
+
+#[test]
+fn autoscaler_derives_replicas_from_offered_load() {
+    let replicas = |t: &Translation| t.replicas_of("C2", |n| n.to_string()).unwrap();
+    // Backend does 10 ms per request: λ = 100/s is 1.0 core of load; 0.5-core replicas at 0.7
+    // need 1.0 / 0.35 = 2.86, so 3 replicas, at a utilisation of 1.0 / 1.5
+    let t = translated(&fixture(100.0, "C2", &autoscaled(0.7, "", "")));
+    assert_eq!(replicas(&t), 3.0);
+    close(t.utilisation("C2", |n| n.to_string()).unwrap(), 1.0 / 1.5, 1e-9);
+    // it simulates exactly as three fixed replicas
+    let fixed = translated(&fixture(100.0, "C2", &deploy(3, 0.5)));
+    assert_eq!(canonical(&t.pcm), canonical(&fixed.pcm));
+    // cost: C1 (no Deployable) 1 core + 0.2; C2 3 × (0.5 + 0.2)
+    close(t.cost, 1.2 + 3.0 * 0.7, 1e-12);
+    // the smallest count: exactly at the target needs no extra replica; idle keeps one
+    assert_eq!(replicas(&translated(&fixture(35.0, "C2", &autoscaled(0.7, "", "")))), 1.0);
+    assert_eq!(replicas(&translated(&fixture(70.0, "C2", &autoscaled(0.7, "", "")))), 2.0);
+    assert_eq!(replicas(&translated(&fixture(0.5, "C2", &autoscaled(0.7, "", "")))), 1.0);
+    // the target matters: at 0.5, 1.0 / 0.25 = 4
+    assert_eq!(replicas(&translated(&fixture(100.0, "C2", &autoscaled(0.5, "", "")))), 4.0);
+    // archReplicas without a name: the Deployables in use (C1 has none)
+    assert_eq!(t.replicas_of("", |n| n.to_string()).unwrap(), 3.0);
+    // maxReplicas caps the count, with a warning
+    let t = translated(&fixture(100.0, "C2", &autoscaled(0.7, "maxReplicas = 2", "")));
+    assert_eq!(replicas(&t), 2.0);
+    assert!(t.warnings.iter().any(|w| w.contains("maxReplicas")), "{:?}", t.warnings);
+}
+
+#[test]
+fn autoscaler_cost_over_load_levels() {
+    // levels: half the load 3/4 of the time (1.43 → 2 replicas), twice the load 1/4 (5.71 → 6);
+    // simulated at the model's own workload (3 replicas), cost on the weighted mean of 3 replicas
+    let levels = "auto.levels -- low\nlow : LoadLevel { factor = 0.5 weight = 3.0 }\n\
+                  auto.levels -- high\nhigh : LoadLevel { factor = 2.0 weight = 1.0 }\n";
+    let t = translated(&fixture(100.0, "C2", &autoscaled(0.7, "", levels)));
+    assert_eq!(t.replicas_of("C2", |n| n.to_string()).unwrap(), 3.0);
+    close(t.cost, 1.2 + (3.0 * 2.0 + 6.0) / 4.0 * 0.7, 1e-12);
+    // with a ContainerPrice, the price counts per replica
+    let priced = autoscaled(0.7, "", levels) + "cost.prices -- price\nprice : ContainerPrice { price = 2.0 }\nprice.containers -- C2\n";
+    close(translated(&fixture(100.0, "C2", &priced)).cost, 1.2 + 2.0 * 3.0, 1e-12);
+}
+
+#[test]
+fn autoscaler_counts_the_sidecar() {
+    // 30 ms of callee CPU on C2's sidecar at 100/s: 3 cores, so 3 / 0.7 → 5 replicas of one
+    // sidecar core, more than the CPU's 3; the sidecar gets 5 cores, the CPU 5 replicas
+    let decisions = format!("{}{}", remote(2.0, 30.0, 4.0).replace("sidecar = false", "sidecar = true"), autoscaled(0.7, "", "").replace(ROOT, ""));
+    let t = translated(&fixture(100.0, "C2", &decisions));
+    let g = Graph::new(&t.pcm);
+    assert_eq!(t.replicas_of("C2", |n| n.to_string()).unwrap(), 5.0);
+    assert_eq!(g.num_attr("C2_sidecar_cpu", "numberOfReplicas"), Some(5.0));
+    assert_eq!(g.num_attr("C2_cpu", "numberOfReplicas"), Some(5.0));
+    // C1 has no Deployable: one replica, one sidecar core
+    assert_eq!(g.num_attr("C1_sidecar_cpu", "numberOfReplicas"), Some(1.0));
+    // a Deployable without replicas and without autoscaling is an error
+    let bad = format!("{ROOT}d : Deployable {{ cpuPerReplica = 0.5 }}\nd.container -- C2\ndecisions.deployables -- d\n");
+    assert!(translate::translate(&fixture(1.0, "C2", &bad)).is_err());
 }

@@ -35,6 +35,7 @@ compilation 130–170 ms, simulation of 22 000 measurements 190–240 ms).
 | `archCost()` | cost from the `CostModel` (DESIGN §12 D13; `ContainerPrice`s, D22) |
 | `archModularity()` | cohesive MQ of the call graph between the movable components, containers as clusters (D32) |
 | `archUtilisation(element = "")` | offered load: of a container (its highest resource), of `node:<name>`, or the highest of all |
+| `archReplicas(element = "")` | the replicas of a container with a `Deployable`, fixed or autoscaled; "" = the sum over those in use (D50) |
 | `archNoLoadTime(exclude = "")` | the rate-weighted mean response time without contention over the usage scenarios (but those named in `exclude`, comma-separated), in model time units: the expected-value walk of the translated model, no simulation (DESIGN D48; static objectives) |
 | `archInfo()` | `ArchInfo`: translated or not, cost, modularity, every resource's load, warnings |
 
@@ -69,6 +70,7 @@ Applied to a copy of the model, in this order (`src/translate.rs`):
 | 1 | `AsyncCall` | the call inside a `ForkAction` with an asynchronous forked behaviour; through the broker to another container, no fork here: the stub publishes on the caller's path and forks the rest (D43) |
 | 1 | `CachedCall` | a probabilistic branch: hit = CPU `hitCpuMs` on the caller, miss = the call |
 | 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller and a skeleton with the callee; one SEFF per signature, forwarding parameters and return values. Plain call: caller CPU, latency, call / callee CPU, call. Asynchronous: publish, then broker, latency, call in the background / deliver, call. Copy update: broker, latency, call / deliver, call. Orchestrated request: publish, broker, latency, call, broker, latency, deliver / deliver, call, publish (D43). Connectors into a `direct` container are left alone (D19); a sidecar has `sidecarCores` per replica (D20) |
+| 3a | `Deployable.autoscaling` → `Autoscaling` | n = the smallest count ≥ 1 with u/(n·q) ≤ `targetUtilisation` and u_s/(n·sidecarCores) ≤ target, u and u_s the CPU loads of the container and its sidecar (full-speed cores, one walk after rule 2), capped at `maxReplicas`; the sidecar gets n·sidecarCores cores; per `LoadLevel` the same with the load × factor, for the cost's weighted mean (D50) |
 | 3 | `Deployable` | n replicas of q cores: `numberOfReplicas` = n·⌈q⌉, `processingRate` × q/⌈q⌉ (limit-speed); with `quota`, full speed here |
 | 4 | `Deployable.quota`, `Node` | one load analysis (its walk gives the no-load times); a quota container runs at max(q′, 1 − u/(n⌈q⌉)·(1 − q′)/q′) of full speed (D45); node slowdown s = 1 + C(c, U)/(c − U) from the node's CPU load U; every CPU on the node runs at most at 1/s of full speed |
 
@@ -89,7 +91,7 @@ prints every cluster's intra and inter weight to stderr.
 
 ## Verification
 
-`cargo test --release` (24 tests; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
+`cargo test --release` (27 tests; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
 with a database, a read side, a notifier and the placeholders the P6 tests fill in):
 
 | Test | Checks |
@@ -117,6 +119,9 @@ with a database, a read side, a notifier and the placeholders the P6 tests fill 
 | `read_store_is_fed_by_projection` | nothing while the read side sits with the write side; apart: +0.5 ms projection, apply load on the read store |
 | `quota_runs_at_full_speed_when_idle` | quota speed 0.8 at u = 0.2 (q 0.5) and 1 − 0.2/3·0.25 (q 2.4), utilisation on the capacity, no-load time at full speed |
 | `a_write_publishes_once_for_all_its_copies` | one publish for two copies, two broker messages, deliver and write per copy |
+| `autoscaler_derives_replicas_from_offered_load` | 1 core of load, 0.5-core replicas, target 0.7: 3 replicas, utilisation 2/3, the same PCM as 3 fixed replicas, cost; exactly at the target no extra replica; idle 1; target 0.5: 4; `maxReplicas` caps with a warning |
+| `autoscaler_cost_over_load_levels` | levels 0.5 × (weight 3) and 2 × (weight 1): 2 and 6 replicas, cost on their weighted mean, 3 simulated; a priced container per replica |
+| `autoscaler_counts_the_sidecar` | 3 cores of sidecar load → 5 replicas, 5 sidecar cores; a Deployable without replicas or autoscaling is an error |
 | `functions::tests` | the manifest declares every function and record |
 
 In the workbench, `scripts/evaluate.fn` `report()` gives the same numbers as `eval` on the

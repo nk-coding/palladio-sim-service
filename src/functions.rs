@@ -7,6 +7,7 @@
 //! val mq = archModularity()                      // cohesive MQ, containers as clusters (D32)
 //! val u = archUtilisation("Server1")             // offered load of a container ("" = highest)
 //! val t = archNoLoadTime("login")                // rate-weighted no-load response time, no simulation
+//! val n = archReplicas()                         // replicas in use, fixed or autoscaled (D50)
 //! ```
 
 use crate::translate::Translation;
@@ -90,6 +91,7 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "archUtilisation", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "archInfo", params: &[], returns: Ty::Record("ArchInfo"), simulates: false },
     Function { name: "archNoLoadTime", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archReplicas", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -231,7 +233,7 @@ pub fn manifest() -> Value {
         "languagePlugins": [],
         "contributionPlugins": [{
             "languageId": "script",
-            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
+            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
             "additionalKeywords": [],
             "serverContributionPlugins": [{
                 "type": "script-language-contribution",
@@ -321,6 +323,7 @@ pub async fn call(
         "archModularity" => double(translation.modularity),
         "archUtilisation" => double(translation.utilisation(&a.string("element")?, entity)?),
         "archInfo" => Ok(info(translation, next_id)),
+        "archReplicas" => double(translation.replicas_of(&a.string("element")?, entity)?),
         "archNoLoadTime" => {
             let excluded: Vec<String> =
                 a.string("exclude")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();

@@ -8,6 +8,7 @@
 
 use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
 use palladio_sim_service::schema::{PropKind, Schema, schema};
+use simoxide_model::meta::prelude::PcmClass;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]

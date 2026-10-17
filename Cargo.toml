@@ -25,6 +25,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# SimuLizar-exact simulation (palladio-sim-service's `exact`): local use only, a build with it
+# must not be distributed. The plugin build runs SimOxide's fast mode.
+exact = ["palladio-sim-service/exact"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 8

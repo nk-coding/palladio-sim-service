@@ -1,6 +1,7 @@
 //! Writes the [`Schema`] as an mdeo metamodel (`.mm`).
 
 use crate::schema::{AttrType, PropKind, Schema};
+use simoxide_model::meta::prelude::*;
 use std::fmt::Write;
 
 /// Words the metamodel, model or script languages reserve; a name that is one is written quoted.

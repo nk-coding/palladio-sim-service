@@ -2,7 +2,7 @@
 //! [`FUNCTIONS`] and [`RECORDS`], and [`call`] answers them.
 //!
 //! ```fn
-//! // Everything the monitors measured (one run, exactly as SimuLizar would measure it):
+//! // Everything the monitors measured (one run, measured as SimuLizar measures it):
 //! val result = pcmSimulate(seed = 1, maxMeasurements = 10000)
 //! // One number, e.g. for an objective; calls with the same model and run parameters share one
 //! // simulation:
@@ -189,7 +189,7 @@ pub fn manifest() -> Value {
     json!({
         "id": PLUGIN_ID,
         "name": "Palladio Simulation",
-        "description": "Simulates Palladio (PCM) models with SimOxide, exactly as SimuLizar 5.2.2 does, as script functions",
+        "description": "Simulates Palladio (PCM) models with SimOxide, with SimuLizar 5.2.2's semantics, as script functions",
         "icon": [
             ["path", {"d": "M3 12h4l3-8 4 16 3-8h4"}]
         ],

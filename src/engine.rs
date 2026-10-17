@@ -1,12 +1,13 @@
-//! The simulation engine: turns models into compiled PCM models and runs them, in exact
-//! SimuLizar mode, on one thread pool shared by every session.
+//! The simulation engine: turns models into compiled PCM models and runs them, in SimOxide's
+//! default mode (fast; SimuLizar-exact with the feature `exact`), on one thread pool shared by
+//! every session.
 //!
 //! - **One pool.** Runs are CPU-bound, so they go to a rayon pool of `SIM_THREADS` threads, never
 //!   to the async runtime. Replications of one call run in parallel on it, and so do the calls of
 //!   all sessions: an optimizer with many workers keeps every thread busy, and one script asking
 //!   for many replications does as well.
 //! - **Content-addressed caches.** A model is identified by the digest of its PCM files. Compiling
-//!   is cached by that digest, and outcomes by the digest and the run parameters. Exact mode is
+//!   is cached by that digest, and outcomes by the digest and the run parameters. Both modes are
 //!   deterministic, so a cached outcome is exactly what running again would give; it saves the
 //!   work when an optimizer meets a model again, or when several objectives of one solution ask
 //!   for the same simulation.

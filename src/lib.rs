@@ -1,5 +1,7 @@
-//! An mdeo plugin service that simulates Palladio models with SimOxide in exact SimuLizar mode,
-//! offered to scripts as external functions.
+//! An mdeo plugin service that simulates Palladio models with SimOxide, offered to scripts as
+//! external functions. The plugin build runs SimOxide's fast mode (SimuLizar 5.2.2's semantics
+//! and statistics, not its random numbers); a local build with the feature `exact` runs the
+//! SimuLizar-exact mode.
 //!
 //! - [`schema`]: the Palladio metamodel as mdeo sees it, derived from the PCM Ecore metamodel;
 //!   [`mm`] writes it as a `.mm` file.

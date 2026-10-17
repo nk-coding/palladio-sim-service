@@ -21,6 +21,7 @@
 //!   the part through its EMF container feature (or a synthetic `<feature>Owner` when EMF has
 //!   none); opposite references become one bidirectional association.
 
+use simoxide_model::meta::prelude::*;
 use simoxide_model::meta::{
     self, ClassId, DataKind, EnumId, FeatureId, FeatureKind, PackageId, class as c, feat as f,
 };
@@ -564,6 +565,8 @@ impl Schema {
                             DataKind::Long => AttrType::Long,
                             DataKind::Double => AttrType::Double,
                             DataKind::Bool => AttrType::Bool,
+                            // `Sample<T>.value` (type parameter): none of these is used
+                            DataKind::JavaObject => continue,
                             DataKind::Enum(e) => AttrType::Enum(*ecore_enums.entry(e).or_insert_with(|| {
                                 s.enums.push(MEnum {
                                     name: e.def().name.to_string(),
@@ -823,14 +826,15 @@ pub fn load_libraries() -> Libraries {
 }
 
 fn library_entries(libs: &Libraries, cl: ClassId) -> Vec<EnumEntry> {
+    use simoxide_model::raw::PcmGraph;
     let g = &libs.graph;
     let mut out: Vec<EnumEntry> = Vec::new();
-    for (ri, r) in g.resources.iter().enumerate() {
+    for (ri, r) in g.resources().iter().enumerate() {
         if !r.uri.starts_with("pathmap:") {
             continue;
         }
-        for o in g.all_contents(simoxide_model::raw::ResId(ri as u32)) {
-            let obj = g.obj(o);
+        for o in g.tree_contents(simoxide_model::raw::ResId(ri as u32)) {
+            let obj = &g[o];
             if !obj.class.is_a(cl) || obj.proxy.is_some() {
                 continue;
             }

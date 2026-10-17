@@ -9,6 +9,7 @@
 
 use crate::protocol::{WireModel, WireValue};
 use crate::schema::{AttrType, PropKind, Schema};
+use simoxide_model::meta::prelude::*;
 use simoxide_model::meta::{ClassId, FeatureId, PackageId};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;

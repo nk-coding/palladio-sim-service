@@ -1,13 +1,15 @@
 [package]
 name = "palladio-sim-service"
-description = "mdeo plugin service: Palladio performance simulation (SimOxide, exact SimuLizar mode) as external script functions"
+description = "mdeo plugin service: Palladio performance simulation (SimOxide, SimuLizar semantics) as external script functions"
 version = "0.1.0"
 edition = "2024"
 license = "EPL-2.0"
 default-run = "palladio-sim-service"
 
 [dependencies]
+simoxide-emf-core = { path = "../simoxide/crates/foundation/simoxide-emf-core" }
 simoxide-model = { path = "../simoxide/crates/simoxide-model" }
+# EPL-only build: SimOxide's fast mode (SimuLizar's semantics, not its random numbers).
 simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
 
 axum = { version = "0.8", features = ["ws"] }
@@ -23,6 +25,12 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# SimuLizar-exact mode, byte-identical to the reference (the default mode with it). For local
+# use only: it links code for which no licence is granted (SimOxide's LICENSES, section 7), so a
+# build with it must not be distributed. The plugin build leaves it off.
+exact = ["simoxide-sim/exact"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

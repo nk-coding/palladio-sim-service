@@ -4,8 +4,10 @@
 
 use crate::protocol::{WireInstance, WireModel, WireValue};
 use crate::schema::{AttrType, PRIMITIVE_TYPES, PropKind, Schema, schema};
+use simoxide_emf_core::ModelStore;
+use simoxide_model::meta::prelude::*;
 use simoxide_model::meta::{FeatureKind, class as c, feat as f};
-use simoxide_model::raw::{Graph, ObjId, ResId, Slot, Value};
+use simoxide_model::raw::{Graph, ObjId, PcmGraph, ResId, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
@@ -82,7 +84,7 @@ pub fn import_files(files: &[std::path::PathBuf], metamodel_path: &str, naming: 
 fn import_loaded(mut l: simoxide_model::Loader, metamodel_path: &str, naming: Naming) -> Result<Imported, String> {
     l.resolve_all();
     let (g, diags) = l.finish();
-    let errors: Vec<String> = g.resources.iter().flat_map(|r| r.errors.iter().cloned()).collect();
+    let errors: Vec<String> = g.resources().iter().flat_map(|r| r.errors.iter().cloned()).collect();
     if !errors.is_empty() {
         return Err(format!("the model does not load: {}", errors.join("; ")));
     }
@@ -102,7 +104,7 @@ struct Importer<'a> {
 }
 
 fn is_model_resource(g: &Graph, r: ResId) -> bool {
-    let res = &g.resources[r.0 as usize];
+    let res = g.resource(r);
     !res.uri.starts_with("pathmap:") && !res.failed
 }
 
@@ -123,10 +125,9 @@ impl<'a> Importer<'a> {
         let g = self.g;
         // Every object of the model files, in tree order.
         let mut objects: Vec<ObjId> = Vec::new();
-        for ri in 0..g.resources.len() {
-            let r = ResId(ri as u32);
+        for r in g.resource_ids() {
             if is_model_resource(g, r) {
-                objects.extend(g.all_contents(r));
+                objects.extend(g.tree_contents(r));
             }
         }
         // Names: the PCM id (or entity name) where there is one, else the class name and a counter.
@@ -145,7 +146,7 @@ impl<'a> Importer<'a> {
                 Some(id) if !g.has_generated_id(o) && self.naming == Naming::Ids => id.to_string(),
                 // A root without an id is named after its file.
                 _ if g[o].container.is_none() => {
-                    let res = &g.resources[g[o].resource.0 as usize];
+                    let res = resource_of(g, o);
                     let stem = Path::new(&res.name).file_stem().and_then(|s| s.to_str()).unwrap_or("model");
                     let taken = |n: &str| self.taken.contains(n);
                     let ext = Path::new(&res.name).extension().and_then(|s| s.to_str()).unwrap_or("root");
@@ -216,7 +217,7 @@ impl<'a> Importer<'a> {
             .iter()
             .filter(|&&o| g[o].container.is_none() && self.names.contains_key(&o))
             .map(|&o| {
-                let res = &g.resources[g[o].resource.0 as usize];
+                let res = resource_of(g, o);
                 let file = Path::new(&res.name).file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
                 (file, self.names[&o].clone())
             })
@@ -236,18 +237,18 @@ impl<'a> Importer<'a> {
         let s = self.s;
         let mut attributes = Vec::new();
         let mut references = Vec::new();
-        for (fid, slot) in &g[o].slots {
-            let fid = *fid;
+        // The features the file sets, in the class's feature order.
+        for fid in g[o].class.features().filter(|&f| g.is_stored(o, f)) {
             if Some(fid) == g[o].class.def().id_attribute {
                 continue;
             }
             let Some(pi) = s.prop_by_feature(ci, fid) else {
                 if !fid.def().derived && !fid.def().transient && !fid.is_container() {
-                    let set = match slot {
-                        Slot::Many(v) => !v.is_empty(),
-                        Slot::Refs(v) => !v.is_empty(),
-                        Slot::Ref(r) => r.is_some(),
-                        Slot::One(_) => true,
+                    let set = match (fid.is_attribute(), fid.def().many) {
+                        (true, true) => !g.stored_list(o, fid).is_empty(),
+                        (true, false) => true,
+                        (false, true) => !g.get_refs(o, fid).is_empty(),
+                        (false, false) => g.get_ref(o, fid).is_some(),
                     };
                     if set {
                         *self
@@ -261,11 +262,10 @@ impl<'a> Importer<'a> {
             let p = &s.props[pi];
             match &p.kind {
                 PropKind::Attr { ty } => {
-                    let vals: Vec<Value> = match slot {
-                        Slot::One(v) => vec![v.clone()],
-                        Slot::Many(v) => v.clone(),
-                        _ => continue,
-                    };
+                    if !fid.is_attribute() {
+                        continue;
+                    }
+                    let vals: Vec<Value> = if fid.def().many { g.attrs(o, fid) } else { vec![g.attr(o, fid)] };
                     let vals: Vec<WireValue> =
                         vals.iter().filter_map(|v| attr_value(s, ty, fid, v)).collect();
                     attributes.push((p.name.clone(), vals));
@@ -301,8 +301,10 @@ impl<'a> Importer<'a> {
                 PropKind::Ref { .. } => {
                     let mut targets = Vec::new();
                     for &t in g.get_refs(o, fid) {
-                        let res = &g.resources[g[t].resource.0 as usize];
-                        if g[t].proxy.is_none() && res.uri == PRIMITIVE_TYPES && g[t].class.is_a(c::PrimitiveDataType) {
+                        if g[t].proxy.is_none()
+                            && g.resource_of(t).is_some_and(|r| g.resource(r).uri == PRIMITIVE_TYPES)
+                            && g[t].class.is_a(c::PrimitiveDataType)
+                        {
                             let ty = match g.attr(t, f::PrimitiveDataType_type) {
                                 Value::Enum(e) => {
                                     simoxide_model::meta::enums::PrimitiveTypeEnum.def().literals[e as usize].name.to_string()
@@ -344,6 +346,11 @@ impl<'a> Importer<'a> {
         self.primitives.insert(ty.to_string(), name.clone());
         name
     }
+}
+
+/// The resource of an object (`eResource()`); every object of a loaded model has one.
+fn resource_of(g: &Graph, o: ObjId) -> &simoxide_model::raw::Resource {
+    g.resource(g.resource_of(o).expect("a loaded object is in a resource"))
 }
 
 fn o_class_name(g: &Graph, o: ObjId) -> String {

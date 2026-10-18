@@ -1,8 +1,12 @@
 # Palladio Architecture plugin service (`palladio-arch-service`)
 
 An mdeo plugin service, written in Rust. It evaluates Palladio (PCM) models that carry
-architecture decisions (`architecture.mm`, `microservices.mm` of
-[palladio-architecture-optimization](../palladio-architecture-optimization)). For the model a
+architecture decisions (layer 2, `architecture.mm` of
+[palladio-architecture-optimization](../palladio-architecture-optimization)). It knows PCM and
+layer 2 only: a domain layer such as the microservice layer (`microservices.mm`) is realised in
+the model itself, by that layer's model transformations, with PCM and the generic completions of
+layer 2 (`Colocation`, `Work`, `Redirect`, `Notification`, `Replica`; the HPA project's
+DESIGN.md H10-H16). For the model a
 script runs on, it translates the decisions into plain PCM and simulates the result with
 [SimOxide](../simoxide), through [palladio-sim-service](../palladio-sim-service), which it uses as
 a library (protocol, auth, PCM schema, XMI writer, simulation engine). The design is
@@ -38,7 +42,7 @@ compilation 130–170 ms, simulation of 22 000 measurements 190–240 ms).
 | `archReplicas(element = "")` | the replicas of a container with a `Deployable`, fixed or autoscaled; "" = the sum over those in use (D50) |
 | `archFailure(exclude = "")` | O2: the rate-weighted share of requests that fail (D53): per request, the probability that it needs each container on its synchronous path, times the container's unavailability (shared fate; `Reliability`, `ChangeUnit`) |
 | `archChangeCoupling()` | O3: containers touched per change of a `ChangeUnit`, weighted by its changes: its own deployables plus, per other deployable that calls into it, the largest break probability of those calls (D54) |
-| `archInconsistency(exclude = "")` | O4: per request, stale reads (cache hits, local-copy reads across containers, reads of a read store apart from its source) plus writes to other containers (`CallSite.writes`; weights in `Consistency`) (D54) |
+| `archInconsistency(exclude = "")` | O4: per request, stale reads (cache hits; across containers, the share `staleReads` of a call's mechanism; calls into a `Replica` apart from its source) plus writes to other containers (`CallSite.writes`; weights in `Consistency`) (D54) |
 | `archLatencyViolation()` | C1: Σ over the `LatencyBudget`s of max(0, no-load time / budget − 1) (D55) |
 | `archPeakUtilisation()`, `archPeakViolation()` | C2: the highest utilisation of the `PeakCapacity` containers at its factor, and its excess over the limit (D55) |
 | `archNoLoadTime(exclude = "")` | the rate-weighted mean response time without contention over the usage scenarios (but those named in `exclude`, comma-separated), in model time units: the expected-value walk of the translated model, no simulation (DESIGN D48; static objectives) |
@@ -91,14 +95,17 @@ Applied to a copy of the model, in this order (`src/translate.rs`):
 
 | Step | Decision | PCM result |
 | --- | --- | --- |
+| 0 | `Colocation` | the assembly (which has no AllocationContext) is allocated in the container of its host, after the walks of the model before translation (placement, modularity, O3, O4 do not see it) |
+| 0 | `Work` | the InternalAction gets exponential demands, `cpuMs` on the CPU, then `hddMs` on the HDD, at the rates of the container of its component's first assembly (none without an assembly) |
 | 0 | `Workflow` with an `Orchestrated` style | every step (the call with its loop or branch) leaves its SEFF; the trigger's component makes them at the end of the trigger's SEFF, `stepCpuMs` each, as a forest (parallel siblings) or level by level; an asynchronous step to another container is a request and a reply through the broker; all in the background when the first step is asynchronous and remote (D42) |
 | 0 | `CallSite` with a `Bypass` | across containers: the callee's top-level CPU work on the caller, `latencyMs`, and the callee's calls into `direct` containers, made by the caller (D40) |
 | 0 | `CallSite` with a `ComposedCall` | across containers: the call (with its loop or branch) moves after the composer's call into the caller: `composeCpuMs`, then the composer's cache branch or the call; several in parallel (D39) |
-| 0 | `CallSite` with a `LocalCopy`, `CopyFeed` | a copy-store component with the store; the call reads the copy (`readCpuMs` CPU, `readDbMs` HDD); each writer gets an asynchronous fork that publishes once (a publisher component on its sidecar) and sends every copy it feeds a message, except a writer in the store's own container (D21, D43); a feed without writers is a copy carried by other messages (D46) |
-| 0 | `Projection` | when `reads` and `source` sit in different containers: after every writer, `cpuMs` on its CPU and an asynchronous call of `apply` on `reads` (D41) |
+| 0 | `Redirect` | the call is re-pointed to `service` of `provider` through a role of the caller's component (wired from all its assemblies) and loses its parameter and return usages; its callee does not run, also not in the walks before translation |
+| 0 | `Notification` | right after `after`: `cpuMs` on its container's CPU, then an asynchronous fork with one call per `Delivery`; `published`, with a broker: first one publish through the publisher of the container (on its sidecar), the deliveries are messages whose stubs only travel (D43). Several after one action: the published ones end up last |
+| 0 | a `Mechanism` of another class | the call as modelled (that layer realises it with the completions); its `couplingWeight` and `staleReads` feed the modularity and O4 |
 | 1 | `AsyncCall` | the call inside a `ForkAction` with an asynchronous forked behaviour; through the broker to another container, no fork here: the stub publishes on the caller's path and forks the rest (D43) |
 | 1 | `CachedCall` | a probabilistic branch: hit = CPU `hitCpuMs` on the caller, miss = the call |
-| 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller and a skeleton with the callee; one SEFF per signature, forwarding parameters and return values. Plain call: caller CPU, latency, call / callee CPU, call. Asynchronous: publish, then broker, latency, call in the background / deliver, call. Copy update: broker, latency, call / deliver, call. Orchestrated request: publish, broker, latency, call, broker, latency, deliver / deliver, call, publish (D43). Connectors into a `direct` container are left alone (D19); a sidecar has `sidecarCores` per replica (D20) |
+| 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller and a skeleton with the callee; one SEFF per signature, forwarding parameters and return values. Plain call: caller CPU, latency, call / callee CPU, call. Asynchronous: publish, then broker, latency, call in the background / deliver, call. Delivery of a published Notification: broker, latency, call / deliver, call. Orchestrated request: publish, broker, latency, call, broker, latency, deliver / deliver, call, publish (D43). Connectors into a `direct` container are left alone (D19); a sidecar has `sidecarCores` per replica (D20) |
 | 3a | `Deployable.autoscaling` → `Autoscaling` | n = the smallest count ≥ 1 with u/(n·q) ≤ `targetUtilisation` and u_s/(n·sidecarCores) ≤ target, u and u_s the CPU loads of the container and its sidecar (full-speed cores, one walk after rule 2), capped at `maxReplicas`; the sidecar gets n·sidecarCores cores; per `LoadLevel` the same with the load × factor, for the cost's weighted mean (D50) |
 | 3 | `Deployable` | n replicas of q cores: `numberOfReplicas` = n·⌈q⌉, `processingRate` × q/⌈q⌉ (limit-speed); with `quota`, full speed here |
 | 4 | `Deployable.quota`, `Node` | one load analysis (its walk gives the no-load times); a quota container runs at max(q′, 1 − u/(n⌈q⌉)·(1 − q′)/q′) of full speed (D45); node slowdown s = 1 + C(c, U)/(c − U) from the node's CPU load U; every CPU on the node runs at most at 1/s of full speed |
@@ -114,13 +121,14 @@ Modularity (`translate.rs` `modularity`, DESIGN D32, D44) is the cohesive MQ of 
 round 2, made generic: the modules are the components with a `Placement` that may sit outside the
 `RemoteCalls.direct` containers; each module's executions per time unit count as cohesion of its
 container; a call between two modules in different containers couples them by its frequency times
-2 (bypass), 1 (sync, cached), 0.5 (composed call, local copy) or 0.3 (async). A call that reads a
-local copy, or bypasses its callee across containers, does not run its callee. `ARCH_DEBUG_MQ=1`
+its mechanism's `couplingWeight`, else 2 (bypass), 1 (sync, cached, a mechanism of another layer),
+0.5 (composed call) or 0.3 (async). A redirected call, or one that bypasses its callee across
+containers, does not run its callee. `ARCH_DEBUG_MQ=1`
 prints every cluster's intra and inter weight to stderr.
 
 ## Verification
 
-`cargo test --release` (38 tests: the 32 below and the 6 of `tests/dynamic.rs`, which check the
+`cargo test --release` (40 tests: the 34 below and the 6 of `tests/dynamic.rs`, which check the
 dynamic translation (the static model unchanged, one pod behind a load balancer, the SPD and HPA
 files), the HPA's steady replicas at a constant load against the ideal autoscaler (2, 3, 5 pods),
 a load step's SLO violations, lag and scale-in, the cap on created pods with its penalty, and the
@@ -137,26 +145,28 @@ with a database, a read side, a notifier and the placeholders the P6 tests fill 
 | `node_slowdown_matches_msa_sim_service` | the formula equals msa-sim-service's on a grid; the translated rates equal 1000/s |
 | `translation_is_deterministic_and_order_independent` | every decision kind at once; shuffled instances and reference lists translate to the same model, cost, modularity and node loads |
 | `models_without_decisions_simulate_as_in_palladio_sim_service` | the fixture and the six Palladio Simulation models: same PCM digest and identical outcome |
-| `local_copy_reads_the_copy_and_writers_feed_it` | read and write demands; 5 + 1 ms simulated |
+| `redirected_call_reads_a_copy_kept_with_the_caller` | a copy as the HPA project's sync realises it (copy store with a Colocation, its operations' Work, a Redirect, a published Notification): read and write demands; 5 + 1 ms simulated; the store's HDD load with its host |
 | `cost_and_modularity` | cost from the CostModel; no Placement, no cluster |
-| `modularity_is_cohesive_mq_over_movable_components` | cohesive MQ: two containers 2 × 2/3, one container 1, async and copy coupling weights, a cache couples as the call, components that can only sit in direct containers are left out, a copy read does not run the callee |
+| `modularity_is_cohesive_mq_over_movable_components` | cohesive MQ: two containers 2 × 2/3, one container 1, the async coupling weight and a mechanism's `couplingWeight` (0.5; absent for another layer's class: 1), a cache couples as the call, components that can only sit in direct containers are left out, a redirected call does not run the callee |
 | `direct_containers_get_no_middleware` | no stub or skeleton into a direct container: 15 ms |
 | `sidecar_cores_per_replica` | 2 replicas × 3 sidecar cores = 6 cores at full speed |
 | `container_prices_replace_the_cost_rule` | a priced container costs its price, and nothing when it hosts nothing |
-| `local_copy_read_cpu_runs_in_the_store` | `readCpuMs` on the store's CPU: 5 + 2 + 1 ms |
-| `a_writer_in_the_stores_container_feeds_nothing` | one message for a remote writer, none for a co-located one |
+| `work_becomes_demands_at_the_rates_of_its_container` | `Work` on the store's CPU and HDD: 5 + 2 + 1 ms, loads; twice the units on a CPU twice as fast; nothing for a component without an assembly |
+| `a_notification_delivers_in_the_background` | 1 ms CPU on the path, the delivery as a plain call in the background (25 ms no-load, the request does not wait for it), its stub's and callee's load; `published` without a broker is the same |
+| `colocation_follows_its_host` | the colocated assembly's load moves with its host; the walks before translation do not see it; a Colocation of an allocated assembly is an error |
 | `chain_baseline` | the chain, all synchronous and apart: 70 ms analytic and simulated |
 | `composed_call_moves_to_the_composer` | 71.5 ms (analytic, simulated), the loads per container, the composer's cache, inline in one container, coupling 0.5 |
 | `bypass_does_the_callees_work_and_reaches_its_database` | 58 ms, the callee's other call skipped, loads, plain in one container, coupling 2 and no callee execution |
 | `orchestration_moves_the_steps_to_the_trigger` | choreographed 70 ms, orchestrated 71 ms; asynchronous steps: 43.5 / 43 ms, request and reply loads on broker and both sides; a step with the orchestrator inline |
-| `read_store_is_fed_by_projection` | nothing while the read side sits with the write side; apart: +0.5 ms projection, apply load on the read store |
+| `read_store_is_fed_by_projection` | a projection as an unpublished Notification (the sync makes it while the read side sits apart): +0.5 ms on the path, the apply load on the read store; none: nothing changes |
 | `quota_runs_at_full_speed_when_idle` | quota speed 0.8 at u = 0.2 (q 0.5) and 1 − 0.2/3·0.25 (q 2.4), utilisation on the capacity, no-load time at full speed |
-| `a_write_publishes_once_for_all_its_copies` | one publish for two copies, two broker messages, deliver and write per copy |
+| `a_write_publishes_once_for_all_its_copies` | a published Notification with two Deliveries: one publish, two broker messages, deliver and write per copy |
 | `autoscaler_derives_replicas_from_offered_load` | 1 core of load, 0.5-core replicas, target 0.7: 3 replicas, utilisation 2/3, the same PCM as 3 fixed replicas, cost; exactly at the target no extra replica; idle 1; target 0.5: 4; `maxReplicas` caps with a warning |
 | `autoscaler_cost_over_load_levels` | levels 0.5 × (weight 3) and 2 × (weight 1): 2 and 6 replicas, cost on their weighted mean, 3 simulated; a priced container per replica |
 | `failure_share_follows_the_synchronous_path_with_shared_fate` | the chain with four change units: unavailabilities 0.011, 0.026, 0.012 (a database server: u_db + κ·unit), 0.006; failure 1 − Π(1 − u) with everything synchronous, the same with sidecars, without the asynchronous notify's container, with a quarter of it behind a cache; one process term when three components share a container |
 | `change_coupling_counts_containers_touched_per_change` | (10·1 + 20·1.15 + 5·1 + 5·1.15)/40; a bypass with break probability 0.6; co-located callers break nothing |
-| `inconsistency_counts_stale_reads_and_remote_writes` | two remote writes 2; asynchronous 1 + 1.5; co-located 1; a cache 0.75 more; a read store apart 0.25 more for the misses |
+| `inconsistency_counts_stale_reads_and_remote_writes` | two remote writes 2; asynchronous 1 + 1.5; co-located 1; a cache 0.75 more; a `Replica` apart 0.25 more for the misses |
+| `stale_reads_of_a_mechanism_count_across_containers` | `staleReads` 1 and 0.4 of a redirected query across containers; nothing in one container; a redirected query no longer reads the Replica apart |
 | `latency_budget_and_peak_capacity` | 70 ms against 50 ms: 0.4; against 100 ms: 0; peak utilisation 10 × 0.008 and 200 × 0.008 |
 | `autoscaled_cost_at_a_peak_level` | O1: cost with replicas at 10 × the load, the simulated model at 1 replica |
 | `autoscaler_counts_the_sidecar` | 3 cores of sidecar load → 5 replicas, 5 sidecar cores; a Deployable without replicas or autoscaling is an error |
@@ -182,7 +192,8 @@ runs of the original PCM files; MediaStore: 23 554.228 ms for download).
 ## Limitations
 
 - Composite components are not walked by the load analysis (a warning says so).
-- A call with a local copy loses its parameter and return usages.
+- A redirected call loses its parameter and return usages.
+- `Work` uses the rates of the container of its component's first assembly.
 - Several assemblies of one component type on containers with different CPU rates share one
   cache-hit demand (D9).
 - Rule 0 works on a component's first assembly: the roles it adds are wired from every assembly,

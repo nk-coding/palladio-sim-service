@@ -190,11 +190,11 @@ fn change_coupling(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String
     if total > 0.0 { sum / total } else { 0.0 }
 }
 
-/// O4 per scenario: per request, the expected stale reads (cache hits; local-copy reads across
-/// containers; reads of a read store that sits apart from its source) plus the writes to another
-/// container (CallSite.writes), weighted by `weights` (synchronous, asynchronous). The walk runs
-/// on the model before translation; a cache hit, a local-copy read and a bypass across
-/// containers do not run the callee.
+/// O4 per scenario: per request, the expected stale reads (cache hits; across containers, the
+/// share `staleReads` of a call's mechanism; calls into a `Replica` that sits apart from its
+/// source) plus the writes to another container (CallSite.writes), weighted by `weights`
+/// (synchronous, asynchronous). The walk runs on the model before translation; a cache hit, a
+/// redirected call and a bypass across containers do not run the callee.
 fn inconsistency(
     g: &Graph,
     d: &Decisions,
@@ -215,16 +215,16 @@ fn inconsistency(
                 scale.insert(call.clone(), 1.0 - h);
                 stale = *h;
             }
-            Mechanism::LocalCopy { .. } => {
-                scale.insert(call.clone(), 0.0);
-                if across {
-                    stale = 1.0;
-                }
-            }
             Mechanism::Bypass { .. } if across => {
                 scale.insert(call.clone(), 0.0);
             }
             _ => {}
+        }
+        if d.redirects.contains_key(call) {
+            scale.insert(call.clone(), 0.0);
+        }
+        if across && let Some(x) = d.q.stale.get(call) {
+            stale += x;
         }
         let write = if across && d.q.writes.contains(call) {
             if matches!(m, Mechanism::Async) { async_w } else { sync_w }
@@ -236,7 +236,7 @@ fn inconsistency(
         }
     }
     let stale_callees: BTreeSet<&String> =
-        d.projections.iter().filter(|p| placement.get(&p.reads) != placement.get(&p.source)).map(|p| &p.reads).collect();
+        d.q.replicas.iter().filter(|(r, s)| placement.get(r) != placement.get(s)).map(|(r, _)| r).collect();
     let loads = load::analyse_with(g, &BTreeSet::new(), &scale, true);
     let mut out = BTreeMap::new();
     for (sc, calls) in &loads.scenario_calls {

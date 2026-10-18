@@ -1,6 +1,7 @@
 //! An mdeo plugin service that optimises the architecture of plain Palladio (PCM) models: it
-//! translates the architecture decisions of a model (`architecture.mm`, `microservices.mm`) into
-//! plain PCM and simulates the result with SimOxide, through `palladio-sim-service`.
+//! translates the architecture decisions of a model (layer 2, `architecture.mm`, with its generic
+//! completions) into plain PCM and simulates the result with SimOxide, through
+//! `palladio-sim-service`. Domain layers are realised in the model by their own transformations.
 //!
 //! - [`mfile`]: reads `.m` files (for the command line and the tests).
 //! - [`graph`]: the model as an editable instance graph.

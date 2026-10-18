@@ -1,12 +1,16 @@
-//! The completion: architecture decisions (layers 2 and 3) → plain PCM (DESIGN.md §4, §5).
+//! The completion: architecture decisions (layer 2, `architecture.mm`) → plain PCM (DESIGN.md
+//! §4). The plugin knows PCM and layer 2 only: a domain layer (such as the HPA project's
+//! microservices) is realised in the model by its own transformations, with PCM and the generic
+//! completions of layer 2 (`Colocation`, `Work`, `Redirect`, `Notification`, `Replica`).
 //!
 //! Applied to a copy of the model, in this order:
-//! 0. calls that change hands: an orchestrated `Workflow` moves its steps into the trigger's
-//!    SEFF; across containers, a `Bypass` becomes the callee's own work and its direct calls, and
-//!    a `ComposedCall` moves to its composer;
-//!    layer 3: a call with a `LocalCopy` mechanism reads the copy; every feeding write publishes
-//!    once and sends each copy an asynchronous message; a `Projection` whose read side sits
-//!    apart adds the projection to every writer;
+//! 0. completions and calls that change hands: every `Colocation` allocates its assembly with its
+//!    host, every `Work` becomes demands at its container's rates; an orchestrated `Workflow`
+//!    moves its steps into the trigger's SEFF; across containers, a `Bypass` becomes the callee's
+//!    own work and its direct calls, and a `ComposedCall` moves to its composer; a `Redirect`
+//!    re-points its call; a `Notification` adds its CPU and an asynchronous fork with its
+//!    deliveries after its action (a published one publishes once, its deliveries travel through
+//!    the broker);
 //! 1. mechanisms: `AsyncCall` wraps the call in an asynchronous fork (through the broker: the
 //!    stub publishes on the caller's path and forks the rest), `CachedCall` in a probabilistic
 //!    branch;
@@ -159,11 +163,13 @@ enum Mechanism {
     Sync,
     Async,
     Cached { hit_ratio: f64, hit_cpu_ms: f64 },
-    LocalCopy { read_db_ms: f64, read_cpu_ms: f64, write_cpu_ms: f64, write_db_ms: f64 },
     /// Across containers: made by the composer; `cache` = (hit ratio, hit CPU ms) at the composer.
     Composed { compose_cpu_ms: f64, cache: Option<(f64, f64)> },
     /// Across containers: the callee's own work and direct calls, made by the caller.
     Bypass { latency_ms: f64 },
+    /// A mechanism class of another layer: the call as modelled (that layer realises the
+    /// mechanism with the completions).
+    Other,
 }
 
 #[derive(Clone, Debug)]
@@ -258,14 +264,15 @@ struct Workflow {
     orchestrated: Option<f64>,
 }
 
+/// A `Notification`: work after an action, in the background (layer 2, completions).
 #[derive(Clone, Debug)]
-struct Projection {
+struct Notification {
     name: String,
-    reads: String,
-    source: String,
-    writers: Vec<String>,
-    apply: String,
+    after: String,
     cpu_ms: f64,
+    published: bool,
+    /// (provider assembly, signature), by the signature's entity name
+    deliveries: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -335,11 +342,16 @@ struct Decisions {
     remote: Option<RemoteCalls>,
     deployables: Vec<Deployable>,
     workflows: Vec<Workflow>,
-    projections: Vec<Projection>,
+    /// (assembly, host assembly)
+    colocations: Vec<(String, String)>,
+    /// (InternalAction, cpuMs, hddMs)
+    work: Vec<(String, f64, f64)>,
+    /// call → (provider assembly, signature)
+    redirects: BTreeMap<String, (String, String)>,
+    notifications: Vec<Notification>,
     nodes: Vec<(String, f64, f64, Vec<String>)>, // (name, cores, background, containers)
     cost: Option<[f64; 4]>,                  // perContainer, perCore, perReplicaOverhead, perCache
     prices: BTreeMap<String, f64>,           // container → fixed price (ContainerPrice)
-    feeds: Vec<(String, String, Vec<String>, String)>, // (feed, site, writers, store)
     any: bool,
     /// The quality model (D53–D55): data, not decisions.
     q: QualityData,
@@ -356,6 +368,12 @@ struct QualityData {
     contract_break: f64,
     /// call → breakProbability of its site's mechanism
     breaks: BTreeMap<String, f64>,
+    /// call → couplingWeight of its site's mechanism (modularity)
+    coupling: BTreeMap<String, f64>,
+    /// call → staleReads of its site's mechanism (inconsistency, across containers)
+    stale: BTreeMap<String, f64>,
+    /// (replica, source) of every Replica
+    replicas: Vec<(String, String)>,
     /// calls whose site writes
     writes: BTreeSet<String>,
     /// syncWriteWeight, asyncWriteWeight
@@ -430,12 +448,6 @@ impl Decisions {
                     }
                     Mechanism::Cached { hit_ratio: h, hit_cpu_ms: num(g, m, "hitCpuMs")? }
                 }
-                "LocalCopy" => Mechanism::LocalCopy {
-                    read_db_ms: num(g, m, "readDbMs")?,
-                    read_cpu_ms: g.num_attr(m, "readCpuMs").unwrap_or(0.0),
-                    write_cpu_ms: num(g, m, "writeCpuMs")?,
-                    write_db_ms: num(g, m, "writeDbMs")?,
-                },
                 "ComposedCall" => {
                     let cache = match g.num_attr(m, "hitRatio") {
                         Some(h) if h > 0.0 => {
@@ -449,7 +461,8 @@ impl Decisions {
                     Mechanism::Composed { compose_cpu_ms: num(g, m, "composeCpuMs")?, cache }
                 }
                 "Bypass" => Mechanism::Bypass { latency_ms: num(g, m, "latencyMs")? },
-                other => return Err(format!("{m}: unknown mechanism class {other}")),
+                // a subclass of Mechanism from another layer: the call as modelled
+                _ => Mechanism::Other,
             })
         };
         let mut q = QualityData::read(g)?;
@@ -471,6 +484,15 @@ impl Decisions {
             let mech = mechanism(&m)?;
             if let Some(b) = g.num_attr(&m, "breakProbability") {
                 q.breaks.insert(call.clone(), b);
+            }
+            if let Some(w) = g.num_attr(&m, "couplingWeight") {
+                q.coupling.insert(call.clone(), w);
+            }
+            if let Some(x) = g.num_attr(&m, "staleReads") {
+                if !(0.0..=1.0).contains(&x) {
+                    return Err(format!("{m}: staleReads {x} is not a share"));
+                }
+                q.stale.insert(call.clone(), x);
             }
             if g.bool_attr(&cs, "writes").unwrap_or(false) {
                 q.writes.insert(call.clone());
@@ -561,16 +583,59 @@ impl Decisions {
             }
             workflows.push(Workflow { name: w.clone(), trigger: one(g, &w, "trigger")?, steps, orchestrated });
         }
-        let mut projections = Vec::new();
-        for p in sorted(g.all("Projection")) {
-            projections.push(Projection {
-                name: p.clone(),
-                reads: one(g, &p, "reads")?,
-                source: one(g, &p, "source")?,
-                writers: sorted(g.refs(&p, "writers")),
-                apply: one(g, &p, "apply")?,
-                cpu_ms: num(g, &p, "cpuMs")?,
+        let mut colocations = Vec::new();
+        for c in sorted(g.all("Colocation")) {
+            colocations.push((one(g, &c, "assembly")?, one(g, &c, "host")?));
+        }
+        let mut work = Vec::new();
+        for w in sorted(g.all("Work")) {
+            let a = one(g, &w, "action")?;
+            if !g.is_a(&a, "InternalAction") {
+                return Err(format!("{w}.action is a {}, not an InternalAction", g.class(&a)));
+            }
+            let (cpu, hdd) = (g.num_attr(&w, "cpuMs").unwrap_or(0.0), g.num_attr(&w, "hddMs").unwrap_or(0.0));
+            if !(cpu >= 0.0 && hdd >= 0.0) {
+                return Err(format!("{w}: cpuMs and hddMs must not be negative"));
+            }
+            work.push((a, cpu, hdd));
+        }
+        let mut redirects = BTreeMap::new();
+        for r in sorted(g.all("Redirect")) {
+            let call = one(g, &r, "call")?;
+            if !g.is_a(&call, "ExternalCallAction") {
+                return Err(format!("{r}.call is a {}, not an ExternalCallAction", g.class(&call)));
+            }
+            if redirects.insert(call.clone(), (one(g, &r, "provider")?, one(g, &r, "service")?)).is_some() {
+                return Err(format!("{call} has two Redirects"));
+            }
+        }
+        let mut notifications = Vec::new();
+        for n in sorted(g.all("Notification")) {
+            let after = one(g, &n, "after")?;
+            if !(g.is_a(&after, "ExternalCallAction") || g.is_a(&after, "InternalAction")) {
+                return Err(format!("{n}.after is a {}, not an ExternalCallAction or InternalAction", g.class(&after)));
+            }
+            let mut deliveries = Vec::new();
+            for d in sorted(g.refs(&n, "deliveries")) {
+                deliveries.push((one(g, &d, "provider")?, one(g, &d, "service")?, d));
+            }
+            if deliveries.is_empty() {
+                return Err(format!("{n}: a Notification needs at least one Delivery"));
+            }
+            deliveries.sort_by(|a, b| (g.entity(&a.1), &a.2).cmp(&(g.entity(&b.1), &b.2)));
+            notifications.push(Notification {
+                name: n.clone(),
+                after,
+                cpu_ms: g.num_attr(&n, "cpuMs").unwrap_or(0.0),
+                published: g.bool_attr(&n, "published").unwrap_or(false),
+                deliveries: deliveries.into_iter().map(|(p, s, _)| (p, s)).collect(),
             });
+        }
+        // published ones first: rule 0 inserts each right after its action, so a projection-like
+        // one (CPU on the path) ends up before the forks of the published ones, as before H10
+        notifications.sort_by_key(|n| !n.published);
+        for r in sorted(g.all("Replica")) {
+            q.replicas.push((one(g, &r, "replica")?, one(g, &r, "source")?));
         }
         let mut nodes = Vec::new();
         for n in sorted(g.all("Node")) {
@@ -594,10 +659,6 @@ impl Decisions {
                 }
             }
         }
-        let mut feeds = Vec::new();
-        for f in sorted(g.all("CopyFeed")) {
-            feeds.push((f.clone(), one(g, &f, "site")?, sorted(g.refs(&f, "writers")), one(g, &f, "store")?));
-        }
         for p in sorted(g.all("Placement")) {
             let a = one(g, &p, "allocation")?;
             if let Some(c) = g.ref1(&a, "resourceContainer")
@@ -610,9 +671,11 @@ impl Decisions {
             || remote.is_some()
             || !deployables.is_empty()
             || !nodes.is_empty()
-            || !feeds.is_empty()
             || !workflows.is_empty()
-            || !projections.is_empty();
+            || !colocations.is_empty()
+            || !work.is_empty()
+            || !redirects.is_empty()
+            || !notifications.is_empty();
         let profile = match g.all("LoadProfile").as_slice() {
             [] => None,
             [p] => Some(LoadProfileSpec::read(g, p)?),
@@ -626,11 +689,13 @@ impl Decisions {
             remote,
             deployables,
             workflows,
-            projections,
+            colocations,
+            work,
+            redirects,
+            notifications,
             nodes,
             cost,
             prices,
-            feeds,
             any,
             q,
         })
@@ -676,7 +741,19 @@ impl QualityData {
             Some(c) => Some((num(g, &c, "factor")?, num(g, &c, "limit")?, sorted(g.refs(&c, "containers")))),
             None => None,
         };
-        Ok(QualityData { reliability, units, contract_break, breaks: BTreeMap::new(), writes: BTreeSet::new(), consistency, budgets, peak })
+        Ok(QualityData {
+            reliability,
+            units,
+            contract_break,
+            breaks: BTreeMap::new(),
+            coupling: BTreeMap::new(),
+            stale: BTreeMap::new(),
+            replicas: Vec::new(),
+            writes: BTreeSet::new(),
+            consistency,
+            budgets,
+            peak,
+        })
     }
 }
 
@@ -719,8 +796,9 @@ struct Builder {
 enum RoleKind {
     /// An asynchronous call: publish on the caller's path, the rest in the background.
     Async,
-    /// A copy update in a writer's background fork, published once per write elsewhere.
-    Feed,
+    /// A delivery of a published Notification: published once by the sender's publisher, then
+    /// broker, latency, call.
+    Published,
     /// An orchestrated asynchronous step: request and reply through the broker, the caller waits.
     Reply,
 }
@@ -965,7 +1043,7 @@ impl Builder {
         if let Some(k) = kind {
             let label = match k {
                 RoleKind::Async => "async",
-                RoleKind::Feed => "feed",
+                RoleKind::Published => "published",
                 RoleKind::Reply => "reply",
             };
             self.g.set_attr(&r, "entityName", s(format!("{}_{label}", self.g.entity(&r))));
@@ -1278,13 +1356,10 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
     let g = Graph::new(model);
     let mut warnings = Vec::new();
     let mut d = Decisions::read(&g, &mut warnings)?;
-    // Calls that do not run their callee: local-copy reads, and bypasses across containers.
-    let mut skipped: BTreeSet<String> = BTreeSet::new();
+    // Calls that do not run their callee: redirected calls, and bypasses across containers.
+    let mut skipped: BTreeSet<String> = d.redirects.keys().cloned().collect();
     for (_, call, m) in &d.sites {
         match m {
-            Mechanism::LocalCopy { .. } => {
-                skipped.insert(call.clone());
-            }
             Mechanism::Bypass { .. } => {
                 if let Some((a, p)) = call_target(&g, call)
                     && allocated(&g, &a) != allocated(&g, &p)
@@ -1362,11 +1437,13 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
             }
         }
     }
+    colocations(&mut b, &d)?;
+    work(&mut b, &d)?;
     workflows(&mut b, &d)?;
     bypasses(&mut b, &d)?;
     composed_calls(&mut b, &d)?;
-    local_copies(&mut b, &d)?;
-    projections(&mut b, &d)?;
+    redirects(&mut b, &d)?;
+    notifications(&mut b, &d)?;
     mechanisms(&mut b, &d)?;
     if let Some(rc) = &d.remote {
         remote_calls(&mut b, rc)?;
@@ -1653,129 +1730,94 @@ fn composed_calls(b: &mut Builder, d: &Decisions) -> Result<(), String> {
     Ok(())
 }
 
-/// Layer 3: projections into read stores (CQRS). When the read side sits apart from the write
-/// side, every writer is followed by the projection CPU and an asynchronous call that applies
-/// the write to the read side.
-fn projections(b: &mut Builder, d: &Decisions) -> Result<(), String> {
-    for p in &d.projections {
-        let (Some(rc), Some(sc)) = (b.container_of(&p.reads), b.container_of(&p.source)) else {
-            return Err(format!("{}: its read or write side is not allocated", p.name));
-        };
-        if rc == sc {
-            continue;
+/// Rule 0, completions: every `Colocation` gives its assembly an AllocationContext in the
+/// container of its host (after the walks of the model before translation, which do not see it).
+fn colocations(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    for (asm, host) in &d.colocations {
+        if b.container_of(asm).is_some() {
+            return Err(format!("{asm} has a Colocation and an AllocationContext of its own"));
         }
-        let iface = b.g.container(&p.apply).ok_or_else(|| format!("{}: apply is in no interface", p.name))?;
-        for w in &p.writers {
-            if !(b.g.is_a(w, "ExternalCallAction") || b.g.is_a(w, "InternalAction")) {
-                return Err(format!("{}: writer {w} is a {}, not an ExternalCallAction or InternalAction", p.name, b.g.class(w)));
-            }
-            let owner = b.component_of(w).ok_or_else(|| format!("{w} is in no component"))?;
-            let oc = b.container_of_component(&owner)?;
-            let r = b.role_to(&owner, &iface, &p.reads, None)?;
-            let cpu = b.internal(w, "project", &[("CPU", b.cpu_units(&oc, p.cpu_ms)?)]);
-            let call = b.external(&format!("{w}_apply"), &r, &p.apply);
-            let fork = b.async_fork(&format!("{w}_projection"), &[call]);
-            b.insert_all_after(w, &[cpu, fork])?;
+        let c = b.container_of(host).ok_or_else(|| format!("{asm} sits with {host}, which is not allocated"))?;
+        let ac = b.named(&format!("alloc_{asm}"), "AllocationContext", None);
+        let alloc = b.allocation.clone();
+        b.g.link(&alloc, "allocationContexts", &ac);
+        b.g.link(&ac, "assemblyContext", asm);
+        b.g.link(&ac, "resourceContainer", &c);
+    }
+    Ok(())
+}
+
+/// Rule 0, completions: every `Work` becomes exponential demands of its InternalAction, CPU then
+/// HDD, at the rates of the container of its component's first assembly. A component without an
+/// assembly never runs: its Work is left out.
+fn work(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    for (action, cpu_ms, hdd_ms) in &d.work {
+        let comp = b.component_of(action).ok_or_else(|| format!("{action} is in no component"))?;
+        let Some(c) = b.assemblies_of(&comp).first().and_then(|a| b.container_of(a)) else { continue };
+        if *cpu_ms > 0.0 {
+            let units = b.cpu_units(&c, *cpu_ms)?;
+            b.demand(action, "CPU", units, true);
+        }
+        if *hdd_ms > 0.0 {
+            let units = b.hdd_units(&c, *hdd_ms)?;
+            b.demand(action, "HDD", units, true);
         }
     }
     Ok(())
 }
 
-/// Layer 3: local copies.
-fn local_copies(b: &mut Builder, d: &Decisions) -> Result<(), String> {
-    // store → (interface, component, provided role, assembly)
-    let mut stores: BTreeMap<String, (String, String, String, String)> = BTreeMap::new();
-    // (component, store) → required role
-    let mut roles: BTreeMap<(String, String), String> = BTreeMap::new();
-    // writer → forked behaviour that sends its messages
-    let mut writer_forks: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
-    let broker = d.remote.as_ref().is_some_and(|r| r.broker.is_some());
-    for (cs, call, m) in &d.sites {
-        let Mechanism::LocalCopy { read_db_ms, read_cpu_ms, write_cpu_ms, write_db_ms } = m else { continue };
-        let Some((_, _, writers, store)) = d.feeds.iter().find(|f| &f.1 == cs) else {
-            return Err(format!("{cs} reads a LocalCopy, but no CopyFeed feeds it"));
-        };
-        let store_c = b.container_of(store).ok_or_else(|| format!("the copy store {store} is not allocated"))?;
-        if !stores.contains_key(store) {
-            let iface = b.named(&format!("{store}_copies"), "OperationInterface", Some(&format!("{store}_copies")));
-            let repo = b.repo.clone();
-            b.g.link(&repo, "interfaces", &iface);
-            let comp = b.component(&format!("{store}_copyStore"));
-            let prov = b.role(&comp, &iface, true);
-            let asm = b.assembly(&comp, &store_c);
-            stores.insert(store.clone(), (iface, comp, prov, asm));
-        }
-        let (iface, comp, prov, asm) = stores[store].clone();
-        let read = b.named(&format!("{iface}_read_{cs}"), "OperationSignature", Some(&format!("read_{cs}")));
-        let write = b.named(&format!("{iface}_write_{cs}"), "OperationSignature", Some(&format!("write_{cs}")));
-        b.g.link(&iface, "signatures", &read);
-        b.g.link(&iface, "signatures", &write);
-        let rs = b.seff(&comp, &read);
-        let units = b.hdd_units(&store_c, *read_db_ms)?;
-        let cpu = if *read_cpu_ms > 0.0 { b.cpu_units(&store_c, *read_cpu_ms)? } else { 0.0 };
-        let a = b.internal(&rs, "readCopy", &[("CPU", cpu), ("HDD", units)]);
-        b.fill(&rs, &[a]);
-        let ws = b.seff(&comp, &write);
-        let (cu, hu) = (b.cpu_units(&store_c, *write_cpu_ms)?, b.hdd_units(&store_c, *write_db_ms)?);
-        let a = b.internal(&ws, "writeCopy", &[("CPU", cu), ("HDD", hu)]);
-        b.fill(&ws, &[a]);
-
-        // the reader: the call reads the copy
+/// Rule 0, completions: every `Redirect` re-points its call to its service on its provider,
+/// through a role of the caller's component (wired from every assembly of the caller), and drops
+/// the call's parameter and return usages.
+fn redirects(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    for (call, (provider, service)) in &d.redirects {
         let caller = b.component_of(call).ok_or_else(|| format!("{call} is in no component"))?;
-        let role = match roles.get(&(caller.clone(), store.clone())) {
-            Some(r) => r.clone(),
-            None => {
-                let r = b.role(&caller, &iface, false);
-                for asm_c in b.assemblies_of(&caller) {
-                    b.connector(&asm_c, &r, &asm, &prov);
-                }
-                roles.insert((caller.clone(), store.clone()), r.clone());
-                r
-            }
-        };
+        let iface = b.g.container(service).ok_or_else(|| format!("{service} is in no interface"))?;
+        let role = b.role_to(&caller, &iface, provider, None)?;
         b.g.set_ref(call, "role", &role);
-        b.g.set_ref(call, "calledService", &read);
+        b.g.set_ref(call, "calledService", service);
         for u in b.g.refs(call, "inputVariableUsages").into_iter().chain(b.g.refs(call, "returnVariableUsage")) {
             for ch in b.g.refs(&u, "variableCharacterisation") {
                 b.g.remove(&ch);
             }
             b.g.remove(&u);
         }
-
-        // the writers: an asynchronous message to the copy after each feeding write
-        for w in writers {
-            if !(b.g.is_a(w, "ExternalCallAction") || b.g.is_a(w, "InternalAction")) {
-                return Err(format!("CopyFeed writer {w} is a {}, not an ExternalCallAction or InternalAction", b.g.class(w)));
-            }
-            let owner = b.component_of(w).ok_or_else(|| format!("{w} is in no component"))?;
-            // A writer in the store's own container sends nothing: the copy is its own data.
-            let owner_c = b.assemblies_of(&owner).first().and_then(|a| b.container_of(a));
-            if owner_c.as_deref() == Some(store_c.as_str()) {
-                continue;
-            }
-            // Through the broker, a copy update is a message of its own (rule 2).
-            let kind = if broker { Some(RoleKind::Feed) } else { None };
-            let role = b.role_to(&owner, &iface, &asm, kind)?;
-            let send = b.external(&format!("{w}_feed_{cs}"), &role, &write);
-            writer_forks.entry(w.clone()).or_insert_with(|| (owner.clone(), Vec::new())).1.push(send);
-        }
     }
-    for (w, (owner, sends)) in writer_forks {
-        // One publish per write, whatever the number of copies (msa §3.5); then one message per copy.
-        let mut actions = Vec::new();
-        if broker && let Some(rc) = &d.remote {
-            let oc = b.container_of_component(&owner)?;
+    Ok(())
+}
+
+/// Rule 0, completions: every `Notification` puts its CPU (`cpuMs` on the CPU of its action's
+/// container) and an asynchronous fork with its deliveries right after its action. A published
+/// one, with a broker, first publishes once through the publisher of the action's container (on
+/// its sidecar); its deliveries are messages whose stubs only travel (broker, latency, call:
+/// rule 2). Otherwise each delivery is a plain call.
+fn notifications(b: &mut Builder, d: &Decisions) -> Result<(), String> {
+    let broker = d.remote.as_ref().filter(|r| r.broker.is_some());
+    for n in &d.notifications {
+        let w = &n.after;
+        let owner = b.component_of(w).ok_or_else(|| format!("{}: {w} is in no component", n.name))?;
+        let oc = b.container_of_component(&owner)?;
+        let message = n.published && broker.is_some();
+        let mut sends = Vec::new();
+        if message && let Some(rc) = broker {
             let (pasm, piface) = b.publisher(&oc, rc)?;
             let sig = b.g.refs(&piface, "signatures").into_iter().next().ok_or("a publisher without its operation")?;
             let r = b.role_to(&owner, &piface, &pasm, None)?;
-            actions.push(b.external(&format!("{w}_publish"), &r, &sig));
+            sends.push(b.external(&format!("{w}_publish"), &r, &sig));
         }
-        actions.extend(sends);
-        let fork = b.named(&format!("{w}_feed"), "ForkAction", None);
-        let fb = b.named(&format!("{w}_feed_async"), "ForkedBehaviour", None);
-        b.g.link(&fork, "asynchronousForkedBehaviours", &fb);
-        b.fill(&fb, &actions);
-        b.insert_after(&w, &fork)?;
+        for (provider, service) in &n.deliveries {
+            let iface = b.g.container(service).ok_or_else(|| format!("{service} is in no interface"))?;
+            let kind = if message { Some(RoleKind::Published) } else { None };
+            let role = b.role_to(&owner, &iface, provider, kind)?;
+            let label = b.g.entity(service);
+            sends.push(b.external(&format!("{w}_{label}"), &role, service));
+        }
+        let mut actions = Vec::new();
+        if n.cpu_ms > 0.0 {
+            actions.push(b.internal(w, "notify", &[("CPU", b.cpu_units(&oc, n.cpu_ms)?)]));
+        }
+        actions.push(b.async_fork(&format!("{w}_notification"), &sends));
+        b.insert_all_after(w, &actions)?;
     }
     Ok(())
 }
@@ -1789,7 +1831,7 @@ fn mechanisms(b: &mut Builder, d: &Decisions) -> Result<(), String> {
             continue;
         }
         match m {
-            Mechanism::Sync | Mechanism::LocalCopy { .. } | Mechanism::Composed { .. } | Mechanism::Bypass { .. } => {}
+            Mechanism::Sync | Mechanism::Other | Mechanism::Composed { .. } | Mechanism::Bypass { .. } => {}
             Mechanism::Async => {
                 // Through the broker to another container: the stub publishes on the caller's
                 // path and forks the rest (rule 2), as msa-sim-service does (D6 there: E5).
@@ -1910,8 +1952,8 @@ fn remote_calls(b: &mut Builder, rc: &RemoteCalls) -> Result<(), String> {
                     let f = b.async_fork(&format!("{seff}_send"), &trip);
                     vec![p, f]
                 }
-                // published once by the writer's publisher: the trip only
-                Some(RoleKind::Feed) => trip,
+                // published once by the sender's publisher: the trip only
+                Some(RoleKind::Published) => trip,
                 // request and reply: publish, the trip, then the reply's broker, latency, deliver
                 Some(RoleKind::Reply) => {
                     let mut v = vec![b.internal(&seff, "publish", &[("CPU", publish_out)])];
@@ -2132,14 +2174,17 @@ fn cost(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>, warnings
 }
 
 /// How much a call between two containers couples them, by mechanism (DESIGN §12 D32, D44, as
-/// msa's coupling weights): a bypass 2, a synchronous or cached call 1, a composed call and a
-/// local copy 0.5, an asynchronous call 0.3. A call inside one container counts 1 whatever its
-/// mechanism.
-fn coupling_weight(m: &Mechanism) -> f64 {
+/// msa's coupling weights): the mechanism's `couplingWeight`, else by class: a bypass 2, a
+/// synchronous or cached call 1, a composed call 0.5, an asynchronous call 0.3, a mechanism of
+/// another layer 1. A call inside one container counts 1 whatever its mechanism.
+fn coupling_weight(m: &Mechanism, weight: Option<f64>) -> f64 {
+    if let Some(w) = weight {
+        return w;
+    }
     match m {
         Mechanism::Bypass { .. } => 2.0,
-        Mechanism::Sync | Mechanism::Cached { .. } => 1.0,
-        Mechanism::LocalCopy { .. } | Mechanism::Composed { .. } => 0.5,
+        Mechanism::Sync | Mechanism::Cached { .. } | Mechanism::Other => 1.0,
+        Mechanism::Composed { .. } => 0.5,
         Mechanism::Async => 0.3,
     }
 }
@@ -2170,7 +2215,8 @@ fn modularity(g: &Graph, d: &Decisions, loads: &Loads, placement: &BTreeMap<Stri
             modules.insert(asm);
         }
     }
-    let weight: HashMap<&String, f64> = d.sites.iter().map(|(_, call, m)| (call, coupling_weight(m))).collect();
+    let weight: HashMap<&String, f64> =
+        d.sites.iter().map(|(_, call, m)| (call, coupling_weight(m, d.q.coupling.get(call).copied()))).collect();
     let mut intra: BTreeMap<&String, f64> = BTreeMap::new();
     let mut inter: BTreeMap<&String, f64> = BTreeMap::new();
     for m in &modules {

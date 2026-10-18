@@ -381,29 +381,87 @@ fn models_without_decisions_simulate_as_in_palladio_sim_service() {
     }
 }
 
-#[test]
-fn local_copy_reads_the_copy_and_writers_feed_it() {
-    // Backend's query reads a copy kept by a store assembly on C1 (with an HDD); Backend itself
-    // is the writer (its CPU action feeds the copy).
-    let hdd = "C1.activeResourceSpecifications -- C1_hdd\nC1_hdd : ProcessingResourceSpecification { \
-               schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
-               processingRate = \"1000\" numberOfReplicas = 1 }\n";
-    let decisions = format!(
-        "{}{hdd}ms : MicroserviceDecisions {{ }}\nms.copyFeeds -- feed\nfeed : CopyFeed {{ }}\nfeed.site -- site\n\
-         feed.writers -- Backend_query_cpu\nfeed.store -- AssemblyFrontend\n",
-        site("m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 }")
+/// An HDD on container `c` (1000 units per second).
+fn hdd(c: &str) -> String {
+    format!(
+        "{c}.activeResourceSpecifications -- {c}_hdd\n{c}_hdd : ProcessingResourceSpecification {{ \
+         schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
+         processingRate = \"1000\" numberOfReplicas = 1 }}\n"
+    )
+}
+
+/// A copy store as the HPA project's layer-3 sync makes it (DESIGN.md H11): a component `cs` with
+/// an interface of its own, a read and a write operation per copy (an InternalAction each whose
+/// times are a Work: (cpuMs, hddMs)), and an assembly that sits with `host` (a Colocation). Per
+/// copy: (name, read work, write work).
+fn copy_store(cs: &str, host: &str, copies: &[(&str, (f64, f64), (f64, f64))]) -> String {
+    let mut out = format!(
+        "repo.interfaces -- {cs}_copies\n{cs}_copies : OperationInterface {{ entityName = \"{cs}_copies\" }}\n\
+         repo.components -- {cs}\n{cs} : BasicComponent {{ entityName = \"{cs}\" }}\n{cs}.providedRoles -- {cs}_provides\n\
+         {cs}_provides : OperationProvidedRole {{ }}\n{cs}_provides.providedInterface -- {cs}_copies\n\
+         system.assemblyContexts -- Assembly_{cs}\nAssembly_{cs} : AssemblyContext {{ entityName = \"Assembly_{cs}\" }}\n\
+         Assembly_{cs}.encapsulatedComponent -- {cs}\ncol_{cs} : Colocation {{ }}\ncol_{cs}.assembly -- Assembly_{cs}\n\
+         col_{cs}.host -- {host}\ndecisions.colocations -- col_{cs}\n"
     );
-    let t = translated(&fixture(0.5, "C2", &decisions));
+    for (name, read, write) in copies {
+        for (op, (cpu, hdd), local) in [("read", read, "readCopy"), ("write", write, "writeCopy")] {
+            let sig = format!("{cs}_{op}_{name}");
+            out += &format!(
+                "{cs}_copies.signatures -- {sig}\n{sig} : OperationSignature {{ entityName = \"{op}_{name}\" }}\n\
+                 {cs}.serviceEffectSpecifications -- {sig}_seff\n{sig}_seff : ResourceDemandingSEFF {{ }}\n\
+                 {sig}_seff.describedService -- {sig}\n{sig}_seff.steps -- {sig}_start\n{sig}_seff.steps -- {sig}_a\n\
+                 {sig}_seff.steps -- {sig}_stop\n{sig}_start : StartAction {{ }}\n{sig}_a : InternalAction {{ entityName = \"{local}\" }}\n\
+                 {sig}_stop : StopAction {{ }}\n{sig}_start.successor -- {sig}_a\n{sig}_a.successor -- {sig}_stop\n\
+                 {sig}_work : Work {{ cpuMs = {cpu:?} hddMs = {hdd:?} }}\n{sig}_work.action -- {sig}_a\ndecisions.work -- {sig}_work\n"
+            );
+        }
+    }
+    out
+}
+
+/// A Redirect of `call` to the read operation of copy `name` in copy store `cs`.
+fn redirect(call: &str, cs: &str, name: &str) -> String {
+    format!(
+        "red_{name} : Redirect {{ }}\nred_{name}.call -- {call}\nred_{name}.provider -- Assembly_{cs}\n\
+         red_{name}.service -- {cs}_read_{name}\ndecisions.redirects -- red_{name}\n"
+    )
+}
+
+/// A Notification after `after` with `attrs`, delivering to (provider assembly, signature).
+fn notification(n: &str, after: &str, attrs: &str, deliveries: &[(&str, &str)]) -> String {
+    let mut out = format!("{n} : Notification {{ {attrs} }}\n{n}.after -- {after}\ndecisions.notifications -- {n}\n");
+    for (i, (p, sig)) in deliveries.iter().enumerate() {
+        out += &format!("{n}.deliveries -- {n}_d{i}\n{n}_d{i} : Delivery {{ }}\n{n}_d{i}.provider -- {p}\n{n}_d{i}.service -- {sig}\n");
+    }
+    out
+}
+
+/// Frontend's call of Backend reads a copy (in a copy store with Frontend on C1, which has an
+/// HDD; read work `read`); Backend's CPU action writes it (a published Notification, unless
+/// Backend sits with the copy). The site's mechanism is `mechanism`, named m.
+fn copy_model_with(backend: &str, mechanism: &str, read: (f64, f64), extra: &str) -> WireModel {
+    let mut d = site(mechanism) + &hdd("C1") + &copy_store("cs", "AssemblyFrontend", &[("q", read, (0.5, 2.0))]);
+    d += &redirect("Frontend_handle_callQuery", "cs", "q");
+    if backend != "C1" {
+        d += &notification("pub", "Backend_query_cpu", "published = true", &[("Assembly_cs", "cs_write_q")]);
+    }
+    fixture(0.5, backend, &format!("{d}{extra}"))
+}
+
+#[test]
+fn redirected_call_reads_a_copy_kept_with_the_caller() {
+    // a mechanism of another layer (the HPA project's LocalCopy), realised by the completions
+    let t = translated(&copy_model_with("C2", "m : LocalCopy { readDbMs = 1.0 }", (0.0, 1.0), ""));
     let g = Graph::new(&t.pcm);
     assert_eq!(demands_of(&g, "readCopy"), vec![("HDD".into(), 1.0)]);
-    let mut w = demands_of(&g, "writeCopy");
-    w.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(w, vec![("CPU".into(), 0.5), ("HDD".into(), 2.0)]);
+    assert_eq!(demands_of(&g, "writeCopy"), vec![("CPU".into(), 0.5), ("HDD".into(), 2.0)]);
     // The handle no longer calls Backend: 5 ms + 1 ms read. Nothing calls Backend any more, so
-    // its feeding write never runs either.
+    // its write never runs either.
     close(response_ms(&t.pcm), 6.0, 0.02);
     let hdd_busy = t.loads.resources.iter().find(|r| r.container == "C1" && r.kind == "HDD").unwrap().busy;
     close(hdd_busy, 0.5 * 0.001, 1e-9);
+    // the copy store's assembly sits with its host
+    assert_eq!(t.loads.resources.iter().filter(|r| r.container == "C1" && r.kind == "HDD").count(), 1);
 }
 
 #[test]
@@ -451,10 +509,13 @@ fn modularity_is_cohesive_mq_over_movable_components() {
     let rc = remote(1.0, 1.0, 1.0).replace(ROOT, "") + "rc.direct -- C2\n";
     let t = translated(&fixture(2.0, "C2", &format!("{}{}{rc}", site(sync), placements(&["C2"]))));
     close(t.modularity, 1.0, 1e-9);
-    // a local copy (0.5 requests/s): Backend no longer executes for Frontend (own work 0), the
-    // read couples by 0.5: Frontend 0.5 / (0.5 + 0.25/2), Backend 0
-    let m = copy_model_with("C2", "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 }", &placements(&["C1", "C2"]));
+    // a redirected call (0.5 requests/s): Backend no longer executes for Frontend (own work 0),
+    // the read couples by its mechanism's couplingWeight 0.5: Frontend 0.5 / (0.5 + 0.25/2), Backend 0
+    let m = copy_model_with("C2", "m : LocalCopy { couplingWeight = 0.5 }", (0.0, 1.0), &placements(&["C1", "C2"]));
     close(translated(&m).modularity, 0.5 / 0.625, 1e-9);
+    // a mechanism of another layer without a couplingWeight couples as a synchronous call
+    let m = copy_model_with("C2", "m : LocalCopy { }", (0.0, 1.0), &placements(&["C1", "C2"]));
+    close(translated(&m).modularity, 0.5 / 0.75, 1e-9);
 }
 
 #[test]
@@ -496,46 +557,91 @@ fn container_prices_replace_the_cost_rule() {
     close(t.cost, 16.0 + 2.0, 1e-12);
 }
 
-fn copy_model(backend: &str, mechanism: &str) -> WireModel {
-    copy_model_with(backend, mechanism, "")
-}
-
-fn copy_model_with(backend: &str, mechanism: &str, extra: &str) -> WireModel {
-    let hdd = "C1.activeResourceSpecifications -- C1_hdd\nC1_hdd : ProcessingResourceSpecification { \
-               schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
-               processingRate = \"1000\" numberOfReplicas = 1 }\n";
-    let decisions = format!(
-        "{}{hdd}ms : MicroserviceDecisions {{ }}\nms.copyFeeds -- feed\nfeed : CopyFeed {{ }}\nfeed.site -- site\n\
-         feed.writers -- Backend_query_cpu\nfeed.store -- AssemblyFrontend\n",
-        site(mechanism)
-    );
-    fixture(0.5, backend, &format!("{decisions}{extra}"))
-}
-
 #[test]
-fn local_copy_read_cpu_runs_in_the_store() {
-    let t = translated(&copy_model("C2", "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 readCpuMs = 2.0 }"));
+fn work_becomes_demands_at_the_rates_of_its_container() {
+    let t = translated(&copy_model_with("C2", "m : LocalCopy { }", (2.0, 1.0), ""));
     let g = Graph::new(&t.pcm);
-    let mut r = demands_of(&g, "readCopy");
-    r.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(r, vec![("CPU".into(), 2.0), ("HDD".into(), 1.0)]);
+    assert_eq!(demands_of(&g, "readCopy"), vec![("CPU".into(), 2.0), ("HDD".into(), 1.0)]);
     // 5 ms + 2 ms CPU + 1 ms read
     close(response_ms(&t.pcm), 8.0, 0.02);
     let busy = |kind: &str| t.loads.resources.iter().find(|r| r.container == "C1" && r.kind == kind).unwrap().busy;
     close(busy("CPU"), 0.5 * 0.007, 1e-9);
     close(busy("HDD"), 0.5 * 0.001, 1e-9);
+    // on a CPU twice as fast the same ms are twice the units (the host on C1 at 2000 units/s)
+    let base = copy_model_with("C2", "m : LocalCopy { }", (2.0, 1.0), "");
+    let path = base.metamodel_path.clone();
+    let fast = base.instances.into_iter().map(|mut x| {
+        if x.name == "C1_cpu" {
+            x.attributes.retain(|(k, _)| k != "processingRate");
+            x.attributes.push(("processingRate".into(), vec![WireValue::String("2000".into())]));
+        }
+        x
+    });
+    let m = WireModel { metamodel_path: path.clone(), instances: fast.collect() };
+    let t = translated(&m);
+    assert_eq!(demands_of(&Graph::new(&t.pcm), "readCopy"), vec![("CPU".into(), 4.0), ("HDD".into(), 1.0)]);
+    // a Work of a component without an assembly adds nothing (it never runs)
+    let unplaced = copy_model_with("C2", "m : LocalCopy { }", (2.0, 1.0), "")
+        .instances
+        .into_iter()
+        .filter(|x| !x.name.starts_with("red_") && !x.name.starts_with("pub") && x.name != "Assembly_cs" && x.name != "col_cs")
+        .collect();
+    let t = translated(&WireModel { metamodel_path: path, instances: unplaced });
+    assert!(demands_of(&Graph::new(&t.pcm), "readCopy").is_empty());
 }
 
 #[test]
-fn a_writer_in_the_stores_container_feeds_nothing() {
-    let m = "m : LocalCopy { readDbMs = 1.0 writeCpuMs = 0.5 writeDbMs = 2.0 }";
-    let feeds = |t: &Translation| Graph::new(&t.pcm).all("ExternalCallAction").into_iter().filter(|a| a.contains("_feed_")).count();
-    // Backend (the writer) on C2, the store on C1: one write message
-    assert_eq!(feeds(&translated(&copy_model("C2", m))), 1);
-    // both on C1: the copy is the writer's own data
-    let t = translated(&copy_model("C1", m));
-    assert_eq!(feeds(&t), 0);
-    assert!(Graph::new(&t.pcm).all("ForkAction").is_empty());
+fn a_notification_delivers_in_the_background() {
+    // Frontend's CPU action notifies Backend.query (a plain call, no broker), with 1 ms of CPU
+    // first; Frontend still calls Backend itself: 5 + 1 + 2 + 4 + 3 + 10 = 25 ms
+    let d = remote(2.0, 3.0, 4.0) + &notification("n", "Frontend_handle_cpu", "cpuMs = 1.0", &[("AssemblyBackend", "query")]);
+    let t = translated(&fixture(0.5, "C2", &d));
+    close(no_load_ms(&t), 25.0, 1e-9);
+    // simulated, the background call competes with the request's own call for both single-core
+    // CPUs (about 8 ms here), but the request does not wait for it: that would take 25 + 19
+    let r = response_ms(&t.pcm);
+    assert!(r > 25.0 && r < 40.0, "response {r} ms");
+    let busy = |c: &str| t.loads.resources.iter().find(|r| r.container == c && r.kind == "CPU").unwrap().busy;
+    // C1: 5 + 1 + two calls' marshal 2 + 2; C2: two calls of 3 + 10
+    close(busy("C1"), 0.5 * 0.010, 1e-9);
+    close(busy("C2"), 0.5 * 0.026, 1e-9);
+    assert_eq!(Graph::new(&t.pcm).all("ForkAction").len(), 1);
+    // published without a broker: the same plain call
+    let p = translated(&fixture(0.5, "C2", &d.replace("cpuMs = 1.0", "cpuMs = 1.0 published = true")));
+    close(p.loads.resources.iter().find(|r| r.container == "C1" && r.kind == "CPU").unwrap().busy, 0.5 * 0.010, 1e-9);
+}
+
+#[test]
+fn colocation_follows_its_host() {
+    // the copy store sits with Frontend wherever Frontend is: C1, and on C2 when Frontend moves
+    let m = copy_model_with("C2", "m : LocalCopy { }", (0.0, 1.0), &hdd("C2"));
+    let t = translated(&m);
+    assert_eq!(t.loads.resources.iter().find(|r| r.container == "C1" && r.kind == "HDD").unwrap().busy > 0.0, true);
+    let moved = WireModel {
+        metamodel_path: m.metamodel_path.clone(),
+        instances: m
+            .instances
+            .into_iter()
+            .map(|mut x| {
+                if x.name == "alloc_Frontend" {
+                    for (k, v) in &mut x.references {
+                        if k == "resourceContainer" {
+                            *v = vec!["C2".into()];
+                        }
+                    }
+                }
+                x
+            })
+            .collect(),
+    };
+    let t = translated(&moved);
+    close(t.loads.resources.iter().find(|r| r.container == "C2" && r.kind == "HDD").unwrap().busy, 0.5 * 0.001, 1e-9);
+    // the walks of the model before translation do not see the colocated assembly
+    assert!(!t.placement.contains_key("Assembly_cs"));
+    // an assembly with a Colocation and an allocation of its own is an error
+    let both = copy_model_with("C2", "m : LocalCopy { }", (0.0, 1.0),
+        "allocation.allocationContexts -- alloc_cs\nalloc_cs : AllocationContext { }\nalloc_cs.assemblyContext -- Assembly_cs\nalloc_cs.resourceContainer -- C2\n");
+    assert!(translate::translate(&both).unwrap_err().contains("Colocation"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -735,19 +841,19 @@ fn orchestration_moves_the_steps_to_the_trigger() {
     close(no_load_ms(&t), 71.0 - 9.0, 1e-9);
 }
 
+/// A projection as the HPA project's sync makes it while the read side sits apart from its
+/// source: the write is followed by 0.5 ms on its CPU and `apply` on the read side, in the
+/// background (an unpublished Notification).
 fn projection() -> String {
-    format!(
-        "{ROOT}ms : MicroserviceDecisions {{ }}\nms.projections -- pr\npr : Projection {{ cpuMs = 0.5 }}\n\
-         pr.reads -- Assembly_DbRead\npr.source -- Assembly_Db\npr.writers -- Backend_update_callWrite\npr.apply -- IDbRead_apply\n"
-    )
+    format!("{ROOT}{}", notification("pr", "Backend_update_callWrite", "cpuMs = 0.5", &[("Assembly_DbRead", "IDbRead_apply")]))
 }
 
 #[test]
 fn read_store_is_fed_by_projection() {
-    // read side with the write side: nothing changes (34 ms, all local)
-    let t = translated(&chain(0.5, "C2", "C2", "C3", &projection()));
+    // read side with the write side (the sync makes no Notification): 34 ms, all local
+    let t = translated(&chain(0.5, "C2", "C2", "C3", ROOT));
     close(no_load_ms(&t), 34.0, 1e-9);
-    assert!(demands_of(&Graph::new(&t.pcm), "project").is_empty());
+    assert!(demands_of(&Graph::new(&t.pcm), "notify").is_empty());
     // a read store of its own (C6): the write projects 0.5 ms on Backend, then applies 1 ms there
     let t = translated(&chain(0.5, "C2", "C2", "C6", &projection()));
     close(no_load_ms(&t), 34.5, 1e-9);
@@ -787,23 +893,17 @@ fn quota_runs_at_full_speed_when_idle() {
 #[test]
 fn a_write_publishes_once_for_all_its_copies() {
     // Frontend's CPU action writes; Backend (C2) and Gateway (C0) keep copies of it
-    let hdd = |c: &str| {
-        format!(
-            "{c}.activeResourceSpecifications -- {c}_hdd\n{c}_hdd : ProcessingResourceSpecification {{ \
-             schedulingPolicy = SchedulingPolicy.PROCESSOR_SHARING activeResourceType = ProcessingResourceType.HDD \
-             processingRate = \"1000\" numberOfReplicas = 1 }}\n"
-        )
-    };
+    // (the copies' realisation as the HPA project's sync makes it: copy stores with their hosts,
+    // Redirects of the two reads, one published Notification of the write with two Deliveries)
     let mut d = chain_remote() + CHAIN_BROKER + &hdd("C0") + &hdd("C2");
-    d += "copy : LocalCopy { readDbMs = 0.3 writeCpuMs = 1.0 writeDbMs = 0.9 }\ndecisions.mechanisms -- copy\n\
-          ms : MicroserviceDecisions { }\n";
+    d += "copy : LocalCopy { }\ndecisions.mechanisms -- copy\n";
     for (s, call, store) in [("sa", "Backend_query_callOther", "Assembly_Backend"), ("sb", "Backend_update_callNotify", "Assembly_Gateway")] {
-        d += &format!(
-            "{s} : CallSite {{ }}\n{s}.call -- {call}\n{s}.mechanism -- copy\n{s}.allowed -- copy\ndecisions.callSites -- {s}\n\
-             ms.copyFeeds -- feed_{s}\nfeed_{s} : CopyFeed {{ }}\nfeed_{s}.site -- {s}\nfeed_{s}.writers -- Frontend_handle_cpu\n\
-             feed_{s}.store -- {store}\n"
-        );
+        let cs = format!("cs_{s}");
+        d += &format!("{s} : CallSite {{ }}\n{s}.call -- {call}\n{s}.mechanism -- copy\n{s}.allowed -- copy\ndecisions.callSites -- {s}\n");
+        d += &copy_store(&cs, store, &[(s, (0.0, 0.3), (1.0, 0.9))]);
+        d += &redirect(call, &cs, s);
     }
+    d += &notification("pub", "Frontend_handle_cpu", "published = true", &[("Assembly_cs_sa", "cs_sa_write_sa"), ("Assembly_cs_sb", "cs_sb_write_sb")]);
     let t = translated(&chain(0.5, "C2", "C4", "C3", &d));
     let g = Graph::new(&t.pcm);
     // one publish (the publisher's), two messages through the broker
@@ -994,8 +1094,7 @@ fn change_coupling_counts_containers_touched_per_change() {
 #[test]
 fn inconsistency_counts_stale_reads_and_remote_writes() {
     let q = chain_quality();
-    let read_store = "pr : Projection { cpuMs = 0.5 }\npr.reads -- Assembly_DbRead\npr.source -- Assembly_Db\n\
-                      pr.writers -- Backend_update_callWrite\npr.apply -- IDbRead_apply\nmicro : MicroserviceDecisions { }\nmicro.projections -- pr\n";
+    let read_store = "pr : Replica { }\npr.replica -- Assembly_DbRead\npr.source -- Assembly_Db\ndecisions.dataReplicas -- pr\n";
     // two synchronous writes to other containers per request
     let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{}", write_sites("m2 : SyncCall { }"))));
     close(inconsistency(&t), 2.0, 1e-12);
@@ -1012,6 +1111,34 @@ fn inconsistency_counts_stale_reads_and_remote_writes() {
     close(inconsistency(&t), 2.75, 1e-12);
     let t = translated(&chain(0.5, "C2", "C4", "C6", &format!("{q}{}{cache}{read_store}", write_sites("m2 : SyncCall { }"))));
     close(inconsistency(&t), 3.0, 1e-12);
+}
+
+#[test]
+fn stale_reads_of_a_mechanism_count_across_containers() {
+    let q = chain_quality();
+    let writes = write_sites("m2 : SyncCall { }");
+    // the query (once per request) with a mechanism of another layer that reads stale data
+    // across containers (staleReads 1) and a Redirect to a copy with Frontend: + 1
+    let copy = query_site("m3 : LocalCopy { staleReads = 1.0 }")
+        + &hdd("C1")
+        + &copy_store("cs", "Assembly_Frontend", &[("q", (0.0, 0.3), (1.0, 0.9))])
+        + &redirect("Frontend_handle_callQuery", "cs", "q");
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{writes}{copy}")));
+    close(inconsistency(&t), 2.0 + 1.0, 1e-12);
+    // a share of 0.4
+    let t = translated(&chain(0.5, "C2", "C4", "C3", &format!("{q}{writes}{}", copy.replace("staleReads = 1.0", "staleReads = 0.4"))));
+    close(inconsistency(&t), 2.0 + 0.4, 1e-12);
+    // the redirected query does not run Backend: its update's write still counts (Frontend calls
+    // it), its read of DbRead does not happen; with Backend in Frontend's container the read is
+    // local (not stale) and the update stays in one container
+    let t = translated(&chain(0.5, "C1", "C4", "C3", &format!("{q}{writes}{copy}")));
+    close(inconsistency(&t), 1.0, 1e-12);
+    // Backend's read store apart (C6, a Replica): the redirected query no longer reads it
+    let replica = "pr : Replica { }\npr.replica -- Assembly_DbRead\npr.source -- Assembly_Db\ndecisions.dataReplicas -- pr\n";
+    let t = translated(&chain(0.5, "C2", "C4", "C6", &format!("{q}{writes}{copy}{replica}")));
+    close(inconsistency(&t), 2.0 + 1.0, 1e-12);
+    let t = translated(&chain(0.5, "C2", "C4", "C6", &format!("{q}{writes}{replica}")));
+    close(inconsistency(&t), 2.0 + 1.0, 1e-12);
 }
 
 #[test]

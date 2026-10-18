@@ -252,7 +252,7 @@ struct Walk<'a, 'b> {
     calls: HashMap<(String, String), f64>,
     action_calls: HashMap<(String, String, String), f64>,
     executions: HashMap<String, f64>,
-    /// Calls that do not reach their callee for `executions` and `action_calls` (a local copy).
+    /// Calls that do not reach their callee for `executions` and `action_calls` (a redirected call).
     skip: &'b BTreeSet<String>,
     /// Calls whose callee runs with this share of the caller's weight (a cache miss: 1 − hit).
     scale: &'b HashMap<String, f64>,
@@ -547,8 +547,8 @@ pub fn analyse(g: &Graph) -> Loads {
 }
 
 /// As `analyse`, but the calls of `skip` (external call actions) and everything below them do
-/// not count in `executions` and `action_calls` (the call itself does): a call that reads a local
-/// copy does not run its callee.
+/// not count in `executions` and `action_calls` (the call itself does): a redirected call does not
+/// run its callee.
 pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
     analyse_with(g, skip, &HashMap::new(), false)
 }

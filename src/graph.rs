@@ -253,6 +253,36 @@ impl Graph {
         }
     }
 
+    /// Removes the instances `names` and every link to them, in one pass.
+    pub fn remove_all(&mut self, names: &HashSet<String>) {
+        for n in names {
+            if let Some(&i) = self.index.get(n.as_str()) {
+                self.removed.insert(i);
+            }
+        }
+        for x in &mut self.insts {
+            for (_, v) in &mut x.references {
+                v.retain(|t| !names.contains(t));
+            }
+        }
+    }
+
+    /// `name` and everything it contains (Palladio containments), depth first.
+    pub fn subtree(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![name.to_string()];
+        while let Some(n) = stack.pop() {
+            let Some(x) = self.get(&n) else { continue };
+            for (f, ts) in &x.references {
+                if is_containment(&x.class_name, f) {
+                    stack.extend(ts.iter().filter(|t| self.has(t)).cloned());
+                }
+            }
+            out.push(n);
+        }
+        out
+    }
+
     /// Completes the opposite ends of every Palladio reference (a model read from a `.m` file
     /// names each link once; the platform sends both ends).
     pub fn complete_opposites(&mut self) {

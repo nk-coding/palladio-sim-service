@@ -24,7 +24,7 @@
 use crate::graph::{Graph, is_pcm};
 use crate::load::{self, Loads};
 use palladio_sim_service::protocol::{WireModel, WireValue};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod quality;
 pub use quality::{Quality, weighted};
@@ -2308,6 +2308,9 @@ fn pods(b: &mut Builder, d: &Decisions, placement: &BTreeMap<String, String>, qu
     b.g.set_attr(&cpu, "processingRate", s("1000000.0"));
     b.g.set_attr(&cpu, "numberOfReplicas", WireValue::Int(1));
     b.g.link(&host, "activeResourceSpecifications", &cpu);
+    if std::env::var_os("ARCH_NO_PRUNE").is_none() {
+        prune_unreachable(b);
+    }
     let link = sorted(b.g.all("LinkingResource")).into_iter().next();
     if let Some(l) = &link {
         b.g.link(l, "connectedResourceContainers", &host);
@@ -2412,7 +2415,10 @@ fn load_balancer(b: &mut Builder, asm: &str, host: &str) -> Result<String, Strin
     let lb = b.component(&format!("LoadBalancer_{label}"));
     let lp = b.role(&lb, &iface, true);
     let lr = b.role(&lb, &iface, false);
-    for sig in b.g.refs(&iface, "signatures") {
+    // the signatures the assembly still serves (rule 5 keeps the reachable SEFFs only)
+    let served: BTreeSet<String> =
+        b.g.refs(&comp, "serviceEffectSpecifications").iter().filter_map(|x| b.g.ref1(x, "describedService")).collect();
+    for sig in b.g.refs(&iface, "signatures").into_iter().filter(|x| served.contains(x)) {
         // what the callers pass
         let mut inputs = BTreeSet::new();
         for conn in &conns {
@@ -2478,4 +2484,72 @@ fn cost_parts(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>) ->
         per.insert(x.container.clone(), p);
     }
     (total - scaled, per)
+}
+
+/// Rule 5's reduction: the SEFFs no request reaches go, with their contents. A request starts at
+/// an entry-level call of the usage model, enters the system through its delegation, and runs a
+/// SEFF per (assembly, signature); every external call anywhere in a SEFF continues over its
+/// connector. The middleware of rule 2 has one SEFF per signature of an interface, and most of
+/// them are never called through their connector: in today's cut they are half of the model,
+/// and every scaling step rebuilds the whole model. Nothing a run executes changes.
+fn prune_unreachable(b: &mut Builder) {
+    let g = &b.g;
+    let mut conn: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut deleg: HashMap<String, Vec<String>> = HashMap::new();
+    for c in g.all("AssemblyConnector") {
+        if let (Some(req), Some(role), Some(prov)) =
+            (g.ref1(&c, "requiringAssemblyContext"), g.ref1(&c, "requiredRole"), g.ref1(&c, "providingAssemblyContext"))
+        {
+            conn.entry((req, role)).or_default().push(prov);
+        }
+    }
+    for c in g.all("ProvidedDelegationConnector") {
+        if let (Some(outer), Some(asm)) = (g.ref1(&c, "outerProvidedRole"), g.ref1(&c, "assemblyContext")) {
+            deleg.entry(outer).or_default().push(asm);
+        }
+    }
+    let mut seff_of: HashMap<(String, String), String> = HashMap::new();
+    let mut all_seffs = Vec::new();
+    for comp in g.all("BasicComponent") {
+        for x in g.refs(&comp, "serviceEffectSpecifications") {
+            if let Some(sig) = g.ref1(&x, "describedService") {
+                seff_of.insert((comp.clone(), sig), x.clone());
+            }
+            all_seffs.push(x);
+        }
+    }
+    let mut work: Vec<(String, String)> = Vec::new();
+    for call in g.all("EntryLevelSystemCall") {
+        if let (Some(role), Some(sig)) = (g.ref1(&call, "providedRole"), g.ref1(&call, "operationSignature")) {
+            for asm in deleg.get(&role).into_iter().flatten() {
+                work.push((asm.clone(), sig.clone()));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut keep = HashSet::new();
+    while let Some((asm, sig)) = work.pop() {
+        if !seen.insert((asm.clone(), sig.clone())) {
+            continue;
+        }
+        let Some(comp) = g.ref1(&asm, "encapsulatedComponent") else { continue };
+        let Some(seff) = seff_of.get(&(comp, sig)) else { continue };
+        keep.insert(seff.clone());
+        for x in g.subtree(seff) {
+            if g.class(&x) != "ExternalCallAction" {
+                continue;
+            }
+            let (Some(role), Some(csig)) = (g.ref1(&x, "role"), g.ref1(&x, "calledService")) else { continue };
+            for prov in conn.get(&(asm.clone(), role)).into_iter().flatten() {
+                work.push((prov.clone(), csig.clone()));
+            }
+        }
+    }
+    let mut gone = HashSet::new();
+    for x in all_seffs {
+        if !keep.contains(&x) {
+            gone.extend(b.g.subtree(&x));
+        }
+    }
+    b.g.remove_all(&gone);
 }

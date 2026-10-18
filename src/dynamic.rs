@@ -196,8 +196,21 @@ impl DynEngine {
                 self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let p2 = p.clone();
                 tokio::task::spawn_blocking(move || {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&p2, &params, limits)))
-                        .unwrap_or_else(|_| Err("the dynamic run panicked".into()))
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&p2, &params, limits)))
+                        .unwrap_or_else(|_| Err("the dynamic run panicked".into()));
+                    match &r {
+                        Ok(o) => tracing::info!(
+                            "dynamic run: {} groups, {} events, {:.0} ms ({:.0} ms adjusting, {} rescales){}",
+                            o.groups.len(),
+                            o.events,
+                            o.wall_ms,
+                            o.adjust_ms,
+                            o.rescales,
+                            if o.capped { ", capped" } else { "" }
+                        ),
+                        Err(e) => tracing::info!("dynamic run failed: {e}"),
+                    }
+                    r
                 })
                 .await
                 .map_err(|e| format!("the dynamic run was abandoned: {e}"))?

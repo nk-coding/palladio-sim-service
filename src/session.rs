@@ -126,13 +126,17 @@ impl Session {
                 None => {
                     let model = held.model.clone();
                     let max_pods = dyn_engine.max_pods;
-                    let p = tokio::task::spawn_blocking(move || -> Result<crate::dynamic::Prepared, String> {
-                        let (_, dm) = translate::translate_dynamic(&model)?;
-                        crate::dynamic::prepare(Arc::new(dm), max_pods)
+                    let (t, p) = tokio::task::spawn_blocking(move || -> Result<(Translation, crate::dynamic::Prepared), String> {
+                        let (t, dm) = translate::translate_dynamic(&model)?;
+                        Ok((t, crate::dynamic::prepare(Arc::new(dm), max_pods)?))
                     })
                     .await
                     .map_err(|e| (format!("the dynamic translation failed: {e}"), None))?
                     .map_err(|e| (e, None))?;
+                    // the static translation comes with it (the analytic functions use it)
+                    if held.translation.is_none() {
+                        held.translation = Some(Arc::new(t));
+                    }
                     let p = Arc::new(p);
                     held.dynamic = Some(p.clone());
                     p

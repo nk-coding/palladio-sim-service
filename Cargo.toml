@@ -16,6 +16,10 @@ simoxide-model = { path = "../simoxide/crates/simoxide-model" }
 simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
 simoxide-stoex = { path = "../simoxide/crates/simoxide-stoex" }
 simoxide-random = { path = "../simoxide/crates/simoxide-random" }
+# dynamic runs: SimOxide's SPD layer with the HPA, and Slingshot's adjustments (EPL default builds)
+simoxide-spd = { path = "../simoxide/crates/simoxide-spd", features = ["sim"] }
+simoxide-reconf = { path = "../simoxide/crates/simoxide-reconf" }
+lru = "0.12"
 
 axum = { version = "0.8", features = ["ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

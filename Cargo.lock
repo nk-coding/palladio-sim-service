@@ -830,12 +830,15 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "lru",
  "palladio-sim-service",
  "serde_json",
  "sha2",
  "simoxide-model",
  "simoxide-random",
+ "simoxide-reconf",
  "simoxide-sim",
+ "simoxide-spd",
  "simoxide-stoex",
  "tokio",
  "tracing",
@@ -994,6 +997,73 @@ dependencies = [
 ]
 
 [[package]]
+name = "qvto"
+version = "0.1.0"
+dependencies = [
+ "qvto-bytecode",
+ "qvto-runtime",
+ "qvto-sema",
+ "qvto-syntax",
+ "qvto-types",
+ "qvto-vm",
+ "simoxide-emf",
+ "simoxide-emf-core",
+]
+
+[[package]]
+name = "qvto-bytecode"
+version = "0.1.0"
+dependencies = [
+ "qvto-sema",
+ "qvto-syntax",
+ "qvto-types",
+ "simoxide-emf-core",
+]
+
+[[package]]
+name = "qvto-runtime"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.17.1",
+ "qvto-types",
+ "simoxide-emf-core",
+ "simoxide-jcompat",
+]
+
+[[package]]
+name = "qvto-sema"
+version = "0.1.0"
+dependencies = [
+ "qvto-syntax",
+ "qvto-types",
+ "simoxide-emf-core",
+]
+
+[[package]]
+name = "qvto-syntax"
+version = "0.1.0"
+
+[[package]]
+name = "qvto-types"
+version = "0.1.0"
+dependencies = [
+ "simoxide-emf-core",
+]
+
+[[package]]
+name = "qvto-vm"
+version = "0.1.0"
+dependencies = [
+ "qvto-bytecode",
+ "qvto-runtime",
+ "qvto-sema",
+ "qvto-types",
+ "regex",
+ "simoxide-emf",
+ "simoxide-emf-core",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1078,6 +1148,18 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1364,6 +1446,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "simoxide-reconf"
+version = "0.1.0"
+dependencies = [
+ "qvto",
+ "qvto-runtime",
+ "qvto-sema",
+ "qvto-vm",
+ "simoxide-emf",
+ "simoxide-emf-core",
+ "simoxide-model",
+ "simoxide-sim",
+ "simoxide-spd",
+]
+
+[[package]]
 name = "simoxide-sched"
 version = "0.1.0"
 
@@ -1378,6 +1475,17 @@ dependencies = [
  "simoxide-random",
  "simoxide-sched",
  "simoxide-stoex",
+]
+
+[[package]]
+name = "simoxide-spd"
+version = "0.1.0"
+dependencies = [
+ "ryu",
+ "serde_json",
+ "simoxide-emf-core",
+ "simoxide-model",
+ "simoxide-sim",
 ]
 
 [[package]]

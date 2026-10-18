@@ -14,7 +14,11 @@ usage: palladio-arch-service [serve]                 run the plugin service (por
        palladio-arch-service eval MODEL [--seed N] [--measurements N] [--max-sim-time S] [--replications N]
                                   [--plain] [--json]
                                                       translate, simulate and print the series, utilisation, cost
-                                                      and modularity; --plain ignores the decisions";
+                                                      and modularity; --plain ignores the decisions
+       palladio-arch-service hpa MODEL [--seed N] [--exclude A,B] [--json] [--dump DIR]
+                                                      a dynamic run with Kubernetes-style autoscaling over the
+                                                      model's load profile (archHpaSimulate); --dump writes its
+                                                      PCM, SPD and HPA files";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -22,6 +26,7 @@ fn main() -> ExitCode {
         None | Some("serve") => palladio_arch::server::main(),
         Some("translate") if args.len() == 3 => translate_cmd(Path::new(&args[1]), Path::new(&args[2])),
         Some("eval") if args.len() >= 2 => eval_cmd(&args[1..]),
+        Some("hpa") if args.len() >= 2 => hpa_cmd(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -257,6 +262,99 @@ fn eval_cmd(args: &[String]) -> Result<(), String> {
     println!("no-load response time (rate-weighted, all scenarios): {}", t.no_load_time(&[], |x| x.to_string()));
     for w in &t.warnings {
         println!("warning: {w}");
+    }
+    Ok(())
+}
+
+fn hpa_cmd(args: &[String]) -> Result<(), String> {
+    use palladio_arch::dynamic;
+    let mut params = dynamic::HpaParams { seed: 1, exclude: vec!["login".into()] };
+    let (mut json, mut dump) = (false, None);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => {
+                params.seed = args.get(i + 1).ok_or("missing value")?.parse().map_err(|e| format!("--seed: {e}"))?;
+                i += 1;
+            }
+            "--exclude" => {
+                params.exclude = args.get(i + 1).ok_or("missing value")?.split(',').map(String::from).filter(|x| !x.is_empty()).collect();
+                i += 1;
+            }
+            "--dump" => {
+                dump = Some(PathBuf::from(args.get(i + 1).ok_or("missing value")?));
+                i += 1;
+            }
+            "--json" => json = true,
+            other => return Err(format!("unknown option {other}\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let t0 = std::time::Instant::now();
+    let model = mfile::read(Path::new(&args[0]))?;
+    let (_, dm) = translate::translate_dynamic(&model)?;
+    let t_translate = t0.elapsed().as_secs_f64();
+    let config = Config::from_env()?;
+    let engine = dynamic::engine(&config);
+    let p = dynamic::prepare(Arc::new(dm), engine.max_pods)?;
+    if let Some(d) = &dump {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+        for (n, text) in &p.files {
+            std::fs::write(d.join(n), text).map_err(|e| e.to_string())?;
+        }
+    }
+    let limits = simoxide_sim::Limits::default();
+    let o = dynamic::run(&p, &params, limits)?;
+    if json {
+        let groups: Vec<serde_json::Value> = o
+            .groups
+            .iter()
+            .map(|g| serde_json::json!({"name": g.name, "meanReplicas": g.mean_replicas, "idealReplicas": g.ideal_replicas,
+                "maxReplicas": g.max_replicas, "rescales": g.rescales, "createdPods": g.created, "lag": g.lag, "reversals": g.reversals}))
+            .collect();
+        let mut out = serde_json::Map::new();
+        for st in functions::HPA_STATISTICS {
+            out.insert(st.to_string(), serde_json::json!(functions::hpa_stat(&o, st)));
+        }
+        out.insert("events".into(), serde_json::json!(o.events));
+        out.insert("wallMs".into(), serde_json::json!(o.wall_ms));
+        out.insert("adjustMs".into(), serde_json::json!(o.adjust_ms));
+        out.insert("translateMs".into(), serde_json::json!(t_translate * 1e3));
+        out.insert("adjustments".into(), serde_json::json!(o.adjustments));
+        out.insert("groups".into(), serde_json::Value::Array(groups));
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(out)).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    println!(
+        "dynamic run: {} groups, {} events, {:.0} ms (adjustments {:.0} ms; translation {:.0} ms)",
+        o.groups.len(),
+        o.events,
+        o.wall_ms,
+        o.adjust_ms,
+        t_translate * 1e3
+    );
+    println!(
+        "cost {:.3} (ideal autoscaler {:.3}), ready replica-seconds {:.0}, SLO violations {:.4} (after increases {:.4}) of {} requests",
+        o.cost, o.ideal_cost, o.ready_replica_seconds, o.slo, o.slo_steps, o.requests
+    );
+    println!(
+        "response time mean {:.2} ms, p95 {:.2} ms; lag mean {:.1} s, max {:.1} s; flapping {:.2}/h; peak pods {}; rescales {}, pods created {}, adjustments {}{}",
+        o.mean_ms,
+        o.p95_ms,
+        o.lag,
+        o.lag_max,
+        o.flapping,
+        o.peak_replicas,
+        o.rescales,
+        o.created,
+        o.adjustments,
+        if o.capped { " (CAPPED)" } else { "" }
+    );
+    for g in &o.groups {
+        println!(
+            "  {:<24} mean {:6.2} (ideal {:6.2}) max {:3} rescales {:3} created {:3} lag {:6.1} s reversals {}",
+            g.name, g.mean_replicas, g.ideal_replicas, g.max_replicas, g.rescales, g.created, g.lag, g.reversals
+        );
     }
     Ok(())
 }

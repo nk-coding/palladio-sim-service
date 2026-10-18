@@ -19,6 +19,8 @@ struct HeldModel {
     model: Arc<WireModel>,
     translation: Option<Arc<Translation>>,
     prepared: Option<Arc<Prepared>>,
+    /// The model of a dynamic run (rule 5), ready to run (`crate::dynamic`).
+    dynamic: Option<Arc<crate::dynamic::Prepared>>,
 }
 
 pub struct Session {
@@ -64,7 +66,7 @@ impl Session {
                 if self.models_seen == 1 || self.models_seen % 500 == 0 {
                     info!("{}: model #{} ({} instances)", self.label, self.models_seen, model.instances.len());
                 }
-                self.model = Some(HeldModel { id: model_id, model: Arc::new(model), translation: None, prepared: None });
+                self.model = Some(HeldModel { id: model_id, model: Arc::new(model), translation: None, prepared: None, dynamic: None });
                 None
             }
             ClientMessage::Release { ids, .. } => {
@@ -117,6 +119,40 @@ impl Session {
             (_, None) => return Err(("the call names no model to simulate".into(), None)),
             _ => return Err(("the model is not held".into(), Some(UNKNOWN_MODEL))),
         };
+        if functions::is_dynamic(operation) {
+            let dyn_engine = crate::dynamic::engine(&self.engine.config);
+            let prepared = match &held.dynamic {
+                Some(p) => p.clone(),
+                None => {
+                    let model = held.model.clone();
+                    let max_pods = dyn_engine.max_pods;
+                    let p = tokio::task::spawn_blocking(move || -> Result<crate::dynamic::Prepared, String> {
+                        let (_, dm) = translate::translate_dynamic(&model)?;
+                        crate::dynamic::prepare(Arc::new(dm), max_pods)
+                    })
+                    .await
+                    .map_err(|e| (format!("the dynamic translation failed: {e}"), None))?
+                    .map_err(|e| (e, None))?;
+                    let p = Arc::new(p);
+                    held.dynamic = Some(p.clone());
+                    p
+                }
+            };
+            let params = functions::hpa_params(operation, args).map_err(|e| (e, None))?;
+            let outcome = dyn_engine.simulate(prepared, params).await.map_err(|e| (e, None))?;
+            let mut next = self.next_id;
+            let answer = functions::call_dynamic(operation, args, &outcome, &mut || {
+                let id = next;
+                next -= 1;
+                id
+            })
+            .map_err(|e| (e, None))?;
+            self.next_id = next;
+            for o in &answer.objects {
+                self.heap.insert(o.id, o.version);
+            }
+            return Ok(ServiceMessage::Result { call_id, objects: answer.objects, value: answer.value });
+        }
         let translation = match &held.translation {
             Some(t) => t.clone(),
             None => {

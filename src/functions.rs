@@ -13,6 +13,10 @@
 //! val i = archInconsistency("login")             // stale reads + remote writes per request (D54)
 //! val v = archLatencyViolation()                 // C1: over the latency budgets (D55)
 //! val p = archPeakViolation()                    // C2: unscaled containers over their limit at the peak (D55)
+//! val h = archHpaSimulate()                      // a dynamic run with Kubernetes-style autoscaling (crate::dynamic)
+//! val c = archHpaCost()                          // its cost: replica-seconds under the HPA over the load profile
+//! val v = archHpaSlo()                           // its share of requests over the service level
+//! val l = archHpaStat("lag")                     // one of its other measures
 //! ```
 
 use crate::translate::Translation;
@@ -81,6 +85,30 @@ const UTIL_PARAMS: [Param; 1] = [p("element", Ty::String, Default::Str(""))];
 
 const NO_LOAD_PARAMS: [Param; 1] = [p("exclude", Ty::String, Default::Str(""))];
 
+const HPA_PARAMS: [Param; 2] = [p("seed", Ty::Int, Default::Int(1)), p("exclude", Ty::String, Default::Str("login"))];
+
+const HPA_STAT_PARAMS: [Param; 3] =
+    [p("statistic", Ty::String, Default::None), p("seed", Ty::Int, Default::Int(1)), p("exclude", Ty::String, Default::Str("login"))];
+
+/// The measures `archHpaStat` returns.
+pub const HPA_STATISTICS: &[&str] = &[
+    "cost",
+    "idealCost",
+    "readyReplicaSeconds",
+    "slo",
+    "sloSteps",
+    "requests",
+    "meanMs",
+    "p95Ms",
+    "lag",
+    "lagMax",
+    "flapping",
+    "peakReplicas",
+    "rescales",
+    "createdPods",
+    "capped",
+];
+
 struct Function {
     name: &'static str,
     params: &'static [Param],
@@ -103,6 +131,10 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "archLatencyViolation", params: &[], returns: Ty::Double, simulates: false },
     Function { name: "archPeakUtilisation", params: &[], returns: Ty::Double, simulates: false },
     Function { name: "archPeakViolation", params: &[], returns: Ty::Double, simulates: false },
+    Function { name: "archHpaSimulate", params: &HPA_PARAMS, returns: Ty::Record("ArchHpaResult"), simulates: false },
+    Function { name: "archHpaCost", params: &HPA_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archHpaSlo", params: &HPA_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "archHpaStat", params: &HPA_STAT_PARAMS, returns: Ty::Double, simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -149,6 +181,43 @@ const RECORDS: &[(&str, &[(&str, Ty)])] = &[
             ("maxUtilisation", Ty::Double),
             ("resources", Ty::ListOf("ArchResource")),
             ("warnings", Ty::ListOfString),
+        ],
+    ),
+    (
+        "ArchHpaResult",
+        &[
+            ("cost", Ty::Double),
+            ("idealCost", Ty::Double),
+            ("readyReplicaSeconds", Ty::Double),
+            ("replicaSeconds", Ty::Double),
+            ("slo", Ty::Double),
+            ("sloSteps", Ty::Double),
+            ("requests", Ty::Long),
+            ("meanMs", Ty::Double),
+            ("p95Ms", Ty::Double),
+            ("lag", Ty::Double),
+            ("lagMax", Ty::Double),
+            ("flapping", Ty::Double),
+            ("peakReplicas", Ty::Double),
+            ("rescales", Ty::Long),
+            ("createdPods", Ty::Long),
+            ("capped", Ty::Boolean),
+            ("events", Ty::Long),
+            ("wallMs", Ty::Double),
+            ("groups", Ty::ListOf("ArchHpaGroup")),
+        ],
+    ),
+    (
+        "ArchHpaGroup",
+        &[
+            ("name", Ty::String),
+            ("meanReplicas", Ty::Double),
+            ("idealReplicas", Ty::Double),
+            ("maxReplicas", Ty::Int),
+            ("rescales", Ty::Long),
+            ("createdPods", Ty::Long),
+            ("lag", Ty::Double),
+            ("reversals", Ty::Int),
         ],
     ),
     (
@@ -244,7 +313,7 @@ pub fn manifest() -> Value {
         "languagePlugins": [],
         "contributionPlugins": [{
             "languageId": "script",
-            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archFailure(), archChangeCoupling(), archInconsistency(), archLatencyViolation(), archPeakUtilisation(), archPeakViolation(), archInfo(): architecture decisions on Palladio models, translated to PCM and simulated",
+            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archFailure(), archChangeCoupling(), archInconsistency(), archLatencyViolation(), archPeakUtilisation(), archPeakViolation(), archInfo(); archHpaSimulate(), archHpaCost(), archHpaSlo(), archHpaStat(): architecture decisions on Palladio models, translated to PCM and simulated, also with Kubernetes-style autoscaling over a load profile",
             "additionalKeywords": [],
             "serverContributionPlugins": [{
                 "type": "script-language-contribution",
@@ -316,6 +385,108 @@ pub fn simulates(name: &str) -> bool {
     FUNCTIONS.iter().any(|f| f.name == name && f.simulates)
 }
 
+/// Whether `name` needs a dynamic run (`crate::dynamic`).
+pub fn is_dynamic(name: &str) -> bool {
+    name.starts_with("archHpa")
+}
+
+/// The parameters of a dynamic function's run.
+pub fn hpa_params(operation: &str, args: &[WireValue]) -> Result<crate::dynamic::HpaParams, String> {
+    let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
+    let a = Args { f, args };
+    Ok(crate::dynamic::HpaParams { seed: a.long("seed")?, exclude: excluded(&a)? })
+}
+
+/// Answers a dynamic function from the outcome of its run.
+pub fn call_dynamic(
+    operation: &str,
+    args: &[WireValue],
+    o: &crate::dynamic::HpaOutcome,
+    next_id: &mut impl FnMut() -> i64,
+) -> Result<Answer, String> {
+    let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
+    let a = Args { f, args };
+    let double = |v: f64| Ok(Answer { value: WireValue::Double(v), objects: vec![] });
+    match operation {
+        "archHpaCost" => double(o.cost),
+        "archHpaSlo" => double(o.slo),
+        "archHpaStat" => {
+            let st = a.string("statistic")?;
+            double(hpa_stat(o, &st).ok_or_else(|| format!("unknown statistic '{st}'; one of {}", HPA_STATISTICS.join(", ")))?)
+        }
+        "archHpaSimulate" => Ok(hpa_result(o, next_id)),
+        other => Err(format!("{other} is not a dynamic function")),
+    }
+}
+
+/// One measure of a dynamic run (`archHpaStat`).
+pub fn hpa_stat(o: &crate::dynamic::HpaOutcome, statistic: &str) -> Option<f64> {
+    Some(match statistic {
+        "cost" => o.cost,
+        "idealCost" => o.ideal_cost,
+        "readyReplicaSeconds" => o.ready_replica_seconds,
+        "slo" => o.slo,
+        "sloSteps" => o.slo_steps,
+        "requests" => o.requests as f64,
+        "meanMs" => o.mean_ms,
+        "p95Ms" => o.p95_ms,
+        "lag" => o.lag,
+        "lagMax" => o.lag_max,
+        "flapping" => o.flapping,
+        "peakReplicas" => o.peak_replicas,
+        "rescales" => o.rescales as f64,
+        "createdPods" => o.created as f64,
+        "capped" => f64::from(o.capped as u8),
+        _ => return None,
+    })
+}
+
+fn hpa_result(o: &crate::dynamic::HpaOutcome, next_id: &mut impl FnMut() -> i64) -> Answer {
+    let list_id = next_id();
+    let groups: Vec<WireValue> = o
+        .groups
+        .iter()
+        .map(|g| WireValue::Record {
+            class_name: "ArchHpaGroup".into(),
+            fields: vec![
+                ("name".into(), WireValue::String(g.name.clone())),
+                ("meanReplicas".into(), WireValue::Double(g.mean_replicas)),
+                ("idealReplicas".into(), WireValue::Double(g.ideal_replicas)),
+                ("maxReplicas".into(), WireValue::Int(g.max_replicas)),
+                ("rescales".into(), WireValue::Long(g.rescales as i64)),
+                ("createdPods".into(), WireValue::Long(g.created as i64)),
+                ("lag".into(), WireValue::Double(g.lag)),
+                ("reversals".into(), WireValue::Int(g.reversals as i32)),
+            ],
+        })
+        .collect();
+    let value = WireValue::Record {
+        class_name: "ArchHpaResult".into(),
+        fields: vec![
+            ("cost".into(), WireValue::Double(o.cost)),
+            ("idealCost".into(), WireValue::Double(o.ideal_cost)),
+            ("readyReplicaSeconds".into(), WireValue::Double(o.ready_replica_seconds)),
+            ("replicaSeconds".into(), WireValue::Double(o.replica_seconds)),
+            ("slo".into(), WireValue::Double(o.slo)),
+            ("sloSteps".into(), WireValue::Double(o.slo_steps)),
+            ("requests".into(), WireValue::Long(o.requests as i64)),
+            ("meanMs".into(), WireValue::Double(o.mean_ms)),
+            ("p95Ms".into(), WireValue::Double(o.p95_ms)),
+            ("lag".into(), WireValue::Double(o.lag)),
+            ("lagMax".into(), WireValue::Double(o.lag_max)),
+            ("flapping".into(), WireValue::Double(o.flapping)),
+            ("peakReplicas".into(), WireValue::Double(o.peak_replicas)),
+            ("rescales".into(), WireValue::Long(o.rescales as i64)),
+            ("createdPods".into(), WireValue::Long(o.created as i64)),
+            ("capped".into(), WireValue::Bool(o.capped)),
+            ("events".into(), WireValue::Long(o.events as i64)),
+            ("wallMs".into(), WireValue::Double(o.wall_ms)),
+            ("groups".into(), WireValue::Ref(list_id)),
+        ],
+    };
+    Answer { value, objects: vec![HeapObject { id: list_id, kind: HeapKind::List, version: 0, elements: Some(groups), entries: None }] }
+}
+
 /// Answers a call. `prepared` is the translated model, compiled (for the simulating functions).
 pub async fn call(
     engine: &Arc<Engine>,
@@ -351,6 +522,7 @@ pub async fn call(
             double((u - limit).max(0.0))
         }
         "archNoLoadTime" => double(translation.no_load_time(&excluded(&a)?, entity)),
+        op if is_dynamic(op) => Err(format!("{op} needs a dynamic run (crate::dynamic)")),
         "archSimulate" => {
             let prepared = prepared.ok_or("no model")?;
             let params = a.run_params()?;

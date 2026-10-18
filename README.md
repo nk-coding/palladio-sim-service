@@ -43,9 +43,30 @@ compilation 130–170 ms, simulation of 22 000 measurements 190–240 ms).
 | `archPeakUtilisation()`, `archPeakViolation()` | C2: the highest utilisation of the `PeakCapacity` containers at its factor, and its excess over the limit (D55) |
 | `archNoLoadTime(exclude = "")` | the rate-weighted mean response time without contention over the usage scenarios (but those named in `exclude`, comma-separated), in model time units: the expected-value walk of the translated model, no simulation (DESIGN D48; static objectives) |
 | `archInfo()` | `ArchInfo`: translated or not, cost, modularity, every resource's load, warnings |
+| `archHpaSimulate(seed = 1, exclude = "login")` | `ArchHpaResult`: a dynamic run with Kubernetes-style autoscaling over the model's `LoadProfile` (rule 5, `src/dynamic.rs`, below): cost, SLO violations, lag, flapping, pods, per autoscaler |
+| `archHpaCost(seed = 1, exclude = "login")` | its cost per time over the profile's window: the fixed cost plus each autoscaled container's price per pod times its ready pods (the dynamic O1) |
+| `archHpaSlo(seed = 1, exclude = "login")` | its share of requests (all scenarios with a `LatencyBudget` but `exclude`) slower than `sloFactor` × their budget |
+| `archHpaStat(statistic, seed = 1, exclude = "login")` | one measure of the run: `cost`, `idealCost`, `readyReplicaSeconds`, `slo`, `sloSteps`, `requests`, `meanMs`, `p95Ms`, `lag`, `lagMax`, `flapping`, `peakReplicas`, `rescales`, `createdPods`, `capped` |
 
 A model without decisions (or with decisions that change nothing) is simulated exactly as
 palladio-sim-service simulates it. Simulations are shared and cached as there.
+
+**Dynamic runs** (`archHpa*`; the HPA project's DESIGN.md H2–H4). Rule 5 (`translate_dynamic`)
+turns the translated model into the structure SimOxide's HPA scales (SimOxide `DESIGN-SPD.md`
+§5.10): every autoscaled `Deployable` becomes one pod (⌈q⌉ cores at the per-core speed of rules 3
+and 4, an HPA request of q full-speed cores), each assembly on it gets a load balancer (Slingshot's
+pattern: one branch with one call per pod, on `LoadBalancerServer`), its sidecar the cores of
+`maxReplicas` pods; an SPD elastic infrastructure per pod, a service group per assembly, and one
+`HorizontalPodAutoscaler` per Deployable (`averageUtilization` = 100 · `targetUtilisation`,
+`minReplicas`, `maxReplicas`, `startupSeconds`, `scaleDownSeconds`; absent: 1, twice the ideal count
+at the profile's peak (at least 4), 30 s, Kubernetes' 5 min). The run starts each group at the
+ideal autoscaler's count of the profile's first factor, applies the `LoadProfile` as SimOxide's
+load profile (every usage scenario) and measures over `[warmUpSeconds, endSeconds]`. Lag: per load
+increase and autoscaler that needs pods, the time until its ready pods reach the ideal count / 1.1;
+flapping: direction reversals of rescales per hour. A run that creates more than `HPA_MAX_PODS`
+pods (default 400) stops and is penalised (capped: every pod at its maximum, every request over
+budget). Outcomes are cached by content (`SIM_RESULT_CACHE_SIZE`); at most `SIM_THREADS` run at
+once. `HPA_TRACE_DIR` writes a run's response times and pods over time.
 
 ## Command line
 
@@ -55,6 +76,9 @@ palladio-arch-service translate MODEL OUT_DIR    OUT_DIR/<name>.translated.m (pl
 palladio-arch-service eval MODEL [--seed N] [--measurements N] [--max-sim-time S] [--replications N]
                                  [--plain] [--json]
                                                  translate, simulate, print series, loads, cost, modularity
+palladio-arch-service hpa MODEL [--seed N] [--exclude A,B] [--json] [--dump DIR]
+                                                 a dynamic run over the model's load profile; --dump writes its
+                                                 PCM, SPD and HPA files
 palladio-arch-service serve                      the plugin service (the default)
 ```
 
@@ -96,7 +120,11 @@ prints every cluster's intra and inter weight to stderr.
 
 ## Verification
 
-`cargo test --release` (32 tests; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
+`cargo test --release` (38 tests: the 32 below and the 6 of `tests/dynamic.rs`, which check the
+dynamic translation (the static model unchanged, one pod behind a load balancer, the SPD and HPA
+files), the HPA's steady replicas at a constant load against the ideal autoscaler (2, 3, 5 pods),
+a load step's SLO violations, lag and scale-in, the cap on created pods with its penalty, and the
+cache; `tests/fixtures/chain.m` is a gateway → frontend → backend chain
 with a database, a read side, a notifier and the placeholders the P6 tests fill in):
 
 | Test | Checks |
@@ -148,7 +176,8 @@ runs of the original PCM files; MediaStore: 23 554.228 ms for download).
 | `src/mfile.rs` | `.m` reader |
 | `src/functions.rs` | Manifest and function calls |
 | `src/session.rs`, `src/server.rs` | Sessions and HTTP/WebSocket, adapted from palladio-sim-service |
-| `tests/translation.rs`, `tests/fixtures/two-tier.m` | The tests |
+| `src/dynamic.rs` | Dynamic runs with the HPA: SPD and HPA files, the run, the dynamic objectives, their cache |
+| `tests/translation.rs`, `tests/dynamic.rs`, `tests/fixtures/two-tier.m` | The tests |
 
 ## Limitations
 

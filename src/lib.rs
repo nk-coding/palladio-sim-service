@@ -4,10 +4,14 @@
 //!
 //! - [`mfile`]: reads `.m` files (for the command line and the tests).
 //! - [`graph`]: the model as an editable instance graph.
-//! - [`translate`]: the completion rules (DESIGN.md §4, §5), cost and modularity.
+//! - [`translate`]: the completion rules (DESIGN.md §4, §5), cost and modularity; rule 5, the
+//!   model of a dynamic run.
+//! - [`dynamic`]: dynamic runs with Kubernetes-style autoscaling (SimOxide's HPA) over a load
+//!   profile, and their objectives.
 //! - [`load`]: offered load and call frequencies of a PCM model, without simulating.
 //! - [`functions`], [`session`], [`server`]: the plugin service.
 
+pub mod dynamic;
 pub mod functions;
 pub mod graph;
 pub mod load;

@@ -14,7 +14,8 @@
 //!   ready pods, time-weighted), the share of requests over `sloFactor` × their latency budget,
 //!   overall and in the two minutes after each load increase, scaling lag, flapping, peak pods.
 //! - **Bounds.** A run that creates more than `max_pods` pods stops (SimOxide's
-//!   `maxCreatedPods`); it is reported as capped and penalised (every pod at its maximum, every
+//!   `maxCreatedPods`), and so does one past the engine's limits (`SIM_TIMEOUT_SECONDS`,
+//!   `SIM_MAX_EVENTS`); it is reported as capped and penalised (every pod at its maximum, every
 //!   request over budget), so an evaluation never grows without bound.
 
 use crate::translate::{DynamicModel, PodGroup};
@@ -404,7 +405,8 @@ pub fn run(p: &Prepared, params: &HpaParams, limits: Limits) -> Result<HpaOutcom
         Err(e) => Err(e),
     };
     if let Err(e) = r2 {
-        if e.message.contains("maxCreatedPods") || e.message.contains("created more than") {
+        // the pod cap, or a limit of the run (deadline, events): penalised, not an error
+        if e.message.contains("maxCreatedPods") || e.kind == simoxide_sim::SimErrorKind::Limit {
             capped = true;
         } else {
             return Err(format!("the dynamic run failed: {}", e.message));

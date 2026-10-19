@@ -18,7 +18,12 @@ usage: palladio-arch-service [serve]                 run the plugin service (por
        palladio-arch-service hpa MODEL [--seed N] [--exclude A,B] [--json] [--dump DIR]
                                                       a dynamic run with Kubernetes-style autoscaling over the
                                                       model's load profile (archHpaSimulate); --dump writes its
-                                                      PCM, SPD and HPA files";
+                                                      PCM, SPD and HPA files
+       palladio-arch-service oracle MODEL... [--exclude A,B]
+                                                      the analytic arch* values of each model (.m or
+                                                      model data .json) as one JSON object per line:
+                                                      the reference of the layer-2 realisation by
+                                                      model transformations (domain project, B3)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -27,6 +32,7 @@ fn main() -> ExitCode {
         Some("translate") if args.len() == 3 => translate_cmd(Path::new(&args[1]), Path::new(&args[2])),
         Some("eval") if args.len() >= 2 => eval_cmd(&args[1..]),
         Some("hpa") if args.len() >= 2 => hpa_cmd(&args[1..]),
+        Some("oracle") if args.len() >= 2 => oracle_cmd(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -355,6 +361,146 @@ fn hpa_cmd(args: &[String]) -> Result<(), String> {
             "  {:<24} mean {:6.2} (ideal {:6.2}) max {:3} rescales {:3} created {:3} lag {:6.1} s reversals {}",
             g.name, g.mean_replicas, g.ideal_replicas, g.max_replicas, g.rescales, g.created, g.lag, g.reversals
         );
+    }
+    Ok(())
+}
+
+/// A model file: `.m` text, or model data as the platform stores it (`.json`: instances with
+/// properties, links with both ends).
+fn read_any(path: &Path) -> Result<palladio_sim_service::protocol::WireModel, String> {
+    use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        return mfile::read(path);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut insts = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for i in v["instances"].as_array().ok_or("no instances")? {
+        let name = i["name"].as_str().ok_or("an instance without a name")?.to_string();
+        let mut attributes = Vec::new();
+        if let Some(props) = i["properties"].as_object() {
+            for (k, x) in props {
+                let w = match x {
+                    serde_json::Value::Null => continue,
+                    serde_json::Value::Bool(b) => WireValue::Bool(*b),
+                    serde_json::Value::Number(n) => match n.as_i64() {
+                        Some(k) if !n.is_f64() => WireValue::Int(k as i32),
+                        _ => WireValue::Double(n.as_f64().unwrap_or(0.0)),
+                    },
+                    serde_json::Value::String(t) => WireValue::String(t.clone()),
+                    serde_json::Value::Object(o) => match o.get("enum").and_then(|e| e.as_str()) {
+                        Some(e) => WireValue::String(e.to_string()),
+                        None => continue,
+                    },
+                    serde_json::Value::Array(_) => continue,
+                };
+                attributes.push((k.clone(), vec![w]));
+            }
+        }
+        index.insert(name.clone(), insts.len());
+        insts.push(WireInstance { name, class_name: i["className"].as_str().unwrap_or_default().to_string(), attributes, references: Vec::new() });
+    }
+    let mut add = |a: &str, f: &str, b: &str| {
+        if let Some(&ia) = index.get(a) {
+            let x: &mut WireInstance = &mut insts[ia];
+            match x.references.iter_mut().find(|(k, _)| k == f) {
+                Some((_, v)) => v.push(b.to_string()),
+                None => x.references.push((f.to_string(), vec![b.to_string()])),
+            }
+        }
+    };
+    for l in v["links"].as_array().ok_or("no links")? {
+        let (a, b) = (l["sourceName"].as_str().unwrap_or_default(), l["targetName"].as_str().unwrap_or_default());
+        if let Some(f) = l["sourceProperty"].as_str() {
+            add(a, f, b);
+        }
+        if let Some(f) = l["targetProperty"].as_str() {
+            add(b, f, a);
+        }
+    }
+    let using = v["metamodelPath"].as_str().unwrap_or_default().to_string();
+    let mut g = palladio_arch::graph::Graph::new(&WireModel { metamodel_path: using, instances: insts });
+    g.complete_opposites();
+    let mut model = g.to_wire(|_| true);
+    for x in &mut model.instances {
+        for (_, v) in &mut x.references {
+            v.sort();
+            v.dedup();
+        }
+    }
+    Ok(model)
+}
+
+/// The analytic values of the `arch*` functions (as the objectives call them, scenarios in
+/// `--exclude`, default `login`, left out), per model one JSON line.
+fn oracle_cmd(args: &[String]) -> Result<(), String> {
+    let mut files = Vec::new();
+    let mut exclude = vec!["login".to_string()];
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--exclude" {
+            exclude = args.get(i + 1).ok_or("--exclude needs a value")?.split(',').map(str::to_string).filter(|x| !x.is_empty()).collect();
+            i += 2;
+            continue;
+        }
+        files.push(args[i].clone());
+        i += 1;
+    }
+    let num = |x: f64| if x.is_finite() { format!("{x:e}") } else { "null".to_string() };
+    for f in files {
+        let model = read_any(Path::new(&f))?;
+        let t = translate::translate(&model)?;
+        let entity = |n: &str| -> String {
+            t.pcm
+                .instances
+                .iter()
+                .chain(model.instances.iter())
+                .find(|x| x.name == n)
+                .and_then(|x| x.attributes.iter().find(|(k, _)| k == "entityName"))
+                .and_then(|(_, v)| match v.first() {
+                    Some(palladio_sim_service::protocol::WireValue::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| n.to_string())
+        };
+        let mut o: Vec<(String, String)> = vec![("model".into(), format!("{f:?}"))];
+        o.push(("cost".into(), num(t.cost)));
+        o.push(("modularity".into(), num(t.modularity)));
+        o.push(("utilisation".into(), num(t.utilisation("", &entity)?)));
+        o.push(("replicas".into(), num(t.replicas_of("", &entity)?)));
+        o.push(("noLoadTime".into(), num(t.no_load_time(&exclude, &entity))));
+        o.push(("noLoadTimeAll".into(), num(t.no_load_time(&[], &entity))));
+        if let Some(per) = &t.quality.failure {
+            o.push(("failure".into(), num(translate::weighted(per, &exclude, &entity))));
+        }
+        if let Some(c) = t.quality.change_coupling {
+            o.push(("changeCoupling".into(), num(c)));
+        }
+        if let Some(per) = &t.quality.inconsistency {
+            o.push(("inconsistency".into(), num(translate::weighted(per, &exclude, &entity))));
+        }
+        o.push(("latencyViolation".into(), num(t.latency_violation())));
+        if let Some((u, limit)) = t.peak_utilisation() {
+            o.push(("peakUtilisation".into(), num(u)));
+            o.push(("peakViolation".into(), num((u - limit).max(0.0))));
+        }
+        let scen: Vec<String> = t.no_load.iter().map(|(sc, (r, time))| format!("{:?}:[{},{}]", entity(sc), num(*r), num(*time))).collect();
+        o.push(("scenarios".into(), format!("{{{}}}", scen.join(","))));
+        let reps: Vec<String> = t.replicas.iter().map(|(c, n)| format!("{:?}:{}", entity(c), num(*n))).collect();
+        o.push(("replicasOf".into(), format!("{{{}}}", reps.join(","))));
+        let mut util = std::collections::BTreeMap::new();
+        for r in &t.loads.resources {
+            let e = util.entry(format!("{}/{}", entity(&r.container), r.kind)).or_insert(0.0f64);
+            *e = e.max(r.utilisation());
+        }
+        let us: Vec<String> = util.iter().map(|(k, v)| format!("{k:?}:{}", num(*v))).collect();
+        o.push(("utilisationOf".into(), format!("{{{}}}", us.join(","))));
+        let nodes: Vec<String> = t.nodes.iter().map(|n| format!("{:?}:[{},{}]", n.name, num(n.load), num(n.slowdown))).collect();
+        o.push(("nodes".into(), format!("{{{}}}", nodes.join(","))));
+        let ws: Vec<String> = t.warnings.iter().map(|w| format!("{w:?}")).collect();
+        o.push(("warnings".into(), format!("[{}]", ws.join(","))));
+        println!("{{{}}}", o.iter().map(|(k, v)| format!("{k:?}:{v}")).collect::<Vec<_>>().join(","));
     }
     Ok(())
 }

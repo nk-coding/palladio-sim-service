@@ -19,7 +19,7 @@
 use crate::graph::Graph;
 use simoxide_random::UniformSource;
 use simoxide_stoex::{Env, EvalError, Program, Value, VariableMode};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Load of one processing resource.
@@ -67,6 +67,16 @@ pub struct Loads {
     /// Per usage scenario, expected calls per request of every external call action: (caller,
     /// callee, action). Only filled by `analyse_with(.., per_scenario = true)`.
     pub scenario_calls: BTreeMap<String, BTreeMap<(String, String, String), f64>>,
+    /// Per usage scenario, expected executions per request of every action (SEFF actions and
+    /// entry-level system calls). Only filled by [`analyse_pcm`] with `visits`.
+    pub scenario_visits: BTreeMap<String, HashMap<String, f64>>,
+    /// Expected calls per time unit of every entry-level system call: (callee assembly, call).
+    pub entry_calls: BTreeMap<(String, String), f64>,
+    /// Per entry-level system call: Σ over the scenarios of arrival rate × expected executions per
+    /// request × its no-load time (divide by its rate in `entry_calls` for the mean time per call).
+    pub entry_times: BTreeMap<String, f64>,
+    /// Units per time unit demanded of every processing resource spec (before dividing by its rate).
+    pub demand: BTreeMap<String, f64>,
     pub warnings: Vec<String>,
 }
 
@@ -107,6 +117,9 @@ struct Exprs {
     programs: HashMap<String, Option<Arc<Program>>>,
     means: HashMap<String, Option<f64>>,
     warnings: Vec<String>,
+    /// The mean of `Exp(x)` for any constant expression x is 1/x (the `pcm*` functions); without
+    /// it only a literal x is recognised and other arguments are sampled (the `arch*` path).
+    exact_exp: bool,
 }
 
 impl Exprs {
@@ -157,6 +170,13 @@ impl Exprs {
         let t = src.trim();
         if let Some(inner) = t.strip_prefix("Exp(").and_then(|x| x.strip_suffix(')'))
             && let Ok(rate) = inner.trim().parse::<f64>()
+            && rate > 0.0
+        {
+            return Some(1.0 / rate);
+        }
+        if self.exact_exp
+            && let Some(inner) = t.strip_prefix("Exp(").and_then(|x| x.strip_suffix(')'))
+            && let Some(rate) = self.program(inner).and_then(|q| q.constant().and_then(|c| c.to_f64().ok()))
             && rate > 0.0
         {
             return Some(1.0 / rate);
@@ -261,6 +281,13 @@ struct Walk<'a, 'b> {
     random: bool,
     depth: usize,
     warned: std::collections::HashSet<String>,
+    /// Expected executions of every action (with `track_visits`).
+    visits: HashMap<String, f64>,
+    track_visits: bool,
+    /// (callee assembly, entry-level call) → weight
+    entry_calls: HashMap<(String, String), f64>,
+    /// entry-level call → Σ weight × its no-load time
+    entry_times: HashMap<String, f64>,
 }
 
 const ID_TYPES: &[(&str, &str)] =
@@ -361,6 +388,9 @@ impl Walk<'_, '_> {
             n += 1;
             if n > 10_000 {
                 break;
+            }
+            if self.track_visits {
+                *self.visits.entry(a.clone()).or_default() += w;
             }
             time += self.action(asm, &a, frame, result, w);
             cur = g.ref1(&a, "successor");
@@ -508,7 +538,13 @@ impl Walk<'_, '_> {
                         let mut callee = Frame::default();
                         let inputs = g.refs(&a, "inputParameterUsages");
                         self.bind(&inputs, &frame, &mut callee);
-                        time += self.call(&asm, &sig, callee, w).1;
+                        let t = self.call(&asm, &sig, callee, w).1;
+                        if self.track_visits {
+                            *self.visits.entry(a.clone()).or_default() += w;
+                            *self.entry_calls.entry((asm.clone(), a.clone())).or_default() += w;
+                            *self.entry_times.entry(a.clone()).or_default() += w * t;
+                        }
+                        time += t;
                     }
                 }
                 "Branch" => {
@@ -557,7 +593,21 @@ pub fn analyse_skipping(g: &Graph, skip: &BTreeSet<String>) -> Loads {
 /// caller's weight (everything below it too), and with `per_scenario` the expected calls per
 /// request of each scenario are kept (`scenario_calls`).
 pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, f64>, per_scenario: bool) -> Loads {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
+    analyse_impl(g, skip, scale, per_scenario, false, false)
+}
+
+/// The analysis of a plain PCM model for the `pcm*` functions: as [`analyse`], with the exact
+/// mean of `Exp(<constant expression>)`, the demand per resource, the entry-level calls and, with
+/// `visits`, the expected executions per request of every action per scenario.
+pub fn analyse_pcm(g: &Graph, visits: bool) -> Loads {
+    analyse_impl(g, &BTreeSet::new(), &HashMap::new(), false, true, visits)
+}
+
+fn analyse_impl(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, f64>, per_scenario: bool, exact_exp: bool, track_visits: bool) -> Loads {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
+    let mut scenario_visits = BTreeMap::new();
+    let mut entry_calls: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut entry_times: BTreeMap<String, f64> = BTreeMap::new();
     let ix = Index::new(g, &mut ex);
     let mut busy: HashMap<String, f64> = HashMap::new();
     let mut calls: BTreeMap<(String, String), f64> = BTreeMap::new();
@@ -582,6 +632,10 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
             random: false,
             depth: 0,
             warned: Default::default(),
+            visits: HashMap::new(),
+            track_visits,
+            entry_calls: HashMap::new(),
+            entry_times: HashMap::new(),
         };
         let mut time = walk.scenario(&beh, 1.0);
         let mut runs = 1;
@@ -590,6 +644,9 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
             walk.calls.clear();
             walk.action_calls.clear();
             walk.executions.clear();
+            walk.visits.clear();
+            walk.entry_calls.clear();
+            walk.entry_times.clear();
             runs = 4000;
             time = 0.0;
             for _ in 0..runs {
@@ -602,6 +659,9 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
         let sc_calls: Vec<((String, String), f64)> = walk.calls.drain().map(|(k, v)| (k, v / n)).collect();
         let sc_action_calls: Vec<((String, String, String), f64)> = walk.action_calls.drain().map(|(k, v)| (k, v / n)).collect();
         let sc_executions: Vec<(String, f64)> = walk.executions.drain().map(|(k, v)| (k, v / n)).collect();
+        let sc_visits: HashMap<String, f64> = walk.visits.drain().map(|(k, v)| (k, v / n)).collect();
+        let sc_entry: Vec<((String, String), f64)> = walk.entry_calls.drain().map(|(k, v)| (k, v / n)).collect();
+        let sc_entry_times: Vec<(String, f64)> = walk.entry_times.drain().map(|(k, v)| (k, v / n)).collect();
         let wl = g.ref1(&sc, "workload");
         let rate = match wl.as_deref().map(|w| g.class(w)) {
             Some("OpenWorkload") => {
@@ -633,7 +693,17 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
         for (k, v) in sc_executions {
             *executions.entry(k).or_default() += rate * v;
         }
+        for (k, v) in sc_entry {
+            *entry_calls.entry(k).or_default() += rate * v;
+        }
+        for (k, v) in sc_entry_times {
+            *entry_times.entry(k).or_default() += rate * v;
+        }
+        if track_visits {
+            scenario_visits.insert(sc.clone(), sc_visits);
+        }
     }
+    let demand: BTreeMap<String, f64> = busy.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut resources = Vec::new();
     for c in g.all("ResourceContainer") {
         for s in g.refs(&c, "activeResourceSpecifications") {
@@ -652,7 +722,7 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
             });
         }
     }
-    Loads { resources, calls, action_calls, executions, arrivals, times, scenario_calls, warnings: ex.warnings }
+    Loads { resources, calls, action_calls, executions, arrivals, times, scenario_calls, scenario_visits, entry_calls, entry_times, demand, warnings: ex.warnings }
 }
 
 /// Per usage scenario: the probability that one request needs each container on its
@@ -664,10 +734,26 @@ pub fn analyse_with(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, 
 /// independent events, 1 − Π(1 − p). A guarded branch takes each of its n transitions with 1/n, with a warning.
 /// `fate` maps a container to the one whose fate it shares (a sidecar to its container).
 pub fn sync_dependencies(g: &Graph, fate: &HashMap<String, String>) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
+    sync_dependencies_impl(g, fate, &HashSet::new(), false)
+}
+
+/// [`sync_dependencies`] for the `pcm*` functions: calls into the `transparent` assemblies (e.g.
+/// middleware that runs in the communication, not in the request's own path) are neither marked
+/// nor followed; `Exp` means are exact.
+pub fn sync_dependencies_pcm(g: &Graph, transparent: &HashSet<String>) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
+    sync_dependencies_impl(g, &HashMap::new(), transparent, true)
+}
+
+fn sync_dependencies_impl(
+    g: &Graph,
+    fate: &HashMap<String, String>,
+    transparent: &HashSet<String>,
+    exact_exp: bool,
+) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
     let ix = Index::new(g, &mut ex);
     let mut out = BTreeMap::new();
-    let mut d = Deps { ix: &ix, ex: &mut ex, fate, depth: 0, chain: Vec::new(), warned: Default::default() };
+    let mut d = Deps { ix: &ix, ex: &mut ex, fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default() };
     for sc in g.all("UsageScenario") {
         let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
         let mut acc = BTreeMap::new();
@@ -681,6 +767,7 @@ struct Deps<'a, 'b> {
     ix: &'b Index<'a>,
     ex: &'b mut Exprs,
     fate: &'b HashMap<String, String>,
+    transparent: &'b HashSet<String>,
     depth: usize,
     /// Containers of the calls on the current chain.
     chain: Vec<String>,
@@ -713,7 +800,7 @@ impl Deps<'_, '_> {
 
     fn call(&mut self, asm: &str, sig: &str, p: f64, acc: &mut BTreeMap<String, f64>) {
         let g = self.ix.g;
-        if self.depth > 64 || p <= 0.0 {
+        if self.depth > 64 || p <= 0.0 || self.transparent.contains(asm) {
             return;
         }
         let c = self.ix.container_of.get(asm).cloned().unwrap_or_default();
@@ -830,8 +917,14 @@ impl Deps<'_, '_> {
     }
 }
 
+/// [`mean_of`] with the exact mean of `Exp(<constant expression>)` (the `pcm*` functions).
+pub fn mean_pcm(src: &str) -> Option<f64> {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    ex.mean(src)
+}
+
 /// The mean of a variable-free StoEx (e.g. a processing rate), if it has one.
 pub fn mean_of(src: &str) -> Option<f64> {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new() };
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: false };
     ex.mean(src)
 }

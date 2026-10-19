@@ -21,6 +21,9 @@ struct HeldModel {
     prepared: Option<Arc<Prepared>>,
     /// The model of a dynamic run (rule 5), ready to run (`crate::dynamic`).
     dynamic: Option<Arc<crate::dynamic::Prepared>>,
+    /// The plain PCM of the model and its analysis (`pcm*` functions).
+    pcm: Option<Arc<crate::pcm::PcmCache>>,
+    pcm_prepared: functions::PcmPrepared,
 }
 
 pub struct Session {
@@ -30,6 +33,8 @@ pub struct Session {
     model: Option<HeldModel>,
     /// Collections held for the client, by id, with the version they were sent at.
     heap: HashMap<i64, i64>,
+    /// The elements of the lists the client sent (arguments of the `pcm*` functions).
+    lists: HashMap<i64, Vec<palladio_sim_service::protocol::WireValue>>,
     next_id: i64,
     models_seen: u64,
     calls: u64,
@@ -43,6 +48,7 @@ impl Session {
             metamodels: HashSet::new(),
             model: None,
             heap: HashMap::new(),
+            lists: HashMap::new(),
             next_id: -1,
             models_seen: 0,
             calls: 0,
@@ -66,12 +72,21 @@ impl Session {
                 if self.models_seen == 1 || self.models_seen % 500 == 0 {
                     info!("{}: model #{} ({} instances)", self.label, self.models_seen, model.instances.len());
                 }
-                self.model = Some(HeldModel { id: model_id, model: Arc::new(model), translation: None, prepared: None, dynamic: None });
+                self.model = Some(HeldModel {
+                    id: model_id,
+                    model: Arc::new(model),
+                    translation: None,
+                    prepared: None,
+                    dynamic: None,
+                    pcm: None,
+                    pcm_prepared: None,
+                });
                 None
             }
             ClientMessage::Release { ids, .. } => {
                 for id in ids {
                     self.heap.remove(&id);
+                    self.lists.remove(&id);
                 }
                 None
             }
@@ -92,6 +107,7 @@ impl Session {
         // Everything held belonged to the old model.
         self.model = None;
         self.heap.clear();
+        self.lists.clear();
     }
 
     async fn call(
@@ -110,6 +126,9 @@ impl Session {
         }
         for o in &objects {
             self.heap.insert(o.id, o.version);
+            if let Some(e) = &o.elements {
+                self.lists.insert(o.id, e.clone());
+            }
         }
         if !functions::is_operation(operation) {
             return Err((format!("this service has no operation '{operation}'"), None));
@@ -119,6 +138,33 @@ impl Session {
             (_, None) => return Err(("the call names no model to simulate".into(), None)),
             _ => return Err(("the model is not held".into(), Some(UNKNOWN_MODEL))),
         };
+        if functions::is_pcm_function(operation) {
+            let cache = match &held.pcm {
+                Some(c) => c.clone(),
+                None => {
+                    let model = held.model.clone();
+                    let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
+                        .await
+                        .map_err(|e| (format!("the PCM analysis failed: {e}"), None))?;
+                    let c = Arc::new(c);
+                    held.pcm = Some(c.clone());
+                    c
+                }
+            };
+            let mut next = self.next_id;
+            let answer = functions::call_pcm(&self.engine, operation, args, &self.lists, &cache, &mut held.pcm_prepared, &mut || {
+                let id = next;
+                next -= 1;
+                id
+            })
+            .await
+            .map_err(|e| (e, None))?;
+            self.next_id = next;
+            for o in &answer.objects {
+                self.heap.insert(o.id, o.version);
+            }
+            return Ok(ServiceMessage::Result { call_id, objects: answer.objects, value: answer.value });
+        }
         if functions::is_dynamic(operation) {
             let dyn_engine = crate::dynamic::engine(&self.engine.config);
             let prepared = match &held.dynamic {

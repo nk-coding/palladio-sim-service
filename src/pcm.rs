@@ -93,7 +93,8 @@ impl PcmCache {
                 g.set_attr(t, "branchProbability", WireValue::Double(*p));
             }
         }
-        load::analyse_pcm(&g, false)
+        // with the per-action tracking, which also counts the entry-level calls
+        load::analyse_pcm(&g, true)
     }
 
     /// The plain model with the replicas and rates of processing resources overridden:

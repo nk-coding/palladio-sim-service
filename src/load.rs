@@ -114,6 +114,11 @@ impl Env for Frame {
 
 struct Exprs {
     ids: HashMap<String, u32>,
+    /// The support of discrete probability function literals (`IntPMF[...]`, ...), by text.
+    pmfs: HashMap<String, Option<Arc<Vec<(Value, f64)>>>>,
+    /// Whether an expression draws random numbers (a probability function or a random
+    /// function anywhere in it), by text.
+    randoms: HashMap<String, bool>,
     programs: HashMap<String, Option<Arc<Program>>>,
     means: HashMap<String, Option<f64>>,
     warnings: Vec<String>,
@@ -147,6 +152,61 @@ impl Exprs {
         };
         self.programs.insert(src.to_string(), p.clone());
         p
+    }
+
+    /// The values and probabilities of a discrete probability function literal (`IntPMF`,
+    /// `DoublePMF`, `EnumPMF`, `BoolPMF`, also in parentheses), as the simulator samples it
+    /// (probabilities adjusted to sum 1 as `ProbFunctionCache.adjustPMF`); None for anything else.
+    fn pmf_cases(&mut self, src: &str) -> Option<Arc<Vec<(Value, f64)>>> {
+        if let Some(c) = self.pmfs.get(src) {
+            return c.clone();
+        }
+        use simoxide_stoex::ast::ProbFnLit;
+        let mut e = simoxide_stoex::parse(src).ok();
+        while let Some(simoxide_stoex::Expr { kind: simoxide_stoex::ExprKind::Paren(inner), .. }) = e {
+            e = Some(*inner);
+        }
+        let cases: Option<Vec<(Value, f64)>> = match e.map(|x| x.kind) {
+            Some(simoxide_stoex::ExprKind::ProbFn(lit)) => match lit {
+                ProbFnLit::IntPmf(v) => Some(v.into_iter().map(|(x, p)| (Value::Int(x), p)).collect()),
+                ProbFnLit::DoublePmf(v) => Some(v.into_iter().map(|(x, p)| (Value::Double(x), p)).collect()),
+                ProbFnLit::EnumPmf { samples, .. } => Some(samples.into_iter().map(|(x, p)| (Value::Str(x.into()), p)).collect()),
+                ProbFnLit::BoolPmf { samples, .. } => Some(samples.into_iter().map(|(x, p)| (Value::Bool(x), p)).collect()),
+                ProbFnLit::BoxedPdf(_) => None,
+            },
+            _ => None,
+        };
+        let cases = cases.filter(|c| !c.is_empty()).map(|mut c| {
+            let mut probs: Vec<f64> = c.iter().map(|x| x.1).collect();
+            simoxide_stoex::probfn::adjust(&mut probs);
+            for (x, p) in c.iter_mut().zip(probs) {
+                x.1 = p;
+            }
+            Arc::new(c)
+        });
+        self.pmfs.insert(src.to_string(), cases.clone());
+        cases
+    }
+
+    /// Whether `src` draws random numbers when evaluated (unreadable text counts as random).
+    fn is_random(&mut self, src: &str) -> bool {
+        if let Some(r) = self.randoms.get(src) {
+            return *r;
+        }
+        fn random(e: &simoxide_stoex::Expr) -> bool {
+            use simoxide_stoex::ExprKind as K;
+            match &e.kind {
+                K::ProbFn(_) => true,
+                K::Func(name, args) => simoxide_stoex::funcs::Func::from_name(name).is_none_or(|f| f.is_random()) || args.iter().any(random),
+                K::IfElse(a, b, c) => random(a) || random(b) || random(c),
+                K::BoolOp(_, a, b) | K::Compare(_, a, b) | K::Term(_, a, b) | K::Product(_, a, b) | K::Power(a, b) => random(a) || random(b),
+                K::Neg(a) | K::Not(a) | K::Paren(a) => random(a),
+                K::Int(_) | K::Double(_) | K::Str(_) | K::Bool(_) | K::Var(_) => false,
+            }
+        }
+        let r = simoxide_stoex::parse(src).map_or(true, |e| random(&e));
+        self.randoms.insert(src.to_string(), r);
+        r
     }
 
     /// The mean of a variable-free expression, or None if it has variables.
@@ -303,7 +363,9 @@ impl Walk<'_, '_> {
     /// Evaluates `src` in `frame` (a value, not a mean).
     fn value(&mut self, src: &str, frame: &Frame) -> Option<Value> {
         let p = self.ex.program(src)?;
-        if p.constant().is_none() {
+        // with `exact_exp` (the `pcm*` path) only an expression that draws makes the walk random:
+        // one deterministic in its variables is exact in one walk
+        if p.constant().is_none() && (!self.ex.exact_exp || self.ex.is_random(src)) {
             self.random = true;
         }
         match p.eval_mode(frame, &mut self.rng, VariableMode::ReturnDefaultOnNotFound) {
@@ -321,6 +383,52 @@ impl Walk<'_, '_> {
             return m;
         }
         self.value(src, frame).and_then(|v| v.to_f64().ok()).unwrap_or(0.0)
+    }
+
+    /// The input frames of an entry-level system call: with `exact_exp` (the `pcm*` path), a
+    /// characterisation that is a discrete probability function literal is not sampled but
+    /// enumerated: one frame per combination of the values, with its probability (the
+    /// simulator draws each once per call, independently), so a session with random workload
+    /// cardinalities is walked exactly instead of by 4 000 sampled walks. More than 4 096
+    /// combinations: the rest is sampled as before. Without PMF literals: one frame, weight 1.
+    fn bind_cases(&mut self, usages: &[String], from: &Frame) -> Vec<(Frame, f64)> {
+        if !self.ex.exact_exp {
+            let mut f = Frame::default();
+            self.bind(usages, from, &mut f);
+            return vec![(f, 1.0)];
+        }
+        let g = self.ix.g;
+        let mut out = vec![(Frame::default(), 1.0)];
+        for u in usages {
+            let Some(name) = g.str_attr(u, "namedReference") else { continue };
+            for ch in g.refs(u, "variableCharacterisation") {
+                let ty = g.str_attr(&ch, "type").unwrap_or_else(|| "VALUE".into());
+                let ty = ID_TYPES.iter().find(|(k, _)| *k == ty).map_or("VALUE", |(_, v)| v);
+                let Some(spec) = g.str_attr(&ch, "specification") else { continue };
+                let slot = self.ex.slot(&format!("{name}.{ty}"));
+                match self.ex.pmf_cases(&spec) {
+                    Some(cases) if out.len() * cases.len() <= 4096 => {
+                        let mut next = Vec::with_capacity(out.len() * cases.len());
+                        for (f, p) in &out {
+                            for (v, q) in cases.iter() {
+                                let mut f = f.clone();
+                                f.0.insert(slot, v.clone());
+                                next.push((f, p * q));
+                            }
+                        }
+                        out = next;
+                    }
+                    _ => {
+                        if let Some(v) = self.value(&spec, from) {
+                            for (f, _) in &mut out {
+                                f.0.insert(slot, v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Binds the characterisations of `usages` (VariableUsages) evaluated in `from` into `to`.
@@ -535,10 +643,13 @@ impl Walk<'_, '_> {
                     if let (Some(role), Some(sig)) = (g.ref1(&a, "providedRole"), g.ref1(&a, "operationSignature"))
                         && let Some(asm) = self.ix.delegations.get(&role).cloned()
                     {
-                        let mut callee = Frame::default();
                         let inputs = g.refs(&a, "inputParameterUsages");
-                        self.bind(&inputs, &frame, &mut callee);
-                        let t = self.call(&asm, &sig, callee, w).1;
+                        let mut t = 0.0;
+                        for (callee, p) in self.bind_cases(&inputs, &frame) {
+                            if p > 0.0 {
+                                t += p * self.call(&asm, &sig, callee, w * p).1;
+                            }
+                        }
                         if self.track_visits {
                             *self.visits.entry(a.clone()).or_default() += w;
                             *self.entry_calls.entry((asm.clone(), a.clone())).or_default() += w;
@@ -604,7 +715,7 @@ pub fn analyse_pcm(g: &Graph, visits: bool) -> Loads {
 }
 
 fn analyse_impl(g: &Graph, skip: &BTreeSet<String>, scale: &HashMap<String, f64>, per_scenario: bool, exact_exp: bool, track_visits: bool) -> Loads {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
     let mut scenario_visits = BTreeMap::new();
     let mut entry_calls: BTreeMap<(String, String), f64> = BTreeMap::new();
     let mut entry_times: BTreeMap<String, f64> = BTreeMap::new();
@@ -750,7 +861,7 @@ fn sync_dependencies_impl(
     transparent: &HashSet<String>,
     exact_exp: bool,
 ) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
     let ix = Index::new(g, &mut ex);
     let mut out = BTreeMap::new();
     let mut d = Deps { ix: &ix, ex: &mut ex, fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default() };
@@ -919,13 +1030,13 @@ impl Deps<'_, '_> {
 
 /// [`mean_of`] with the exact mean of `Exp(<constant expression>)` (the `pcm*` functions).
 pub fn mean_pcm(src: &str) -> Option<f64> {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
     ex.mean(src)
 }
 
 /// The mean of a variable-free StoEx (e.g. a processing rate), if it has one.
 pub fn mean_of(src: &str) -> Option<f64> {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: false };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: false };
     ex.mean(src)
 }
 
@@ -948,7 +1059,7 @@ pub struct CallAnalysis {
 /// [`CallAnalysis`] of every entry-level system call that reaches the system (exact `Exp`
 /// means, as the `pcm*` functions), and the warnings of the walks.
 pub fn analyse_calls_pcm(g: &Graph) -> (BTreeMap<String, CallAnalysis>, Vec<String>) {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
     let ix = Index::new(g, &mut ex);
     let (skip, scale) = (BTreeSet::new(), HashMap::new());
     let mut out = BTreeMap::new();
@@ -975,10 +1086,14 @@ pub fn analyse_calls_pcm(g: &Graph) -> (BTreeMap<String, CallAnalysis>, Vec<Stri
             entry_times: HashMap::new(),
         };
         let one = |walk: &mut Walk| -> f64 {
-            let mut callee = Frame::default();
             let inputs = g.refs(&call, "inputParameterUsages");
-            walk.bind(&inputs, &Frame::default(), &mut callee);
-            walk.call(&asm, &sig, callee, 1.0).1
+            let mut t = 0.0;
+            for (callee, p) in walk.bind_cases(&inputs, &Frame::default()) {
+                if p > 0.0 {
+                    t += p * walk.call(&asm, &sig, callee, p).1;
+                }
+            }
+            t
         };
         let mut time = one(&mut walk);
         let mut runs = 1;
@@ -1002,7 +1117,7 @@ pub fn analyse_calls_pcm(g: &Graph) -> (BTreeMap<String, CallAnalysis>, Vec<Stri
 /// synchronous path, by the rules of [`sync_dependencies_pcm`] (calls into `transparent`
 /// assemblies are neither marked nor followed).
 pub fn sync_dependencies_calls_pcm(g: &Graph, transparent: &HashSet<String>) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
-    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
     let ix = Index::new(g, &mut ex);
     let fate = HashMap::new();
     let mut out = BTreeMap::new();

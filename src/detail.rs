@@ -237,15 +237,20 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
 /// The detail of `model` (any model; its PCM part is simulated) as JSON.
 pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<Value, String> {
     let t0 = Instant::now();
+    let phase = |what: &str| tracing::debug!("detail: {what} after {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let cache = PcmCache::new(model);
+    phase("analysis");
     let mut g = Graph::new(&cache.with_overrides(&req.overrides));
     monitor_everything(&mut g, req.assembly_operations);
+    phase("monitoring");
     let wire = g.to_wire(|_| true);
     let files = xmi::to_xmi(schema::schema(), &wire)?.files;
+    phase("xmi");
     let usage = files.iter().find(|(n, _)| n.ends_with(".usagemodel")).map(|(n, _)| n.clone()).ok_or("the model has no UsageModel")?;
     let spec = RunSpec { usagemodel: Some(usage), ..RunSpec::default() };
     let pcm = spec.load_model_memory(&files).map_err(|e| format!("the PCM model is invalid: {e}"))?;
     let cm = CompiledModel::compile(pcm).map_err(|e| format!("the model cannot be simulated: {e}"))?;
+    phase("compile");
     let k = 1000.0 / req.time_unit_ms; // model units per second
     let params = RunParams {
         seed: req.seed,
@@ -261,6 +266,7 @@ pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<
     let r = crate::pcmrun::run_with(&cm, &[], &params, &opts, &limits, true, |c| {
         c.ps_algorithm = simoxide_sim::PsAlgorithm::VirtualTime;
     })?;
+    phase("run");
     let (meas, end) = r.runs.into_iter().next().ok_or("no run")?;
     let mut out = reduce(&g, &cache, req, &meas, end);
     out["simulator"] = json!({

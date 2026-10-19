@@ -261,3 +261,44 @@ fn design_detail() {
     let mean = session["meanMs"].as_f64().unwrap();
     assert!(mean > 2060.0 && mean < 2300.0, "{mean}");
 }
+
+/// A workload cardinality as a PMF input of the call, used by a demand: the `pcm*` analysis
+/// enumerates its values (exact, one walk per value) instead of sampling 4 000 walks.
+#[test]
+fn pmf_inputs_are_enumerated() {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two-tier.m")).unwrap();
+    let text = text.replace("RATE", "20.0").replace("BACKEND_CONTAINER", "C2").replace(
+        "specification    = \"Exp(0.2)\"",
+        "specification    = \"items.VALUE * 5 + (mode.VALUE == \\\"FAST\\\" ? 0 : 10)\"",
+    );
+    let extra = r#"
+items_usage : VariableUsage { namedReference = "items" }
+items_char : VariableCharacterisation {
+    type          = VariableCharacterisationType.VALUE
+    specification = "IntPMF[(1;0.5)(3;0.5)]"
+}
+items_usage.variableCharacterisation -- items_char
+scenario_call.inputParameterUsages -- items_usage
+mode_usage : VariableUsage { namedReference = "mode" }
+mode_char : VariableCharacterisation {
+    type          = VariableCharacterisationType.VALUE
+    specification = "EnumPMF[(\"FAST\";0.25)(\"SLOW\";0.75)]"
+}
+mode_usage.variableCharacterisation -- mode_char
+scenario_call.inputParameterUsages -- mode_usage
+"#;
+    let m = mfile::parse(&format!("{text}\n{extra}")).unwrap();
+    let cache = PcmCache::new(&m);
+    // frontend units: E[5 items] + 0.75 · 10 = 10 + 7.5 = 17.5 → 17.5 ms; backend 10 ms
+    let ops = cache.operations();
+    assert_eq!(ops.len(), 1);
+    assert!(close(ops[0].time, 0.0275, 1e-12), "{}", ops[0].time);
+    assert!(close(cache.loads.times["scenario"], 0.0275, 1e-12));
+    let c1 = cache.loads.resources.iter().find(|r| r.container == "C1").unwrap();
+    assert!(close(c1.busy, 20.0 * 0.0175, 1e-12), "{}", c1.busy);
+    assert!(cache.loads.warnings.is_empty(), "{:?}", cache.loads.warnings);
+    // the arch* path (no exact means) still samples: close, not exact
+    let g = palladio_arch::graph::Graph::new(&cache.plain);
+    let l = palladio_arch::load::analyse(&g);
+    assert!((l.times["scenario"] - 0.0275).abs() < 0.0275 * 0.02, "{}", l.times["scenario"]);
+}

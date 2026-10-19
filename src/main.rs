@@ -397,6 +397,7 @@ fn detail_cmd(args: &[String]) -> Result<(), String> {
         }
         None => palladio_arch::detail::DetailRequest::default(),
     };
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into())).with_writer(std::io::stderr).try_init();
     let config = Config::from_env()?;
     let limits = simoxide_sim::Limits { max_events: config.sim_max_events, ..simoxide_sim::Limits::default() };
     let v = palladio_arch::detail::detail(&model, &req, limits)?;

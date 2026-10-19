@@ -72,6 +72,48 @@ pods (default 400) stops and is penalised (capped: every pod at its maximum, eve
 budget). Outcomes are cached by content (`SIM_RESULT_CACHE_SIZE`); at most `SIM_THREADS` run at
 once. `HPA_TRACE_DIR` writes a run's response times and pods over time.
 
+## Generic Palladio functions (`pcm*`, branch `pcm-only`)
+
+Plain PCM in, numbers out: they read the model's PCM part as it is (instances of other classes
+are ignored) and know nothing above PCM; whatever says how to read the model (overrides, branch
+probabilities, unavailabilities, transparent assemblies, load profiles, scaling groups, budgets)
+comes from the script. Used by the domain project (`palladio-architecture-optimization-domain`,
+DESIGN.md §B and §H), whose layer 2 is realised in the model by transformations. Times in model
+time units unless a name says `Ms`/`Seconds`.
+
+| Function | Returns |
+| --- | --- |
+| `pcmResources()` | `PcmResource` per processing resource: container, kind, rate, replicas, demand, busy, utilisation |
+| `pcmScenarios()` | `PcmScenario` per usage scenario: arrival rate, no-load response time |
+| `pcmOperations()` | `PcmOperation` per entry-level system call: signature, callee, calls per time unit, no-load time per call |
+| `pcmWeightedVisits(actions, weights, exclude = "")` | rate-weighted mean over the scenarios of Σ expected executions per request × weight |
+| `pcmOperationVisits(actions, weights)` | `PcmOperationValue` per entry-level call: Σ expected executions per call × weight (the call itself counts once) |
+| `pcmCallRates(transitions, probabilities)` | `PcmCall` per external and entry-level call: calls per time unit, branch probabilities overridden |
+| `pcmFailure(containers, unavailabilities, transparent, exclude = "")` | rate-weighted share of requests needing an unavailable container on their synchronous path |
+| `pcmOperationFailure(containers, unavailabilities, transparent)` | `PcmOperationValue` per entry-level call: the probability that one call fails so |
+| `pcmSimulate(overrides, ...)`, `pcmStat(overrides, element, metric, statistic, ...)` | a simulation with processing resources' replicas and rates overridden (`PcmOverride`) |
+| `pcmRun(overrides, profile, usageStreams = false, ...)`, `pcmRunStat(...)` | the same with a per-scenario load profile (`PcmLoadStep` {scenario or null = every scenario, time, factor}; SimOxide LP-1) and SimOxide's usage streams (common random numbers, RND-11) |
+| `pcmHpaRun(groups, services, profile, budgetElements, budgetsMs, warmUp, end, msPerTimeUnit, sloFactor, usageStreams = false, seed = 1, maxPods = 400)` | `PcmHpaResult`: a dynamic run with SPD and SimOxide's HPA: per `PcmScalingGroup` (container = the pod, min/max/initial replicas, target utilisation, start-up, scale-down window (< 0: default), CPU request (≤ 0: the pod's cores)) an elastic infrastructure, per `PcmServiceGroup` (assembly, its load balancer) a service group; replica-seconds, peak, rescales, created pods, flapping, the share over `sloFactor` × budget of the budgeted elements (scenarios, calls, or signatures as system operations), mean and p95 of the calls; cached per model and request |
+| `pcmMean(expr)`, `pcmWarnings()` | the mean of a variable-free StoEx; the analysis' warnings |
+
+The analysis behind them walks expectations: a discrete probability function literal as an input
+of an entry-level call (`IntPMF`, `EnumPMF`, ...) is enumerated (one walk per value combination,
+exact), and only expressions that draw random numbers make a walk fall back to 4 000 sampled
+walks.
+
+**Design detail** (`src/detail.rs`): `palladio-arch-service detail MODEL [REQUEST.json] [--out
+FILE]` (MODEL `.m` or mdeo model data `.json`), or `POST /pcm/detail` with the request plus
+`modelText` or `model` when the service runs with `PCM_DETAIL_ENDPOINT=1`. One simulation with full
+monitoring (scenarios, entry-level calls, system operations, assembly operations except recursive
+ones, every core of every processing resource), reduced to JSON named by PCM elements:
+response-time statistics, log histogram and per-bin mean/p95/throughput per series, utilisation,
+queue length and wait per resource, utilisation and replicas per container over time, SLO
+violations over time for the budgeted series, the load profile. Request: `durationS`, `warmUpS`,
+`binS`, `timeUnitMs`, `seed`, `usageStreams` (default on), `profile` [{scenario?, timeS,
+factor}], `overrides` [{resource, replicas, rate}], `budgetsMs` {key or name: ms}, `sloFactor`,
+`histogramPerDecade`, `assemblyOperations`, and `autoscaling` {groups, services, maxPods} for a
+dynamic run.
+
 ## Command line
 
 ```text

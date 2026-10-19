@@ -203,6 +203,7 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
         }
     }
     if assembly_operations {
+        let recursive = recursive_operations(g);
         for asm in g.all("AssemblyContext") {
             let Some(comp) = g.ref1(&asm, "encapsulatedComponent") else { continue };
             let served: std::collections::HashSet<String> =
@@ -212,7 +213,7 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
                     continue;
                 }
                 let Some(iface) = g.ref1(&role, "providedInterface") else { continue };
-                for sig in g.refs(&iface, "signatures").into_iter().filter(|s| served.contains(s)) {
+                for sig in g.refs(&iface, "signatures").into_iter().filter(|s| served.contains(s) && !recursive.contains(&(asm.clone(), s.clone()))) {
                     add(g, "AssemblyOperationMeasuringPoint", &[("role", &role), ("operationSignature", &sig), ("assembly", &asm)], None, &["RESPONSE_TIME"]);
                 }
             }
@@ -229,6 +230,57 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
             }
         }
     }
+}
+
+/// The assembly operations (assembly, signature) that can call themselves (directly or through
+/// others): SimuLizar aborts when a process re-enters a monitored operation (MEAS-1.5), so these
+/// are not monitored.
+fn recursive_operations(g: &Graph) -> std::collections::HashSet<(String, String)> {
+    let mut connectors: HashMap<(String, String), String> = HashMap::new();
+    for c in g.all("AssemblyConnector") {
+        if let (Some(a), Some(r), Some(p)) = (g.ref1(&c, "requiringAssemblyContext"), g.ref1(&c, "requiredRole"), g.ref1(&c, "providingAssemblyContext")) {
+            connectors.insert((a, r), p);
+        }
+    }
+    let mut asms_of: HashMap<String, Vec<String>> = HashMap::new();
+    for a in g.all("AssemblyContext") {
+        if let Some(c) = g.ref1(&a, "encapsulatedComponent") {
+            asms_of.entry(c).or_default().push(a);
+        }
+    }
+    let mut edges: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    for call in g.all("ExternalCallAction") {
+        let (Some(role), Some(called)) = (g.ref1(&call, "role"), g.ref1(&call, "calledService")) else { continue };
+        let mut cur = g.container(&call);
+        while let Some(c) = &cur {
+            if g.class(c) == "ResourceDemandingSEFF" {
+                break;
+            }
+            cur = g.container(c);
+        }
+        let Some(seff) = cur else { continue };
+        let (Some(comp), Some(sig)) = (g.container(&seff), g.ref1(&seff, "describedService")) else { continue };
+        for asm in asms_of.get(&comp).into_iter().flatten() {
+            if let Some(target) = connectors.get(&(asm.clone(), role.clone())) {
+                edges.entry((asm.clone(), sig.clone())).or_default().push((target.clone(), called.clone()));
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for start in edges.keys() {
+        let mut stack: Vec<&(String, String)> = edges[start].iter().collect();
+        let mut seen: std::collections::HashSet<&(String, String)> = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == start {
+                out.insert(start.clone());
+                break;
+            }
+            if seen.insert(n) {
+                stack.extend(edges.get(n).into_iter().flatten());
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------

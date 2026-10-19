@@ -71,6 +71,7 @@ pub fn app(config: Config) -> (Router, Arc<AppState>) {
         .route("/", get(manifest_handler))
         .route("/ws/sessions/{kind}/{target}/{name}", get(session_handler))
         .route("/request/{kind}/{target}/{key}", any(no_requests))
+        .route("/pcm/detail", axum::routing::post(detail_handler).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .fallback(not_found)
         // Every answer names the manifest, so the backend notices a redeploy that changed it.
         .layer(axum::middleware::map_response(move |mut r: Response| {
@@ -113,6 +114,45 @@ async fn manifest_handler(State(state): State<Arc<AppState>>) -> Response {
 
 async fn no_requests(Path((kind, target, key)): Path<(String, String, String)>) -> Response {
     error_response(StatusCode::NOT_FOUND, "NotFound", &format!("{kind}:{target} answers no request '{key}'"))
+}
+
+/// `POST /pcm/detail` (only with `PCM_DETAIL_ENDPOINT=1`): the design detail of a model
+/// (`crate::detail`). Body: the request's fields plus the model, as `.m` text (`modelText`) or as
+/// mdeo model data (`model`).
+async fn detail_handler(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    if std::env::var("PCM_DETAIL_ENDPOINT").as_deref() != Ok("1") {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "the detail endpoint is off (PCM_DETAIL_ENDPOINT=1)");
+    }
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", &format!("not JSON: {e}")),
+    };
+    let model = match (v.get("modelText").and_then(|x| x.as_str()), v.get("model")) {
+        (Some(text), _) => crate::mfile::parse(text),
+        (None, Some(m)) => crate::mfile::from_model_data(m),
+        (None, None) => Err("the request needs modelText (.m) or model (model data)".to_string()),
+    };
+    let req = model.and_then(|m| crate::detail::DetailRequest::from_json(&v).map(|r| (m, r)));
+    let (model, req) = match req {
+        Ok(x) => x,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", &e),
+    };
+    let runner = crate::pcmrun::runner(&state.engine.config);
+    let limits = runner.limits();
+    let _permit = match runner.acquire().await {
+        Ok(p) => p,
+        Err(e) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "busy", &e),
+    };
+    let r = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::detail::detail(&model, &req, limits)))
+            .unwrap_or_else(|_| Err("the detail run panicked".into()))
+    })
+    .await;
+    match r {
+        Ok(Ok(v)) => ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::UNPROCESSABLE_ENTITY, "simulation_failed", &e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "abandoned", &e.to_string()),
+    }
 }
 
 async fn not_found(uri: axum::http::Uri) -> Response {

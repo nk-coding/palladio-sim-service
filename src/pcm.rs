@@ -15,10 +15,19 @@
 //!   requests that need an unavailable container on their synchronous path;
 //! - `pcmSimulate(overrides, ...)`, `pcmStat(overrides, ...)`: a simulation with the processing
 //!   resources' replicas and rates overridden;
-//! - `pcmMean(expr)`: the mean of a variable-free StoEx.
+//! - `pcmMean(expr)`: the mean of a variable-free StoEx;
+//! - per operation (entry-level system call; with session scenarios a scenario's response time
+//!   includes think times, so budgets and per-request measures refer to the calls):
+//!   `pcmOperations()` (rate, no-load time per call), `pcmOperationVisits(actions, weights)`,
+//!   `pcmOperationFailure(containers, unavailabilities, transparent)`;
+//! - `pcmRun(overrides, profile, usageStreams, ...)`, `pcmRunStat(...)`: a simulation with a
+//!   per-scenario load profile and SimOxide's usage streams ([`crate::pcmrun`]);
+//! - the design detail of a model ([`crate::detail`]): response-time distributions and time
+//!   series per scenario, call and assembly operation, resource timelines (CLI `detail`, HTTP
+//!   `POST /pcm/detail`).
 
 use crate::graph::{Graph, is_pcm};
-use crate::load::{self, Loads};
+use crate::load::{self, CallAnalysis, Loads};
 use palladio_sim_service::protocol::{WireModel, WireValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -27,6 +36,22 @@ pub struct PcmCache {
     pub plain: WireModel,
     pub graph: Graph,
     pub loads: Loads,
+    /// Per entry-level call, computed on first use.
+    calls: std::sync::OnceLock<(BTreeMap<String, CallAnalysis>, Vec<String>)>,
+}
+
+/// One operation (entry-level system call) of the model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OperationInfo {
+    pub call: String,
+    pub assembly: String,
+    pub signature: Option<String>,
+    pub role: Option<String>,
+    pub scenario: Option<String>,
+    /// Calls per time unit at the model's workload.
+    pub rate: f64,
+    /// No-load time of one call.
+    pub time: f64,
 }
 
 impl PcmCache {
@@ -34,7 +59,67 @@ impl PcmCache {
         let plain = Graph::new(model).to_wire(|x| is_pcm(&x.class_name));
         let graph = Graph::new(&plain);
         let loads = load::analyse_pcm(&graph, true);
-        PcmCache { plain, graph, loads }
+        PcmCache { plain, graph, loads, calls: std::sync::OnceLock::new() }
+    }
+
+    /// Per entry-level call: one call walked alone ([`load::analyse_calls_pcm`]).
+    pub fn per_call(&self) -> &BTreeMap<String, CallAnalysis> {
+        &self.calls.get_or_init(|| load::analyse_calls_pcm(&self.graph)).0
+    }
+
+    /// The usage scenario an action of the usage model belongs to.
+    pub fn scenario_of(&self, action: &str) -> Option<String> {
+        let mut cur = self.graph.container(action);
+        while let Some(c) = cur {
+            if self.graph.class(&c) == "UsageScenario" {
+                return Some(c);
+            }
+            cur = self.graph.container(&c);
+        }
+        None
+    }
+
+    /// Every entry-level call that reaches the system, with its rate (from the scenarios'
+    /// analysis) and its no-load time per call.
+    pub fn operations(&self) -> Vec<OperationInfo> {
+        let mut rates: HashMap<&str, f64> = HashMap::new();
+        for ((_, call), r) in &self.loads.entry_calls {
+            *rates.entry(call.as_str()).or_default() += r;
+        }
+        self.per_call()
+            .iter()
+            .map(|(call, a)| OperationInfo {
+                call: call.clone(),
+                assembly: a.assembly.clone(),
+                signature: self.graph.ref1(call, "operationSignature"),
+                role: self.graph.ref1(call, "providedRole"),
+                scenario: self.scenario_of(call),
+                rate: rates.get(call.as_str()).copied().unwrap_or(0.0),
+                time: a.time,
+            })
+            .collect()
+    }
+
+    /// Per entry-level call: Σ expected executions per call × weight.
+    pub fn operation_visits(&self, weights: &[(String, f64)]) -> Vec<(String, f64)> {
+        self.per_call()
+            .iter()
+            .map(|(call, a)| (call.clone(), weights.iter().map(|(x, w)| a.visits.get(x).copied().unwrap_or(0.0) * w).sum()))
+            .collect()
+    }
+
+    /// Per entry-level call: the probability that one call needs an unavailable container on its
+    /// synchronous path, 1 − Π_k (1 − p(k) u_k) (D53's semantics per call).
+    pub fn operation_failures(&self, unavailable: &HashMap<String, f64>, transparent: &HashSet<String>) -> (Vec<(String, f64)>, Vec<String>) {
+        let (deps, warnings) = load::sync_dependencies_calls_pcm(&self.graph, transparent);
+        let out = deps
+            .into_iter()
+            .map(|(call, acc)| {
+                let ok: f64 = acc.iter().map(|(c, p)| 1.0 - p * unavailable.get(c).copied().unwrap_or(0.0)).product();
+                (call, 1.0 - ok)
+            })
+            .collect();
+        (out, warnings)
     }
 
     fn entity(&self, name: &str) -> String {

@@ -23,7 +23,15 @@ usage: palladio-arch-service [serve]                 run the plugin service (por
                                                       the analytic arch* values of each model (.m or
                                                       model data .json) as one JSON object per line:
                                                       the reference of the layer-2 realisation by
-                                                      model transformations (domain project, B3)";
+                                                      model transformations (domain project, B3)
+       palladio-arch-service detail MODEL [REQUEST.json] [--out FILE]
+                                                      the design detail of a model's PCM (.m or model
+                                                      data .json): one simulation with full monitoring,
+                                                      response-time distributions and time series per
+                                                      scenario, call, system and assembly operation,
+                                                      resource timelines, SLO violations, as JSON
+                                                      (request fields: palladio_arch::detail); also
+                                                      POST /pcm/detail on the service";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +41,7 @@ fn main() -> ExitCode {
         Some("eval") if args.len() >= 2 => eval_cmd(&args[1..]),
         Some("hpa") if args.len() >= 2 => hpa_cmd(&args[1..]),
         Some("oracle") if args.len() >= 2 => oracle_cmd(&args[1..]),
+        Some("detail") if args.len() >= 2 => detail_cmd(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -367,69 +376,47 @@ fn hpa_cmd(args: &[String]) -> Result<(), String> {
 
 /// A model file: `.m` text, or model data as the platform stores it (`.json`: instances with
 /// properties, links with both ends).
+fn detail_cmd(args: &[String]) -> Result<(), String> {
+    let mut out = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--out" {
+            out = Some(args.get(i + 1).ok_or("--out needs a file")?.clone());
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    let model = read_any(Path::new(rest.first().ok_or(USAGE)?))?;
+    let req = match rest.get(1) {
+        Some(f) => {
+            let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+            palladio_arch::detail::DetailRequest::from_json(&serde_json::from_str(&text).map_err(|e| format!("{f}: {e}"))?)?
+        }
+        None => palladio_arch::detail::DetailRequest::default(),
+    };
+    let config = Config::from_env()?;
+    let limits = simoxide_sim::Limits { max_events: config.sim_max_events, ..simoxide_sim::Limits::default() };
+    let v = palladio_arch::detail::detail(&model, &req, limits)?;
+    let text = v.to_string();
+    match out {
+        Some(f) => std::fs::write(&f, text).map_err(|e| format!("{f}: {e}")),
+        None => {
+            println!("{text}");
+            Ok(())
+        }
+    }
+}
+
 fn read_any(path: &Path) -> Result<palladio_sim_service::protocol::WireModel, String> {
-    use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
     if path.extension().and_then(|e| e.to_str()) != Some("json") {
         return mfile::read(path);
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut insts = Vec::new();
-    let mut index = std::collections::HashMap::new();
-    for i in v["instances"].as_array().ok_or("no instances")? {
-        let name = i["name"].as_str().ok_or("an instance without a name")?.to_string();
-        let mut attributes = Vec::new();
-        if let Some(props) = i["properties"].as_object() {
-            for (k, x) in props {
-                let w = match x {
-                    serde_json::Value::Null => continue,
-                    serde_json::Value::Bool(b) => WireValue::Bool(*b),
-                    serde_json::Value::Number(n) => match n.as_i64() {
-                        Some(k) if !n.is_f64() => WireValue::Int(k as i32),
-                        _ => WireValue::Double(n.as_f64().unwrap_or(0.0)),
-                    },
-                    serde_json::Value::String(t) => WireValue::String(t.clone()),
-                    serde_json::Value::Object(o) => match o.get("enum").and_then(|e| e.as_str()) {
-                        Some(e) => WireValue::String(e.to_string()),
-                        None => continue,
-                    },
-                    serde_json::Value::Array(_) => continue,
-                };
-                attributes.push((k.clone(), vec![w]));
-            }
-        }
-        index.insert(name.clone(), insts.len());
-        insts.push(WireInstance { name, class_name: i["className"].as_str().unwrap_or_default().to_string(), attributes, references: Vec::new() });
-    }
-    let mut add = |a: &str, f: &str, b: &str| {
-        if let Some(&ia) = index.get(a) {
-            let x: &mut WireInstance = &mut insts[ia];
-            match x.references.iter_mut().find(|(k, _)| k == f) {
-                Some((_, v)) => v.push(b.to_string()),
-                None => x.references.push((f.to_string(), vec![b.to_string()])),
-            }
-        }
-    };
-    for l in v["links"].as_array().ok_or("no links")? {
-        let (a, b) = (l["sourceName"].as_str().unwrap_or_default(), l["targetName"].as_str().unwrap_or_default());
-        if let Some(f) = l["sourceProperty"].as_str() {
-            add(a, f, b);
-        }
-        if let Some(f) = l["targetProperty"].as_str() {
-            add(b, f, a);
-        }
-    }
-    let using = v["metamodelPath"].as_str().unwrap_or_default().to_string();
-    let mut g = palladio_arch::graph::Graph::new(&WireModel { metamodel_path: using, instances: insts });
-    g.complete_opposites();
-    let mut model = g.to_wire(|_| true);
-    for x in &mut model.instances {
-        for (_, v) in &mut x.references {
-            v.sort();
-            v.dedup();
-        }
-    }
-    Ok(model)
+    mfile::from_model_data(&v).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The analytic values of the `arch*` functions (as the objectives call them, scenarios in

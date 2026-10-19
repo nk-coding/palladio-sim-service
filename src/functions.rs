@@ -124,6 +124,39 @@ const PCM_STAT_PARAMS: [Param; 9] = [
 
 const PCM_MEAN_PARAMS: [Param; 1] = [p("expression", Ty::String, Default::None)];
 
+const PCM_OP_VISITS_PARAMS: [Param; 2] = [p("actions", Ty::ListOfAny, Default::None), p("weights", Ty::ListOfDouble, Default::None)];
+
+const PCM_OP_FAILURE_PARAMS: [Param; 3] = [
+    p("containers", Ty::ListOfAny, Default::None),
+    p("unavailabilities", Ty::ListOfDouble, Default::None),
+    p("transparent", Ty::ListOfAny, Default::None),
+];
+
+const PCM_RUN2_PARAMS: [Param; 8] = [
+    p("overrides", Ty::ListOf("PcmOverride"), Default::None),
+    p("profile", Ty::ListOf("PcmLoadStep"), Default::None),
+    p("usageStreams", Ty::Boolean, Default::Bool(false)),
+    RUN_PARAMS[0],
+    RUN_PARAMS[1],
+    RUN_PARAMS[2],
+    RUN_PARAMS[3],
+    RUN_PARAMS[4],
+];
+
+const PCM_RUN2_STAT_PARAMS: [Param; 11] = [
+    p("overrides", Ty::ListOf("PcmOverride"), Default::None),
+    p("profile", Ty::ListOf("PcmLoadStep"), Default::None),
+    p("usageStreams", Ty::Boolean, Default::Bool(false)),
+    STAT_PARAMS[0],
+    STAT_PARAMS[1],
+    STAT_PARAMS[2],
+    RUN_PARAMS[0],
+    RUN_PARAMS[1],
+    RUN_PARAMS[2],
+    RUN_PARAMS[3],
+    RUN_PARAMS[4],
+];
+
 const HPA_PARAMS: [Param; 2] = [p("seed", Ty::Int, Default::Int(1)), p("exclude", Ty::String, Default::Str("login"))];
 
 const HPA_STAT_PARAMS: [Param; 3] =
@@ -184,6 +217,10 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "pcmStat", params: &PCM_STAT_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "pcmMean", params: &PCM_MEAN_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "pcmWarnings", params: &[], returns: Ty::ListOfString, simulates: false },
+    Function { name: "pcmOperationVisits", params: &PCM_OP_VISITS_PARAMS, returns: Ty::ListOf("PcmOperationValue"), simulates: false },
+    Function { name: "pcmOperationFailure", params: &PCM_OP_FAILURE_PARAMS, returns: Ty::ListOf("PcmOperationValue"), simulates: false },
+    Function { name: "pcmRun", params: &PCM_RUN2_PARAMS, returns: Ty::Record("ArchResult"), simulates: false },
+    Function { name: "pcmRunStat", params: &PCM_RUN2_STAT_PARAMS, returns: Ty::Double, simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -289,6 +326,18 @@ const RECORDS: &[(&str, &[(&str, Ty)])] = &[
     ),
     ("PcmCall", &[("action", Ty::Instance), ("caller", Ty::Instance), ("callee", Ty::Instance), ("rate", Ty::Double)]),
     ("PcmOverride", &[("resource", Ty::Instance), ("replicas", Ty::Int), ("rate", Ty::Double)]),
+    (
+        "PcmOperationValue",
+        &[
+            ("call", Ty::Instance),
+            ("signature", Ty::Instance),
+            ("role", Ty::Instance),
+            ("scenario", Ty::Instance),
+            ("rate", Ty::Double),
+            ("value", Ty::Double),
+        ],
+    ),
+    ("PcmLoadStep", &[("scenario", Ty::Instance), ("time", Ty::Double), ("factor", Ty::Double)]),
     (
         "ArchResource",
         &[
@@ -646,6 +695,24 @@ impl Args<'_> {
         self.list(name, lists)?.iter().map(|v| number(v).ok_or_else(|| format!("{}: {name} must hold numbers, not {v:?}", self.f.name))).collect()
     }
 
+    /// The `profile` argument: `PcmLoadStep` records (scenario null: every scenario).
+    fn profile(&self, lists: &std::collections::HashMap<i64, Vec<WireValue>>) -> Result<Vec<crate::pcmrun::LoadStep>, String> {
+        let mut out = Vec::new();
+        for v in self.list("profile", lists)? {
+            let WireValue::Record { fields, .. } = v else { return Err(format!("{}: profile must hold PcmLoadStep records", self.f.name)) };
+            let field = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+            let scenario = match field("scenario") {
+                Some(WireValue::Instance(n)) => Some(n.clone()),
+                None | Some(WireValue::Null) => None,
+                other => return Err(format!("{}: a load step's scenario must be a UsageScenario or null, not {other:?}", self.f.name)),
+            };
+            let time = field("time").and_then(number).ok_or("a load step needs a time")?;
+            let factor = field("factor").and_then(number).ok_or("a load step needs a factor")?;
+            out.push(crate::pcmrun::LoadStep { scenario, time, factor });
+        }
+        Ok(out)
+    }
+
     /// The `overrides` argument: (resource spec, replicas, rate).
     fn overrides(&self, lists: &std::collections::HashMap<i64, Vec<WireValue>>) -> Result<Vec<(String, i32, f64)>, String> {
         let mut out = Vec::new();
@@ -746,12 +813,14 @@ pub async fn call_pcm(
                 .iter()
                 .map(|((callee, call), rate)| {
                     let t = loads.entry_times.get(call).copied().unwrap_or(0.0);
+                    // a call of a scenario without arrivals: its time per call, walked alone
+                    let alone = || cache.per_call().get(call).map_or(0.0, |a| a.time);
                     vec![
                         ("call", WireValue::Instance(call.clone())),
                         ("signature", instance_or_null(cache.graph.ref1(call, "operationSignature").as_ref())),
                         ("callee", WireValue::Instance(callee.clone())),
                         ("rate", WireValue::Double(*rate)),
-                        ("noLoadTime", WireValue::Double(if *rate > 0.0 { t / rate } else { 0.0 })),
+                        ("noLoadTime", WireValue::Double(if *rate > 0.0 { t / rate } else { alone() })),
                     ]
                 })
                 .collect();
@@ -803,6 +872,42 @@ pub async fn call_pcm(
             let transparent: std::collections::HashSet<String> = a.instances("transparent", lists)?.into_iter().collect();
             double(cache.failure(&unavailable, &transparent, &excluded(&a)?).0)
         }
+        "pcmOperationVisits" => {
+            let actions = a.instances("actions", lists)?;
+            let weights = a.doubles("weights", lists)?;
+            if actions.len() != weights.len() {
+                return Err(format!("pcmOperationVisits: {} actions but {} weights", actions.len(), weights.len()));
+            }
+            let pairs: Vec<(String, f64)> = actions.into_iter().zip(weights).collect();
+            let values: std::collections::HashMap<String, f64> = cache.operation_visits(&pairs).into_iter().collect();
+            Ok(operation_values(cache, &values, next_id))
+        }
+        "pcmOperationFailure" => {
+            let cs = a.instances("containers", lists)?;
+            let us = a.doubles("unavailabilities", lists)?;
+            if cs.len() != us.len() {
+                return Err(format!("pcmOperationFailure: {} containers but {} unavailabilities", cs.len(), us.len()));
+            }
+            let unavailable: std::collections::HashMap<String, f64> = cs.into_iter().zip(us).collect();
+            let transparent: std::collections::HashSet<String> = a.instances("transparent", lists)?.into_iter().collect();
+            let values: std::collections::HashMap<String, f64> = cache.operation_failures(&unavailable, &transparent).0.into_iter().collect();
+            Ok(operation_values(cache, &values, next_id))
+        }
+        "pcmRun" | "pcmRunStat" => {
+            let overrides = a.overrides(lists)?;
+            let p = pcm_prepared(engine, cache, prepared, overrides).await?;
+            let opts = crate::pcmrun::RunOptions { profile: a.profile(lists)?, usage_streams: a.boolean("usageStreams")? };
+            let params = a.run_params()?;
+            let r = crate::pcmrun::runner(&engine.config).simulate(p.clone(), params.clone(), opts).await?;
+            if operation == "pcmRun" {
+                return Ok(simulation_result(&r.outcome, &p, params.seed, next_id));
+            }
+            let (element, metric, statistic) = (a.string("element")?, a.string("metric")?, a.string("statistic")?);
+            if !STATISTICS.contains(&statistic.as_str()) {
+                return Err(format!("unknown statistic '{statistic}'; one of {}", STATISTICS.join(", ")));
+            }
+            double(stat(&r.outcome, &p, &element, &metric, &statistic)?)
+        }
         "pcmMean" => {
             let e = a.string("expression")?;
             double(crate::load::mean_pcm(&e).ok_or_else(|| format!("pcmMean: {e:?} has no mean (variables, or not a StoEx)"))?)
@@ -814,15 +919,7 @@ pub async fn call_pcm(
         }
         "pcmSimulate" | "pcmStat" => {
             let overrides = a.overrides(lists)?;
-            let p = match prepared {
-                Some((o, p)) if *o == overrides => p.clone(),
-                _ => {
-                    let model = Arc::new(cache.with_overrides(&overrides));
-                    let p = engine.prepare(palladio_sim_service::schema::schema(), model).await?;
-                    *prepared = Some((overrides, p.clone()));
-                    p
-                }
-            };
+            let p = pcm_prepared(engine, cache, prepared, overrides).await?;
             let params = a.run_params()?;
             if operation == "pcmSimulate" {
                 let outcome = engine.simulate(p.clone(), params.clone()).await?;
@@ -837,6 +934,38 @@ pub async fn call_pcm(
         }
         other => Err(format!("{other} is not a generic Palladio function")),
     }
+}
+
+/// The plain model with `overrides`, compiled (the last one kept per session).
+async fn pcm_prepared(engine: &Arc<Engine>, cache: &crate::pcm::PcmCache, prepared: &mut PcmPrepared, overrides: Vec<(String, i32, f64)>) -> Result<Arc<Prepared>, String> {
+    Ok(match prepared {
+        Some((o, p)) if *o == overrides => p.clone(),
+        _ => {
+            let model = Arc::new(cache.with_overrides(&overrides));
+            let p = engine.prepare(palladio_sim_service::schema::schema(), model).await?;
+            *prepared = Some((overrides, p.clone()));
+            p
+        }
+    })
+}
+
+/// One `PcmOperationValue` per entry-level call (in the order of [`crate::pcm::PcmCache::operations`]).
+fn operation_values(cache: &crate::pcm::PcmCache, values: &std::collections::HashMap<String, f64>, next_id: &mut impl FnMut() -> i64) -> Answer {
+    let items = cache
+        .operations()
+        .into_iter()
+        .map(|o| {
+            vec![
+                ("call", WireValue::Instance(o.call.clone())),
+                ("signature", instance_or_null(o.signature.as_ref())),
+                ("role", instance_or_null(o.role.as_ref())),
+                ("scenario", instance_or_null(o.scenario.as_ref())),
+                ("rate", WireValue::Double(o.rate)),
+                ("value", WireValue::Double(values.get(&o.call).copied().unwrap_or(0.0))),
+            ]
+        })
+        .collect();
+    list_answer("PcmOperationValue", items, next_id)
 }
 
 /// The `exclude` argument: comma-separated scenario names.

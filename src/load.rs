@@ -928,3 +928,91 @@ pub fn mean_of(src: &str) -> Option<f64> {
     let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: false };
     ex.mean(src)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Per operation (entry-level system call)
+
+/// One call of an entry-level system call, walked alone with weight 1: what a request of that
+/// operation does, independent of the session around it (a scenario's actions are evaluated
+/// without parameters, so the context does not change a call).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CallAnalysis {
+    /// The system's assembly that serves the call (through the provided role's delegation).
+    pub assembly: String,
+    /// No-load time of one call (model time units).
+    pub time: f64,
+    /// Expected executions of every action per call (the call itself counts once).
+    pub visits: HashMap<String, f64>,
+}
+
+/// [`CallAnalysis`] of every entry-level system call that reaches the system (exact `Exp`
+/// means, as the `pcm*` functions), and the warnings of the walks.
+pub fn analyse_calls_pcm(g: &Graph) -> (BTreeMap<String, CallAnalysis>, Vec<String>) {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    let ix = Index::new(g, &mut ex);
+    let (skip, scale) = (BTreeSet::new(), HashMap::new());
+    let mut out = BTreeMap::new();
+    for call in g.all("EntryLevelSystemCall") {
+        let (Some(role), Some(sig)) = (g.ref1(&call, "providedRole"), g.ref1(&call, "operationSignature")) else { continue };
+        let Some(asm) = ix.delegations.get(&role).cloned() else { continue };
+        let mut walk = Walk {
+            ix: &ix,
+            ex: &mut ex,
+            rng: Rng(0xC0FFEE),
+            demand: HashMap::new(),
+            calls: HashMap::new(),
+            action_calls: HashMap::new(),
+            executions: HashMap::new(),
+            skip: &skip,
+            scale: &scale,
+            skipping: 0,
+            random: false,
+            depth: 0,
+            warned: Default::default(),
+            visits: HashMap::new(),
+            track_visits: true,
+            entry_calls: HashMap::new(),
+            entry_times: HashMap::new(),
+        };
+        let one = |walk: &mut Walk| -> f64 {
+            let mut callee = Frame::default();
+            let inputs = g.refs(&call, "inputParameterUsages");
+            walk.bind(&inputs, &Frame::default(), &mut callee);
+            walk.call(&asm, &sig, callee, 1.0).1
+        };
+        let mut time = one(&mut walk);
+        let mut runs = 1;
+        if walk.random {
+            walk.visits.clear();
+            runs = 4000;
+            time = 0.0;
+            for _ in 0..runs {
+                time += one(&mut walk);
+            }
+        }
+        let n = runs as f64;
+        let mut visits: HashMap<String, f64> = walk.visits.drain().map(|(k, v)| (k, v / n)).collect();
+        visits.insert(call.clone(), 1.0);
+        out.insert(call.clone(), CallAnalysis { assembly: asm, time: time / n, visits });
+    }
+    (out, ex.warnings)
+}
+
+/// Per entry-level system call: the probability that one call needs each container on its
+/// synchronous path, by the rules of [`sync_dependencies_pcm`] (calls into `transparent`
+/// assemblies are neither marked nor followed).
+pub fn sync_dependencies_calls_pcm(g: &Graph, transparent: &HashSet<String>) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
+    let mut ex = Exprs { ids: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp: true };
+    let ix = Index::new(g, &mut ex);
+    let fate = HashMap::new();
+    let mut out = BTreeMap::new();
+    let mut d = Deps { ix: &ix, ex: &mut ex, fate: &fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default() };
+    for call in g.all("EntryLevelSystemCall") {
+        let (Some(role), Some(sig)) = (g.ref1(&call, "providedRole"), g.ref1(&call, "operationSignature")) else { continue };
+        let Some(asm) = d.ix.delegations.get(&role).cloned() else { continue };
+        let mut acc = BTreeMap::new();
+        d.call(&asm, &sig, 1.0, &mut acc);
+        out.insert(call, acc);
+    }
+    (out, ex.warnings)
+}

@@ -132,7 +132,8 @@ const PCM_OP_FAILURE_PARAMS: [Param; 3] = [
     p("transparent", Ty::ListOfAny, Default::None),
 ];
 
-const PCM_HPA_PARAMS: [Param; 12] = [
+const PCM_HPA_PARAMS: [Param; 13] = [
+    p("overrides", Ty::ListOf("PcmOverride"), Default::None),
     p("groups", Ty::ListOf("PcmScalingGroup"), Default::None),
     p("services", Ty::ListOf("PcmServiceGroup"), Default::None),
     p("profile", Ty::ListOf("PcmLoadStep"), Default::None),
@@ -812,6 +813,7 @@ impl Args<'_> {
             return Err(format!("pcmHpaRun: {} budget elements but {} budgets", elements.len(), budgets.len()));
         }
         let run = crate::detail::DetailRequest {
+            overrides: self.overrides(lists)?,
             profile,
             usage_streams: self.boolean("usageStreams")?,
             seed: self.long("seed")?,

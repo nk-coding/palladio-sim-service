@@ -3,12 +3,14 @@
 //! (`crate::dynamic`), for models whose layer 2 is realised in the model (domain project,
 //! DESIGN.md §B5/§H).
 //!
-//! The model already holds what an elastic deployment needs in PCM: per autoscaled container a
-//! pod (the container, its CPU with the cores of one pod) and per assembly on it a load balancer
-//! assembly that the callers' connectors point at (Slingshot's pattern, as rule 5 builds it).
-//! The script says which containers scale and how (`PcmScalingGroup`: min, max, target CPU
-//! utilisation, initial pods, start-up delay, scale-down window, CPU request) and which
-//! (assembly, load balancer) pairs belong to each (`PcmServiceGroup`). The plugin writes the SPD
+//! Per autoscaled container the model holds a pod (the container, its CPU with the cores of one
+//! pod). The script says which containers scale and how (`PcmScalingGroup`: min, max, target
+//! CPU utilisation, initial pods, start-up delay, scale-down window, CPU request). The load
+//! balancers that SPD's service groups need (Slingshot's pattern: a component per assembly whose
+//! SEFFs branch to the pods, the callers' connectors pointing at it) are either in the model,
+//! named by `PcmServiceGroup`s (assembly, load balancer), or, for a group without any, added by
+//! the plugin for the run as rule 5 adds them (`translate::load_balanced`): they are SPD's
+//! realisation of a service group, Palladio, not a layer above it. The plugin writes the SPD
 //! (an elastic infrastructure per group, a service group per pair), the semantic configuration and
 //! the HPA configuration, and runs them with a per-scenario load profile. Nothing above PCM: cost
 //! (price × replica-seconds) and the objectives are the script's.
@@ -106,7 +108,16 @@ fn first(g: &Graph, class: &str) -> Result<String, String> {
 
 /// The dynamic model of `model`'s PCM with full monitoring (as a detail run's).
 pub fn dynamic_model(cache: &PcmCache, req: &HpaRequest) -> Result<(DynamicModel, Graph), String> {
-    let mut g = Graph::new(&cache.with_overrides(&req.run.overrides));
+    let mut wire = cache.with_overrides(&req.run.overrides);
+    // groups without service groups: the plugin puts the load balancers in (rule 5's pattern)
+    let bare: Vec<String> = req.groups.iter().filter(|g| !req.services.iter().any(|s| s.container == g.container)).map(|g| g.container.clone()).collect();
+    let mut services = req.services.clone();
+    if !bare.is_empty() {
+        let (w, added) = crate::translate::load_balanced(&wire, &bare)?;
+        wire = w;
+        services.extend(added.into_iter().map(|(container, assembly, load_balancer)| ServiceGroup { container, assembly, load_balancer }));
+    }
+    let mut g = Graph::new(&wire);
     detail::monitor_everything(&mut g, req.run.assembly_operations);
     let k = 1000.0 / req.run.time_unit_ms;
     let mut groups = Vec::new();
@@ -123,7 +134,7 @@ pub fn dynamic_model(cache: &PcmCache, req: &HpaRequest) -> Result<(DynamicModel
         let max = s.max.max(1);
         let min = s.min.clamp(1, max);
         let services: Vec<(String, String)> =
-            req.services.iter().filter(|x| x.container == s.container).map(|x| (x.assembly.clone(), x.load_balancer.clone())).collect();
+            services.iter().filter(|x| x.container == s.container).map(|x| (x.assembly.clone(), x.load_balancer.clone())).collect();
         for (a, lb) in &services {
             for x in [a, lb] {
                 if g.class(x) != "AssemblyContext" {

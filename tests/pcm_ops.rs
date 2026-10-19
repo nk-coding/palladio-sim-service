@@ -483,7 +483,9 @@ async fn script_functions() {
     lists.insert(3, steps.iter().map(|&(t, f)| rec("PcmLoadStep", vec![("scenario", WireValue::Null), ("time", WireValue::Double(t)), ("factor", WireValue::Double(f))])).collect());
     lists.insert(4, vec![inst("scenario")]);
     lists.insert(5, vec![WireValue::Double(30.0)]);
+    lists.insert(9, vec![]);
     let args = vec![
+        WireValue::Ref(9),
         WireValue::Ref(1),
         WireValue::Ref(2),
         WireValue::Ref(3),
@@ -509,4 +511,54 @@ async fn script_functions() {
     // cached per model and request
     let (v2, _) = call(&engine, "pcmHpaRun", args, &lists, &cache, &mut next).await;
     assert_eq!(field(&v2, "wallMs"), field(&v, "wallMs"));
+}
+
+/// Without service groups the plugin adds the load balancers itself (rule 5's pattern): the
+/// translation's static PCM with the pod's cores gives the translation's dynamic run.
+#[test]
+fn hpa_with_load_balancers_added_by_the_plugin() {
+    use palladio_arch::dynamic::{self, HpaParams};
+    use palladio_arch::pcmhpa::{self, HpaRequest, ScalingGroup};
+    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
+    let m = arch_hpa_model(100.0, &steps, 60.0, 600.0);
+    let (_, dm) = translate::translate_dynamic(&m).unwrap();
+    let arch = dynamic::run(&dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(), &HpaParams { seed: 3, exclude: vec![] }, Default::default()).unwrap();
+    let plain = translate::translate(&m).unwrap().pcm;
+    let g = &dm.groups[0];
+    let cpu = |w: &WireModel| -> (i32, f64) {
+        let gr = palladio_arch::graph::Graph::new(w);
+        let r = gr.refs(&g.container, "activeResourceSpecifications").into_iter().find(|r| gr.str_attr(r, "activeResourceType").as_deref() == Some("CPU")).unwrap();
+        (gr.num_attr(&r, "numberOfReplicas").unwrap() as i32, palladio_arch::load::mean_of(&gr.str_attr(&r, "processingRate").unwrap()).unwrap())
+    };
+    let (n, rate) = cpu(&dm.pcm);
+    let spec = palladio_arch::graph::Graph::new(&plain).refs(&g.container, "activeResourceSpecifications")[0].clone();
+    let mut budgets = std::collections::BTreeMap::new();
+    budgets.insert("scenario".to_string(), 30.0);
+    let run = DetailRequest {
+        overrides: vec![(spec, n, rate)],
+        profile: steps.iter().map(|&(t, f)| LoadStep { scenario: None, time: t, factor: f }).collect(),
+        usage_streams: false,
+        seed: 3,
+        duration_s: 600.0,
+        warm_up_s: 60.0,
+        bin_s: 30.0,
+        budgets_ms: budgets,
+        slo_factor: 2.0,
+        assembly_operations: false,
+        ..DetailRequest::default()
+    };
+    let groups = vec![ScalingGroup {
+        container: g.container.clone(),
+        min: g.min,
+        max: g.max,
+        target: g.target,
+        initial: g.initial,
+        startup_s: g.startup_s,
+        scale_down_s: g.scale_down_s,
+        cpu_request: Some(g.cpu_request),
+    }];
+    let (r, _) = pcmhpa::run_model(&plain, &HpaRequest { groups, services: vec![], run, max_pods: 400 }, Default::default()).unwrap();
+    assert!(close(arch.ready_replica_seconds, r.ready_replica_seconds, 1e-9), "{} vs {}", arch.ready_replica_seconds, r.ready_replica_seconds);
+    assert_eq!(arch.groups[0].rescales, r.groups[0].rescales);
+    assert!(close(arch.slo, r.slo, 1e-9), "{} vs {}", arch.slo, r.slo);
 }

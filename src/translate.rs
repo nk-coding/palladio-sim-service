@@ -2514,6 +2514,64 @@ fn load_balancer(b: &mut Builder, asm: &str, host: &str) -> Result<String, Strin
     Ok(lb_asm)
 }
 
+/// Slingshot's load balancers on plain PCM, as rule 5 builds them, for the generic dynamic runs
+/// (`crate::pcmhpa`): a container `LoadBalancerServer` without work (joined to the first linking
+/// resource) and a load balancer in front of every assembly allocated on each of `containers`.
+/// Returns the model and (container, assembly, load balancer assembly) per assembly.
+pub fn load_balanced(model: &WireModel, containers: &[String]) -> Result<(WireModel, Vec<(String, String, String)>), String> {
+    let g = Graph::new(model);
+    let first = |class: &str| g.all(class).into_iter().next().ok_or_else(|| format!("the model has no {class}"));
+    let mut b = Builder {
+        repo: first("Repository")?,
+        system: first("System")?,
+        allocation: first("Allocation")?,
+        resenv: first("ResourceEnvironment")?,
+        ms: 1.0,
+        base_cpu: HashMap::new(),
+        base_hdd: HashMap::new(),
+        sidecars: BTreeMap::new(),
+        replicas: HashMap::new(),
+        sidecar_cores: HashMap::new(),
+        roles: BTreeMap::new(),
+        wired: BTreeMap::new(),
+        local_assemblies: BTreeSet::new(),
+        publishers: BTreeMap::new(),
+        orchestrated: BTreeSet::new(),
+        quota: Vec::new(),
+        offered: BTreeMap::new(),
+        warnings: Vec::new(),
+        g,
+    };
+    let host = b.named("LoadBalancerServer", "ResourceContainer", Some("LoadBalancerServer"));
+    let resenv = b.resenv.clone();
+    b.g.link(&resenv, "resourceContainer", &host);
+    let cpu = b.named(&format!("{host}_cpu"), "ProcessingResourceSpecification", None);
+    b.g.set_attr(&cpu, "schedulingPolicy", s("PROCESSOR_SHARING"));
+    b.g.set_attr(&cpu, "activeResourceType", s("CPU"));
+    b.g.set_attr(&cpu, "processingRate", s("1000000.0"));
+    b.g.set_attr(&cpu, "numberOfReplicas", WireValue::Int(1));
+    b.g.link(&host, "activeResourceSpecifications", &cpu);
+    if let Some(l) = sorted(b.g.all("LinkingResource")).into_iter().next() {
+        b.g.link(&l, "connectedResourceContainers", &host);
+    }
+    let mut out = Vec::new();
+    for c in containers {
+        let mut on_pod: Vec<String> = b
+            .g
+            .referrers(c, "resourceContainer")
+            .into_iter()
+            .filter(|ac| b.g.class(ac) == "AllocationContext")
+            .filter_map(|ac| b.g.ref1(&ac, "assemblyContext"))
+            .collect();
+        on_pod.sort();
+        for asm in on_pod {
+            let lb = load_balancer(&mut b, &asm, &host)?;
+            out.push((c.clone(), asm, lb));
+        }
+    }
+    Ok((b.g.to_wire(|_| true), out))
+}
+
 /// The cost of `cost` split into the part that does not depend on the autoscaled replicas and
 /// the cost of one replica of each autoscaled container in use.
 fn cost_parts(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>) -> (f64, BTreeMap<String, f64>) {

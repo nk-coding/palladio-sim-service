@@ -132,6 +132,21 @@ const PCM_OP_FAILURE_PARAMS: [Param; 3] = [
     p("transparent", Ty::ListOfAny, Default::None),
 ];
 
+const PCM_HPA_PARAMS: [Param; 12] = [
+    p("groups", Ty::ListOf("PcmScalingGroup"), Default::None),
+    p("services", Ty::ListOf("PcmServiceGroup"), Default::None),
+    p("profile", Ty::ListOf("PcmLoadStep"), Default::None),
+    p("budgetElements", Ty::ListOfAny, Default::None),
+    p("budgetsMs", Ty::ListOfDouble, Default::None),
+    p("warmUp", Ty::Double, Default::None),
+    p("end", Ty::Double, Default::None),
+    p("msPerTimeUnit", Ty::Double, Default::None),
+    p("sloFactor", Ty::Double, Default::None),
+    p("usageStreams", Ty::Boolean, Default::Bool(false)),
+    p("seed", Ty::Int, Default::Int(1)),
+    p("maxPods", Ty::Int, Default::Int(400)),
+];
+
 const PCM_RUN2_PARAMS: [Param; 8] = [
     p("overrides", Ty::ListOf("PcmOverride"), Default::None),
     p("profile", Ty::ListOf("PcmLoadStep"), Default::None),
@@ -221,6 +236,7 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "pcmOperationFailure", params: &PCM_OP_FAILURE_PARAMS, returns: Ty::ListOf("PcmOperationValue"), simulates: false },
     Function { name: "pcmRun", params: &PCM_RUN2_PARAMS, returns: Ty::Record("ArchResult"), simulates: false },
     Function { name: "pcmRunStat", params: &PCM_RUN2_STAT_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "pcmHpaRun", params: &PCM_HPA_PARAMS, returns: Ty::Record("PcmHpaResult"), simulates: false },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -338,6 +354,52 @@ const RECORDS: &[(&str, &[(&str, Ty)])] = &[
         ],
     ),
     ("PcmLoadStep", &[("scenario", Ty::Instance), ("time", Ty::Double), ("factor", Ty::Double)]),
+    (
+        "PcmScalingGroup",
+        &[
+            ("container", Ty::Instance),
+            ("minReplicas", Ty::Int),
+            ("maxReplicas", Ty::Int),
+            ("targetUtilisation", Ty::Double),
+            ("initialReplicas", Ty::Int),
+            ("startup", Ty::Double),
+            ("scaleDown", Ty::Double),
+            ("cpuRequest", Ty::Double),
+        ],
+    ),
+    ("PcmServiceGroup", &[("container", Ty::Instance), ("assembly", Ty::Instance), ("loadBalancer", Ty::Instance)]),
+    (
+        "PcmHpaResult",
+        &[
+            ("readyReplicaSeconds", Ty::Double),
+            ("replicaSeconds", Ty::Double),
+            ("peakReplicas", Ty::Double),
+            ("rescales", Ty::Long),
+            ("createdPods", Ty::Long),
+            ("flapping", Ty::Double),
+            ("slo", Ty::Double),
+            ("requests", Ty::Long),
+            ("meanMs", Ty::Double),
+            ("p95Ms", Ty::Double),
+            ("capped", Ty::Boolean),
+            ("events", Ty::Long),
+            ("wallMs", Ty::Double),
+            ("groups", Ty::ListOf("PcmHpaGroup")),
+        ],
+    ),
+    (
+        "PcmHpaGroup",
+        &[
+            ("container", Ty::Instance),
+            ("meanReplicas", Ty::Double),
+            ("readyReplicaSeconds", Ty::Double),
+            ("replicaSeconds", Ty::Double),
+            ("maxReplicas", Ty::Int),
+            ("rescales", Ty::Long),
+            ("createdPods", Ty::Long),
+            ("reversals", Ty::Int),
+        ],
+    ),
     (
         "ArchResource",
         &[
@@ -695,6 +757,79 @@ impl Args<'_> {
         self.list(name, lists)?.iter().map(|v| number(v).ok_or_else(|| format!("{}: {name} must hold numbers, not {v:?}", self.f.name))).collect()
     }
 
+    fn double(&self, name: &str) -> Result<f64, String> {
+        number(self.get(name)?).ok_or_else(|| format!("{}: {name} must be a number", self.f.name))
+    }
+
+    /// The arguments of `pcmHpaRun` (times in model time units, converted to seconds).
+    fn hpa_request(&self, lists: &std::collections::HashMap<i64, Vec<WireValue>>) -> Result<crate::pcmhpa::HpaRequest, String> {
+        let ms = self.double("msPerTimeUnit")?;
+        if !(ms > 0.0) {
+            return Err("pcmHpaRun: msPerTimeUnit must be positive".into());
+        }
+        let s = ms / 1000.0; // seconds per model unit
+        let records = |name: &str| -> Result<Vec<Vec<(String, WireValue)>>, String> {
+            self.list(name, lists)?
+                .iter()
+                .map(|v| match v {
+                    WireValue::Record { fields, .. } => Ok(fields.clone()),
+                    other => Err(format!("{}: {name} must hold records, not {other:?}", self.f.name)),
+                })
+                .collect()
+        };
+        let inst = |f: &[(String, WireValue)], k: &str| -> Result<String, String> {
+            match f.iter().find(|(n, _)| n == k).map(|(_, v)| v) {
+                Some(WireValue::Instance(n)) => Ok(n.clone()),
+                other => Err(format!("pcmHpaRun: {k} must be a model element, not {other:?}")),
+            }
+        };
+        let num = |f: &[(String, WireValue)], k: &str| -> Result<f64, String> {
+            f.iter().find(|(n, _)| n == k).and_then(|(_, v)| number(v)).ok_or_else(|| format!("pcmHpaRun: {k} must be a number"))
+        };
+        let mut groups = Vec::new();
+        for f in records("groups")? {
+            let scale_down = num(&f, "scaleDown")?;
+            let request = num(&f, "cpuRequest")?;
+            groups.push(crate::pcmhpa::ScalingGroup {
+                container: inst(&f, "container")?,
+                min: num(&f, "minReplicas")?.max(1.0) as u32,
+                max: num(&f, "maxReplicas")?.max(1.0) as u32,
+                target: num(&f, "targetUtilisation")?,
+                initial: num(&f, "initialReplicas")?.max(1.0) as u32,
+                startup_s: num(&f, "startup")? * s,
+                scale_down_s: (scale_down >= 0.0).then_some(scale_down * s),
+                cpu_request: (request > 0.0).then_some(request),
+            });
+        }
+        let mut services = Vec::new();
+        for f in records("services")? {
+            services.push(crate::pcmhpa::ServiceGroup { container: inst(&f, "container")?, assembly: inst(&f, "assembly")?, load_balancer: inst(&f, "loadBalancer")? });
+        }
+        let profile = self.profile(lists)?.into_iter().map(|p| crate::pcmrun::LoadStep { time: p.time * s, ..p }).collect();
+        let elements = self.instances("budgetElements", lists)?;
+        let budgets = self.doubles("budgetsMs", lists)?;
+        if elements.len() != budgets.len() {
+            return Err(format!("pcmHpaRun: {} budget elements but {} budgets", elements.len(), budgets.len()));
+        }
+        let run = crate::detail::DetailRequest {
+            profile,
+            usage_streams: self.boolean("usageStreams")?,
+            seed: self.long("seed")?,
+            duration_s: self.double("end")? * s,
+            warm_up_s: self.double("warmUp")? * s,
+            bin_s: (self.double("end")? * s / 60.0).max(1e-9),
+            time_unit_ms: ms,
+            budgets_ms: elements.into_iter().zip(budgets).collect(),
+            slo_factor: self.double("sloFactor")?,
+            assembly_operations: false,
+            ..crate::detail::DetailRequest::default()
+        };
+        if !(run.duration_s > run.warm_up_s) {
+            return Err("pcmHpaRun: end must be after warmUp".into());
+        }
+        Ok(crate::pcmhpa::HpaRequest { groups, services, run, max_pods: self.long("maxPods")?.max(1) as u32 })
+    }
+
     /// The `profile` argument: `PcmLoadStep` records (scenario null: every scenario).
     fn profile(&self, lists: &std::collections::HashMap<i64, Vec<WireValue>>) -> Result<Vec<crate::pcmrun::LoadStep>, String> {
         let mut out = Vec::new();
@@ -764,7 +899,7 @@ pub async fn call_pcm(
     operation: &str,
     args: &[WireValue],
     lists: &std::collections::HashMap<i64, Vec<WireValue>>,
-    cache: &crate::pcm::PcmCache,
+    cache: &Arc<crate::pcm::PcmCache>,
     prepared: &mut PcmPrepared,
     next_id: &mut impl FnMut() -> i64,
 ) -> Result<Answer, String> {
@@ -908,6 +1043,31 @@ pub async fn call_pcm(
             }
             double(stat(&r.outcome, &p, &element, &metric, &statistic)?)
         }
+        "pcmHpaRun" => {
+            let req = a.hpa_request(lists)?;
+            let key = format!("{req:?}");
+            let hit = cache.hpa.lock().unwrap().as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.clone());
+            let r = match hit {
+                Some(r) => r,
+                None => {
+                    let runner = crate::pcmrun::runner(&engine.config);
+                    let limits = runner.limits();
+                    let _permit = runner.acquire().await?;
+                    let c = cache.clone();
+                    let rq = req.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::pcmhpa::run(&c, &rq, limits)))
+                            .unwrap_or_else(|_| Err("the dynamic run panicked".into()))
+                    })
+                    .await
+                    .map_err(|e| format!("the dynamic run was abandoned: {e}"))??;
+                    let r = Arc::new(r.0);
+                    *cache.hpa.lock().unwrap() = Some((key, r.clone()));
+                    r
+                }
+            };
+            Ok(pcm_hpa_result(&r, next_id))
+        }
         "pcmMean" => {
             let e = a.string("expression")?;
             double(crate::load::mean_pcm(&e).ok_or_else(|| format!("pcmMean: {e:?} has no mean (variables, or not a StoEx)"))?)
@@ -966,6 +1126,48 @@ fn operation_values(cache: &crate::pcm::PcmCache, values: &std::collections::Has
         })
         .collect();
     list_answer("PcmOperationValue", items, next_id)
+}
+
+fn pcm_hpa_result(r: &crate::pcmhpa::HpaResult, next_id: &mut impl FnMut() -> i64) -> Answer {
+    let groups = list_answer(
+        "PcmHpaGroup",
+        r.groups
+            .iter()
+            .map(|g| {
+                vec![
+                    ("container", WireValue::Instance(g.container.clone())),
+                    ("meanReplicas", WireValue::Double(g.mean_replicas)),
+                    ("readyReplicaSeconds", WireValue::Double(g.ready_replica_seconds)),
+                    ("replicaSeconds", WireValue::Double(g.replica_seconds)),
+                    ("maxReplicas", WireValue::Int(g.max_replicas)),
+                    ("rescales", WireValue::Long(g.rescales as i64)),
+                    ("createdPods", WireValue::Long(g.created as i64)),
+                    ("reversals", WireValue::Int(g.reversals as i32)),
+                ]
+            })
+            .collect(),
+        next_id,
+    );
+    let value = WireValue::Record {
+        class_name: "PcmHpaResult".into(),
+        fields: vec![
+            ("readyReplicaSeconds".into(), WireValue::Double(r.ready_replica_seconds)),
+            ("replicaSeconds".into(), WireValue::Double(r.replica_seconds)),
+            ("peakReplicas".into(), WireValue::Double(r.peak_replicas)),
+            ("rescales".into(), WireValue::Long(r.rescales as i64)),
+            ("createdPods".into(), WireValue::Long(r.created as i64)),
+            ("flapping".into(), WireValue::Double(r.flapping)),
+            ("slo".into(), WireValue::Double(r.slo)),
+            ("requests".into(), WireValue::Long(r.requests as i64)),
+            ("meanMs".into(), WireValue::Double(r.mean_ms)),
+            ("p95Ms".into(), WireValue::Double(r.p95_ms)),
+            ("capped".into(), WireValue::Bool(r.capped)),
+            ("events".into(), WireValue::Long(r.events as i64)),
+            ("wallMs".into(), WireValue::Double(r.wall_ms)),
+            ("groups".into(), groups.value),
+        ],
+    };
+    Answer { value, objects: groups.objects }
 }
 
 /// The `exclude` argument: comma-separated scenario names.

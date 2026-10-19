@@ -38,6 +38,8 @@ pub struct PcmCache {
     pub loads: Loads,
     /// Per entry-level call, computed on first use.
     calls: std::sync::OnceLock<(BTreeMap<String, CallAnalysis>, Vec<String>)>,
+    /// The last dynamic run (`pcmHpaRun`) of this model, by its request.
+    pub hpa: std::sync::Mutex<Option<(String, std::sync::Arc<crate::pcmhpa::HpaResult>)>>,
 }
 
 /// One operation (entry-level system call) of the model.
@@ -59,7 +61,7 @@ impl PcmCache {
         let plain = Graph::new(model).to_wire(|x| is_pcm(&x.class_name));
         let graph = Graph::new(&plain);
         let loads = load::analyse_pcm(&graph, true);
-        PcmCache { plain, graph, loads, calls: std::sync::OnceLock::new() }
+        PcmCache { plain, graph, loads, calls: std::sync::OnceLock::new(), hpa: Default::default() }
     }
 
     /// Per entry-level call: one call walked alone ([`load::analyse_calls_pcm`]).

@@ -390,17 +390,17 @@ fn detail_cmd(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let model = read_any(Path::new(rest.first().ok_or(USAGE)?))?;
-    let req = match rest.get(1) {
+    let req: serde_json::Value = match rest.get(1) {
         Some(f) => {
             let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
-            palladio_arch::detail::DetailRequest::from_json(&serde_json::from_str(&text).map_err(|e| format!("{f}: {e}"))?)?
+            serde_json::from_str(&text).map_err(|e| format!("{f}: {e}"))?
         }
-        None => palladio_arch::detail::DetailRequest::default(),
+        None => serde_json::json!({}),
     };
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into())).with_writer(std::io::stderr).try_init();
     let config = Config::from_env()?;
     let limits = simoxide_sim::Limits { max_events: config.sim_max_events, ..simoxide_sim::Limits::default() };
-    let v = palladio_arch::detail::detail(&model, &req, limits)?;
+    let v = palladio_arch::detail::detail_json(&model, &req, limits)?;
     let text = v.to_string();
     match out {
         Some(f) => std::fs::write(&f, text).map_err(|e| format!("{f}: {e}")),

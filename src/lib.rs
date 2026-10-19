@@ -18,6 +18,7 @@ pub mod graph;
 pub mod load;
 pub mod mfile;
 pub mod pcm;
+pub mod pcmhpa;
 pub mod pcmrun;
 pub mod detail;
 pub mod server;

@@ -132,7 +132,7 @@ async fn detail_handler(State(state): State<Arc<AppState>>, body: axum::body::By
         (None, Some(m)) => crate::mfile::from_model_data(m),
         (None, None) => Err("the request needs modelText (.m) or model (model data)".to_string()),
     };
-    let req = model.and_then(|m| crate::detail::DetailRequest::from_json(&v).map(|r| (m, r)));
+    let req = model.and_then(|m| crate::detail::DetailRequest::from_json(&v).map(|_| (m, v.clone())));
     let (model, req) = match req {
         Ok(x) => x,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", &e),
@@ -144,7 +144,7 @@ async fn detail_handler(State(state): State<Arc<AppState>>, body: axum::body::By
         Err(e) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "busy", &e),
     };
     let r = tokio::task::spawn_blocking(move || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::detail::detail(&model, &req, limits)))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::detail::detail_json(&model, &req, limits)))
             .unwrap_or_else(|_| Err("the detail run panicked".into()))
     })
     .await;

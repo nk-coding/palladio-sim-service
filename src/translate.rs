@@ -2288,6 +2288,11 @@ pub struct DynamicModel {
     pub budgets: BTreeMap<String, f64>,
     /// Instance names of the repository, system, allocation and resource environment.
     pub roots: [String; 4],
+    /// A per-scenario load profile (model time units) in place of `profile`'s steps (the
+    /// generic `pcm*` dynamic run; `None` for the translation's runs).
+    pub scenario_profile: Option<simoxide_sim::LoadProfile>,
+    /// SimOxide's usage streams (common random numbers; off for the translation's runs).
+    pub usage_streams: bool,
 }
 
 /// One autoscaled Deployable of a [`DynamicModel`].
@@ -2439,6 +2444,8 @@ fn pods(b: &mut Builder, d: &Decisions, placement: &BTreeMap<String, String>, qu
         ms_per_unit: d.ms_per_unit,
         budgets: quality.budgets.iter().cloned().collect(),
         roots: [b.repo.clone(), b.system.clone(), b.allocation.clone(), b.resenv.clone()],
+        scenario_profile: None,
+        usage_streams: false,
     })
 }
 

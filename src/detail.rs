@@ -94,6 +94,7 @@ impl DetailRequest {
                 "assemblyOperations",
                 "model",
                 "modelText",
+                "autoscaling",
             ]
             .contains(&k.as_str())
             {
@@ -144,6 +145,43 @@ impl DetailRequest {
         }
         Ok(r)
     }
+}
+
+/// The detail of a JSON request (CLI `detail`, `POST /pcm/detail`): [`detail`], or with
+/// `autoscaling: {groups: [{container, min, max, target, initial, startupS, scaleDownS?,
+/// cpuRequest?}], services: [{container, assembly, loadBalancer}], maxPods?}` a dynamic run with
+/// SPD and the HPA ([`crate::pcmhpa`]), its outcome under `autoscaling`.
+pub fn detail_json(model: &WireModel, v: &Value, limits: Limits) -> Result<Value, String> {
+    let req = DetailRequest::from_json(v)?;
+    let Some(a) = v.get("autoscaling") else { return detail(model, &req, limits) };
+    let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("autoscaling: {k} is missing"));
+    let n = |x: &Value, k: &str| x.get(k).and_then(Value::as_f64).ok_or_else(|| format!("autoscaling: {k} is missing"));
+    let mut groups = Vec::new();
+    for g in a.get("groups").and_then(Value::as_array).into_iter().flatten() {
+        groups.push(crate::pcmhpa::ScalingGroup {
+            container: s(g, "container")?,
+            min: n(g, "min")? as u32,
+            max: n(g, "max")? as u32,
+            target: n(g, "target")?,
+            initial: n(g, "initial").unwrap_or(1.0) as u32,
+            startup_s: n(g, "startupS").unwrap_or(crate::translate::DEFAULT_STARTUP_S),
+            scale_down_s: g.get("scaleDownS").and_then(Value::as_f64),
+            cpu_request: g.get("cpuRequest").and_then(Value::as_f64),
+        });
+    }
+    let mut services = Vec::new();
+    for x in a.get("services").and_then(Value::as_array).into_iter().flatten() {
+        services.push(crate::pcmhpa::ServiceGroup { container: s(x, "container")?, assembly: s(x, "assembly")?, load_balancer: s(x, "loadBalancer")? });
+    }
+    let max_pods = a.get("maxPods").and_then(Value::as_u64).unwrap_or(crate::dynamic::DEFAULT_MAX_PODS as u64) as u32;
+    let (r, mut out) = crate::pcmhpa::run_model(model, &crate::pcmhpa::HpaRequest { groups, services, run: req, max_pods }, limits)?;
+    out["autoscaling"] = json!({
+        "readyReplicaSeconds": r.ready_replica_seconds, "replicaSeconds": r.replica_seconds, "peakReplicas": r.peak_replicas,
+        "rescales": r.rescales, "createdPods": r.created, "flapping": r.flapping, "capped": r.capped,
+        "groups": r.groups.iter().map(|g| json!({"container": g.container, "meanReplicas": g.mean_replicas, "maxReplicas": g.max_replicas,
+            "readyReplicaSeconds": g.ready_replica_seconds, "rescales": g.rescales, "createdPods": g.created, "reversals": g.reversals})).collect::<Vec<_>>(),
+    });
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,7 +375,7 @@ pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<
 }
 
 /// Response-time tuples and step series of one run, reduced (`end` in model units).
-fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_sim::Measurements, end: f64) -> Value {
+pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_sim::Measurements, end: f64) -> Value {
     let k = 1000.0 / req.time_unit_ms;
     let ms = req.time_unit_ms;
     let (w0, w1) = (req.warm_up_s, req.duration_s.min(end / k).max(req.warm_up_s));
@@ -411,7 +449,13 @@ fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_sim:
         if rows.is_empty() {
             continue;
         }
-        let budget = req.budgets_ms.get(&key).or_else(|| extra.get("name").and_then(Value::as_str).and_then(|n| req.budgets_ms.get(n))).copied();
+        // a budget by the series' key, its element's name, or (system operations) its signature
+        let budget = req
+            .budgets_ms
+            .get(&key)
+            .or_else(|| extra.get("name").and_then(Value::as_str).and_then(|n| req.budgets_ms.get(n)))
+            .or_else(|| (group == "systemOperations").then(|| extra.get("signature").and_then(Value::as_str).and_then(|n| req.budgets_ms.get(n))).flatten())
+            .copied();
         let mut st = response_stats(rows, &bins, req, budget);
         if let Some(b) = budget {
             let limit = req.slo_factor * b / ms;
@@ -586,7 +630,7 @@ fn response_stats(rows: &[(f64, f64)], bins: &[f64], req: &DetailRequest, budget
 }
 
 /// Time-weighted mean over `[a, b]` of a step series (value 0 before its first tuple).
-fn step_mean(rows: &[(f64, f64)], a: f64, b: f64) -> f64 {
+pub fn step_mean(rows: &[(f64, f64)], a: f64, b: f64) -> f64 {
     step_mean_by(rows, a, b, |v| v)
 }
 

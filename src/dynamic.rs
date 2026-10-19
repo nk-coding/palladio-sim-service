@@ -174,6 +174,12 @@ pub fn prepare(dm: Arc<DynamicModel>, max_pods: u32) -> Result<Prepared, String>
     if let Some(p) = &dm.profile {
         h.update(format!("{:?}", p).as_bytes());
     }
+    if let Some(p) = &dm.scenario_profile {
+        h.update(format!("{:?}", p).as_bytes());
+    }
+    if dm.usage_streams {
+        h.update(b"usage streams");
+    }
     Ok(Prepared { model: dm, files, digest: h.finalize().into() })
 }
 
@@ -376,6 +382,61 @@ fn core() -> Result<&'static QvtoCore, String> {
 
 /// Runs a prepared dynamic model.
 pub fn run(p: &Prepared, params: &HpaParams, limits: Limits) -> Result<HpaOutcome, String> {
+    let raw = run_raw(p, params, limits)?;
+    let profile = p.model.profile.as_ref().expect("checked by run_raw");
+    let mut o = outcome(&p.model, profile, params, &raw.cm, &raw.meas, &raw.log, &raw.at_warm, &raw.at_end, raw.capped, raw.events, raw.t0)?;
+    o.adjust_ms = raw.adjust_ms;
+    Ok(o)
+}
+
+/// What a dynamic run leaves: the compiled model, the measurements, the HPA log and summaries.
+pub struct RawRun {
+    pub cm: CompiledModel,
+    pub meas: simoxide_sim::Measurements,
+    log: HpaLog,
+    pub at_warm: Vec<simoxide_spd::hpa::HpaSummary>,
+    pub at_end: Vec<simoxide_spd::hpa::HpaSummary>,
+    pub capped: bool,
+    pub events: u64,
+    pub adjust_ms: f64,
+    /// Simulated time at the end (model units).
+    pub end: f64,
+    pub t0: Instant,
+}
+
+impl RawRun {
+    /// The ready pods of autoscaler `name` over time (s): (time, ready) at its syncs and
+    /// readiness changes, in time order, starting with `initial` at 0.
+    pub fn ready_series(&self, name: &str, initial: i32, units_per_s: f64) -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = vec![(0.0, initial as f64)];
+        let mut rest: Vec<(f64, f64)> = self
+            .log
+            .syncs
+            .iter()
+            .filter(|r| *r.1 == *name)
+            .map(|r| (r.0 / units_per_s, r.2 as f64))
+            .chain(self.log.ready.iter().filter(|r| *r.1 == *name).map(|r| (r.0 / units_per_s, r.2 as f64)))
+            .collect();
+        rest.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.extend(rest);
+        v
+    }
+
+    /// Direction reversals of the rescales of autoscaler `name` from `from` (model units) on.
+    pub fn reversals(&self, name: &str, from: f64) -> u32 {
+        let mut dirs: Vec<i8> = Vec::new();
+        for r in self.log.syncs.iter().filter(|r| *r.1 == *name && r.0 >= from) {
+            let d = (r.4 - r.3).signum() as i8;
+            if d != 0 && dirs.last() != Some(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs.len().saturating_sub(1) as u32
+    }
+}
+
+/// Runs a prepared dynamic model and keeps what it leaves (for [`outcome`] or a generic one).
+pub fn run_raw(p: &Prepared, params: &HpaParams, limits: Limits) -> Result<RawRun, String> {
     let t0 = Instant::now();
     let dm = &p.model;
     let profile = dm.profile.clone().ok_or("a dynamic run needs a LoadProfile in the model")?;
@@ -399,7 +460,11 @@ pub fn run(p: &Prepared, params: &HpaParams, limits: Limits) -> Result<HpaOutcom
     // other float rounding)
     sc.ps_algorithm = simoxide_sim::PsAlgorithm::VirtualTime;
     sc.limits = limits;
-    sc.load_profile = Some(Arc::new(LoadProfile::uniform(profile.steps.iter().map(|&(t, f)| (t * k, f)).collect())));
+    sc.load_profile = Some(Arc::new(match &dm.scenario_profile {
+        Some(lp) => lp.clone(),
+        None => LoadProfile::uniform(profile.steps.iter().map(|&(t, f)| (t * k, f)).collect()),
+    }));
+    sc.usage_streams = dm.usage_streams;
     let sim = Simulation::<Fast>::create(&cm, sc, Outputs::default()).map_err(|e| e.message)?;
     let mut run = SpdRun::new(sim, &spd).map_err(|e| e.message)?.with_hpa(&hpa).map_err(|e| e.message)?;
     let init: Vec<String> = dm.groups.iter().filter(|g| g.initial > 1).map(init_policy).collect();
@@ -428,10 +493,9 @@ pub fn run(p: &Prepared, params: &HpaParams, limits: Limits) -> Result<HpaOutcom
     let at_end = run.hpa_summary();
     let events = run.sim.state().events();
     let measurements = run.sim.state().measurements().clone();
+    let end = run.sim.state().now_ns() as f64 / 1e9;
     drop(run);
-    let mut o = outcome(dm, &profile, params, &cm, &measurements, &log, &at_warm, &at_end, capped, events, t0)?;
-    o.adjust_ms = adj.total.as_secs_f64() * 1e3;
-    Ok(o)
+    Ok(RawRun { cm, meas: measurements, log, at_warm, at_end, capped, events, adjust_ms: adj.total.as_secs_f64() * 1e3, end, t0 })
 }
 
 #[allow(clippy::too_many_arguments)]

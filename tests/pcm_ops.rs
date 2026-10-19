@@ -302,3 +302,211 @@ scenario_call.inputParameterUsages -- mode_usage
     let l = palladio_arch::load::analyse(&g);
     assert!((l.times["scenario"] - 0.0275).abs() < 0.0275 * 0.02, "{}", l.times["scenario"]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic runs on plain PCM (SPD + HPA): the realised model of rule 5 run generically gives the
+// translation's dynamic run
+
+fn arch_hpa_model(rate: f64, steps: &[(f64, f64)], warm_up: f64, end: f64) -> WireModel {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two-tier.m")).unwrap();
+    let text = text.replace("RATE", &format!("{rate:?}")).replace("BACKEND_CONTAINER", "C2");
+    let mut d = format!(
+        "decisions : ArchitectureDecisions {{ msPerTimeUnit = 1000.0 }}\nd : Deployable {{ cpuPerReplica = 0.5 }}\nd.container -- C2\nd.autoscaling -- auto\ndecisions.deployables -- d\n\
+         auto : Autoscaling {{ targetUtilisation = 0.7 }}\ndecisions.autoscalings -- auto\n\
+         cost : CostModel {{ perContainer = 0.0 perCore = 1.0 perReplicaOverhead = 0.2 perCache = 0.0 }}\ndecisions.costModel -- cost\n\
+         budget : LatencyBudget {{ ms = 30.0 }}\nbudget.scenario -- scenario\ndecisions.latencyBudgets -- budget\n\
+         profile : LoadProfile {{ warmUpSeconds = {warm_up:?} endSeconds = {end:?} sloFactor = 2.0 }}\ndecisions.loadProfile -- profile\n"
+    );
+    for (i, (t, f)) in steps.iter().enumerate() {
+        d += &format!("profile.steps -- step{i}\nstep{i} : LoadStep {{ seconds = {t:?} factor = {f:?} }}\n");
+    }
+    mfile::parse(&format!("{text}\n{d}")).unwrap()
+}
+
+#[test]
+fn hpa_on_plain_pcm_matches_the_translations_dynamic_run() {
+    use palladio_arch::dynamic::{self, HpaParams};
+    use palladio_arch::pcmhpa::{self, HpaRequest, ScalingGroup, ServiceGroup};
+    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
+    let m = arch_hpa_model(100.0, &steps, 60.0, 600.0);
+    let (_, dm) = translate::translate_dynamic(&m).unwrap();
+    let arch = dynamic::run(&dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(), &HpaParams { seed: 3, exclude: vec![] }, Default::default()).unwrap();
+    // the realised model: the dynamic model's PCM; the groups as a script would pass them
+    let groups: Vec<ScalingGroup> = dm
+        .groups
+        .iter()
+        .map(|g| ScalingGroup {
+            container: g.container.clone(),
+            min: g.min,
+            max: g.max,
+            target: g.target,
+            initial: g.initial,
+            startup_s: g.startup_s,
+            scale_down_s: g.scale_down_s,
+            cpu_request: Some(g.cpu_request),
+        })
+        .collect();
+    let services: Vec<ServiceGroup> = dm
+        .groups
+        .iter()
+        .flat_map(|g| g.services.iter().map(move |(a, lb)| ServiceGroup { container: g.container.clone(), assembly: a.clone(), load_balancer: lb.clone() }))
+        .collect();
+    let mut budgets = std::collections::BTreeMap::new();
+    budgets.insert("scenario".to_string(), 30.0);
+    let run = DetailRequest {
+        profile: steps.iter().map(|&(t, f)| LoadStep { scenario: None, time: t, factor: f }).collect(),
+        usage_streams: false,
+        seed: 3,
+        duration_s: 600.0,
+        warm_up_s: 60.0,
+        bin_s: 30.0,
+        time_unit_ms: 1000.0,
+        budgets_ms: budgets,
+        slo_factor: 2.0,
+        assembly_operations: false,
+        ..DetailRequest::default()
+    };
+    let req = HpaRequest { groups, services, run, max_pods: 400 };
+    let (r, detail) = pcmhpa::run_model(&dm.pcm, &req, Default::default()).unwrap();
+    assert_eq!(r.groups.len(), 1);
+    let (a, b) = (&arch.groups[0], &r.groups[0]);
+    assert!(close(a.mean_replicas, b.mean_replicas, 1e-12), "{} vs {}", a.mean_replicas, b.mean_replicas);
+    assert_eq!((a.rescales, a.created, a.reversals), (b.rescales, b.created, b.reversals));
+    assert!(close(arch.ready_replica_seconds, r.ready_replica_seconds, 1e-12));
+    assert!(close(arch.replica_seconds, r.replica_seconds, 1e-12));
+    assert_eq!(arch.peak_replicas, r.peak_replicas);
+    assert_eq!(arch.requests, r.requests);
+    assert!(close(arch.slo, r.slo, 1e-12), "{} vs {}", arch.slo, r.slo);
+    assert!(close(arch.flapping, r.flapping, 1e-12));
+    assert!(!r.capped);
+    // the scaled container's pods over time: more at the step to 1.0
+    let c2 = detail["containers"].as_array().unwrap().iter().find(|c| c["container"] == "C2").unwrap().clone();
+    assert_eq!(c2["autoscaled"], true);
+    let pods: Vec<f64> = c2["replicas"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert!(pods[12] > pods[5], "{pods:?}");
+    // with usage streams and a per-scenario profile it runs as well
+    let mut req2 = req.clone();
+    req2.run.usage_streams = true;
+    req2.run.profile = vec![LoadStep { scenario: Some("scenario".into()), time: 0.0, factor: 0.5 }];
+    let (r2, _) = pcmhpa::run_model(&dm.pcm, &req2, Default::default()).unwrap();
+    assert!(r2.groups[0].mean_replicas < r.groups[0].mean_replicas + 1.0);
+}
+
+/// The script functions, called as the platform calls them (records and lists of instances).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_functions() {
+    use palladio_arch::functions;
+    use palladio_sim_service::protocol::{HeapObject, WireValue};
+    let engine = Arc::new(Engine::new(Config::from_env().unwrap()));
+    let rec = |c: &str, f: Vec<(&str, WireValue)>| WireValue::Record { class_name: c.into(), fields: f.into_iter().map(|(k, v)| (k.to_string(), v)).collect() };
+    let inst = |n: &str| WireValue::Instance(n.into());
+    let mut n = 1000;
+    let mut next = || {
+        n += 1;
+        n
+    };
+    async fn call(
+        engine: &Arc<Engine>,
+        op: &str,
+        args: Vec<WireValue>,
+        lists: &HashMap<i64, Vec<WireValue>>,
+        cache: &Arc<PcmCache>,
+        next: &mut impl FnMut() -> i64,
+    ) -> (WireValue, Vec<HeapObject>) {
+        let mut prepared = None;
+        let a = functions::call_pcm(engine, op, &args, lists, cache, &mut prepared, next).await.unwrap_or_else(|e| panic!("{op}: {e}"));
+        (a.value, a.objects)
+    }
+    let field = |v: &WireValue, k: &str| -> WireValue {
+        let WireValue::Record { fields, .. } = v else { panic!("not a record: {v:?}") };
+        fields.iter().find(|(n, _)| n == k).unwrap().1.clone()
+    };
+    // per operation
+    let cache = Arc::new(PcmCache::new(&model()));
+    let backend_cpu = cache.graph.all("InternalAction").into_iter().find(|a| a.starts_with("Backend")).unwrap();
+    let mut lists: HashMap<i64, Vec<WireValue>> = HashMap::new();
+    lists.insert(1, vec![inst(&backend_cpu)]);
+    lists.insert(2, vec![WireValue::Double(3.0)]);
+    let (v, objs) = call(&engine, "pcmOperationVisits", vec![WireValue::Ref(1), WireValue::Ref(2)], &lists, &cache, &mut next).await;
+    let WireValue::Ref(id) = v else { panic!() };
+    let items = objs.iter().find(|o| o.id == id).unwrap().elements.clone().unwrap();
+    assert_eq!(items.len(), 3);
+    for it in &items {
+        assert_eq!(field(it, "value"), WireValue::Double(3.0));
+    }
+    lists.insert(3, vec![inst("C1")]);
+    lists.insert(4, vec![WireValue::Double(0.1)]);
+    lists.insert(5, vec![]);
+    let (v, objs) = call(&engine, "pcmOperationFailure", vec![WireValue::Ref(3), WireValue::Ref(4), WireValue::Ref(5)], &lists, &cache, &mut next).await;
+    let WireValue::Ref(id) = v else { panic!() };
+    for it in objs.iter().find(|o| o.id == id).unwrap().elements.clone().unwrap() {
+        let WireValue::Double(x) = field(&it, "value") else { panic!() };
+        assert!(close(x, 0.1, 1e-12));
+    }
+    // pcmRun / pcmRunStat with a profile (the fixture's own monitor: scenario `scenario`)
+    lists.insert(6, vec![]);
+    lists.insert(7, vec![rec("PcmLoadStep", vec![("scenario", inst("scenario")), ("time", WireValue::Double(0.0)), ("factor", WireValue::Double(2.0))])]);
+    let run = |extra: Vec<WireValue>| {
+        let mut a = vec![WireValue::Ref(6), WireValue::Ref(7), WireValue::Bool(true)];
+        a.extend(extra);
+        a.extend([WireValue::Int(1), WireValue::Int(-1), WireValue::Int(200), WireValue::Int(1), WireValue::Bool(false)]);
+        a
+    };
+    let (v, _) = call(&engine, "pcmRunStat", run(vec![WireValue::String("scenario".into()), WireValue::String("Response Time".into()), WireValue::String("count".into())]), &lists, &cache, &mut next).await;
+    let WireValue::Double(cnt) = v else { panic!() };
+    assert!((cnt / (40.0 * 200.0) - 1.0).abs() < 0.05, "{cnt}");
+    let (v, _) = call(&engine, "pcmRun", run(vec![]), &lists, &cache, &mut next).await;
+    assert!(matches!(field(&v, "events"), WireValue::Long(e) if e > 0));
+    // pcmHpaRun on the realised dynamic model
+    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
+    let (_, dm) = translate::translate_dynamic(&arch_hpa_model(100.0, &steps, 60.0, 600.0)).unwrap();
+    let g = &dm.groups[0];
+    let cache = Arc::new(PcmCache::new(&dm.pcm));
+    let mut lists: HashMap<i64, Vec<WireValue>> = HashMap::new();
+    lists.insert(
+        1,
+        vec![rec(
+            "PcmScalingGroup",
+            vec![
+                ("container", inst(&g.container)),
+                ("minReplicas", WireValue::Int(g.min as i32)),
+                ("maxReplicas", WireValue::Int(g.max as i32)),
+                ("targetUtilisation", WireValue::Double(g.target)),
+                ("initialReplicas", WireValue::Int(g.initial as i32)),
+                ("startup", WireValue::Double(g.startup_s)),
+                ("scaleDown", WireValue::Double(-1.0)),
+                ("cpuRequest", WireValue::Double(g.cpu_request)),
+            ],
+        )],
+    );
+    lists.insert(2, g.services.iter().map(|(a, lb)| rec("PcmServiceGroup", vec![("container", inst(&g.container)), ("assembly", inst(a)), ("loadBalancer", inst(lb))])).collect());
+    lists.insert(3, steps.iter().map(|&(t, f)| rec("PcmLoadStep", vec![("scenario", WireValue::Null), ("time", WireValue::Double(t)), ("factor", WireValue::Double(f))])).collect());
+    lists.insert(4, vec![inst("scenario")]);
+    lists.insert(5, vec![WireValue::Double(30.0)]);
+    let args = vec![
+        WireValue::Ref(1),
+        WireValue::Ref(2),
+        WireValue::Ref(3),
+        WireValue::Ref(4),
+        WireValue::Ref(5),
+        WireValue::Double(60.0),
+        WireValue::Double(600.0),
+        WireValue::Double(1000.0),
+        WireValue::Double(2.0),
+        WireValue::Bool(false),
+        WireValue::Int(3),
+        WireValue::Int(400),
+    ];
+    let (v, _) = call(&engine, "pcmHpaRun", args.clone(), &lists, &cache, &mut next).await;
+    let arch = palladio_arch::dynamic::run(
+        &palladio_arch::dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(),
+        &palladio_arch::dynamic::HpaParams { seed: 3, exclude: vec![] },
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(field(&v, "readyReplicaSeconds"), WireValue::Double(arch.ready_replica_seconds));
+    assert_eq!(field(&v, "slo"), WireValue::Double(arch.slo));
+    // cached per model and request
+    let (v2, _) = call(&engine, "pcmHpaRun", args, &lists, &cache, &mut next).await;
+    assert_eq!(field(&v2, "wallMs"), field(&v, "wallMs"));
+}

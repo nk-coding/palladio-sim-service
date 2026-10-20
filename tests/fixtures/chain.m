@@ -4,7 +4,7 @@
 // and Notifier.notify 4 ms). DbRead.apply takes 1 ms. Time unit: seconds; every CPU does 1000
 // units per second, so one unit is 1 ms. Placeholders: RATE, BACKEND_C, NOTIFIER_C, READ_C.
 
-using "../../../palladio-architecture-optimization/metamodel/palladio.mm"
+using "../../../palladio-architecture-optimization-domain/metamodel/palladio.mm"
 
 repo : Repository { entityName = "repo" }
 repo.interfaces -- IGateway

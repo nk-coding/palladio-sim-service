@@ -6,7 +6,7 @@ use palladio_arch::{mfile, pcm::PcmCache, translate};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const TODAY: &str = "../palladio-architecture-optimization-unified/models/misarch-today.m";
+const TODAY: &str = "../palladio-architecture-optimization-domain/models/misarch-today.m";
 
 #[test]
 fn pcm_analyses_match_the_translation() {

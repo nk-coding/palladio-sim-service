@@ -112,7 +112,7 @@ fn operations_per_call() {
     assert!(f.iter().all(|(_, p)| close(*p, 0.02, 1e-12)));
 }
 
-const TODAY: &str = "../palladio-architecture-optimization-unified/models/misarch-today.m";
+const TODAY: &str = "../palladio-architecture-optimization-domain/models/misarch-today.m";
 
 #[test]
 fn per_call_failure_and_time_match_the_scenarios_on_misarch() {

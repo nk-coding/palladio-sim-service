@@ -101,6 +101,14 @@ const PCM_FAILURE_PARAMS: [Param; 4] = [
     p("exclude", Ty::String, Default::Str("")),
 ];
 
+const PCM_SOURCE_FAILURE_PARAMS: [Param; 5] = [
+    p("containers", Ty::ListOfAny, Default::None),
+    p("sources", Ty::ListOfDouble, Default::None),
+    p("unavailabilities", Ty::ListOfDouble, Default::None),
+    p("transparent", Ty::ListOfAny, Default::None),
+    p("exclude", Ty::String, Default::Str("")),
+];
+
 const PCM_RUN_PARAMS: [Param; 6] = [
     p("overrides", Ty::ListOf("PcmOverride"), Default::None),
     RUN_PARAMS[0],
@@ -229,6 +237,7 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "pcmWeightedVisits", params: &PCM_VISITS_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "pcmCallRates", params: &PCM_CALLS_PARAMS, returns: Ty::ListOf("PcmCall"), simulates: false },
     Function { name: "pcmFailure", params: &PCM_FAILURE_PARAMS, returns: Ty::Double, simulates: false },
+    Function { name: "pcmSourceFailure", params: &PCM_SOURCE_FAILURE_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "pcmSimulate", params: &PCM_RUN_PARAMS, returns: Ty::Record("ArchResult"), simulates: false },
     Function { name: "pcmStat", params: &PCM_STAT_PARAMS, returns: Ty::Double, simulates: false },
     Function { name: "pcmMean", params: &PCM_MEAN_PARAMS, returns: Ty::Double, simulates: false },
@@ -1008,6 +1017,23 @@ pub async fn call_pcm(
             let unavailable: std::collections::HashMap<String, f64> = cs.into_iter().zip(us).collect();
             let transparent: std::collections::HashSet<String> = a.instances("transparent", lists)?.into_iter().collect();
             double(cache.failure(&unavailable, &transparent, &excluded(&a)?).0)
+        }
+        "pcmSourceFailure" => {
+            let cs = a.instances("containers", lists)?;
+            let ix = a.doubles("sources", lists)?;
+            let us = a.doubles("unavailabilities", lists)?;
+            if cs.len() != ix.len() {
+                return Err(format!("pcmSourceFailure: {} containers but {} source indices", cs.len(), ix.len()));
+            }
+            let mut sets = vec![Vec::new(); us.len()];
+            for (c, i) in cs.into_iter().zip(ix) {
+                if !(i >= 0.0 && i.fract() == 0.0 && (i as usize) < us.len()) {
+                    return Err(format!("pcmSourceFailure: source index {i} is not one of 0..{}", us.len()));
+                }
+                sets[i as usize].push(c);
+            }
+            let transparent: std::collections::HashSet<String> = a.instances("transparent", lists)?.into_iter().collect();
+            double(cache.source_failure(&sets, &us, &transparent, &excluded(&a)?).0)
         }
         "pcmOperationVisits" => {
             let actions = a.instances("actions", lists)?;

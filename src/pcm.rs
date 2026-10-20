@@ -13,6 +13,8 @@
 //!   entry-level call, with the given probabilistic branch transitions overridden;
 //! - `pcmFailure(containers, unavailabilities, transparent, exclude)`: the rate-weighted share of
 //!   requests that need an unavailable container on their synchronous path;
+//! - `pcmSourceFailure(containers, sources, unavailabilities, transparent, exclude)`: the same
+//!   with failure sources (common causes) that each take down a set of containers;
 //! - `pcmSimulate(overrides, ...)`, `pcmStat(overrides, ...)`: a simulation with the processing
 //!   resources' replicas and rates overridden;
 //! - `pcmMean(expr)`: the mean of a variable-free StoEx;
@@ -161,6 +163,28 @@ impl PcmCache {
                 continue;
             }
             let ok: f64 = acc.iter().map(|(c, p)| 1.0 - p * unavailable.get(c).copied().unwrap_or(0.0)).product();
+            let r = self.loads.arrivals.get(&sc).copied().unwrap_or(0.0);
+            sum += r * (1.0 - ok);
+            rate += r;
+        }
+        (if rate > 0.0 { sum / rate } else { 0.0 }, warnings)
+    }
+
+    /// The share of failed requests with failure sources (common-cause failures): source s is
+    /// down with probability u_s and then takes down every container of its set S_s; sources are
+    /// independent. Per scenario P_o(S) is the probability that a request needs any container of
+    /// S on its synchronous path (the walk of [`Self::failure`] with S as one node,
+    /// [`load::sync_dependencies_sets_pcm`]), then
+    /// Σ_o λ_o (1 − Π_s (1 − P_o(S_s) u_s)) / Σ_o λ_o.
+    /// With one source per container ({k}, u_k) this is [`Self::failure`] exactly.
+    pub fn source_failure(&self, sets: &[Vec<String>], unavailable: &[f64], transparent: &HashSet<String>, exclude: &[String]) -> (f64, Vec<String>) {
+        let (deps, warnings) = load::sync_dependencies_sets_pcm(&self.graph, transparent, sets);
+        let (mut sum, mut rate) = (0.0, 0.0);
+        for (sc, ps) in deps {
+            if self.excluded(&sc, exclude) {
+                continue;
+            }
+            let ok: f64 = ps.iter().zip(unavailable).map(|(p, u)| 1.0 - p * u).product();
             let r = self.loads.arrivals.get(&sc).copied().unwrap_or(0.0);
             sum += r * (1.0 - ok);
             rate += r;

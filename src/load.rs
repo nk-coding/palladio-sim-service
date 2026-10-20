@@ -861,17 +861,68 @@ fn sync_dependencies_impl(
     transparent: &HashSet<String>,
     exact_exp: bool,
 ) -> (BTreeMap<String, BTreeMap<String, f64>>, Vec<String>) {
+    let (out, _, warnings) = sync_walk(g, fate, transparent, exact_exp, None);
+    (out, warnings)
+}
+
+/// Per usage scenario and per container set: the probability that one request needs *any*
+/// container of the set on its synchronous path, by the rules of [`sync_dependencies_pcm`] with
+/// the set's containers taken as one node: a call into the set is marked unless a container of
+/// the set is already on the current call chain (then the request is in the set already), and
+/// marks combine as there. A one-container set gives exactly that container's probability of
+/// [`sync_dependencies_pcm`]. One walk serves every set.
+pub fn sync_dependencies_sets_pcm(g: &Graph, transparent: &HashSet<String>, sets: &[Vec<String>]) -> (BTreeMap<String, Vec<f64>>, Vec<String>) {
+    let index = SetIndex::new(sets);
+    let (_, out, warnings) = sync_walk(g, &HashMap::new(), transparent, true, Some(&index));
+    (out, warnings)
+}
+
+/// Container sets for [`Deps`]: the sets each container belongs to.
+struct SetIndex {
+    of: HashMap<String, Vec<usize>>,
+    members: Vec<HashSet<String>>,
+}
+
+impl SetIndex {
+    fn new(sets: &[Vec<String>]) -> SetIndex {
+        let mut of: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut members = Vec::with_capacity(sets.len());
+        for (i, s) in sets.iter().enumerate() {
+            let m: HashSet<String> = s.iter().cloned().collect();
+            for c in &m {
+                of.entry(c.clone()).or_default().push(i);
+            }
+            members.push(m);
+        }
+        SetIndex { of, members }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn sync_walk(
+    g: &Graph,
+    fate: &HashMap<String, String>,
+    transparent: &HashSet<String>,
+    exact_exp: bool,
+    sets: Option<&SetIndex>,
+) -> (BTreeMap<String, BTreeMap<String, f64>>, BTreeMap<String, Vec<f64>>, Vec<String>) {
     let mut ex = Exprs { ids: HashMap::new(), pmfs: HashMap::new(), randoms: HashMap::new(), programs: HashMap::new(), means: HashMap::new(), warnings: Vec::new(), exact_exp };
     let ix = Index::new(g, &mut ex);
     let mut out = BTreeMap::new();
-    let mut d = Deps { ix: &ix, ex: &mut ex, fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default() };
+    let mut out_sets = BTreeMap::new();
+    let n = sets.map_or(0, |s| s.members.len());
+    let mut d = Deps { ix: &ix, ex: &mut ex, fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default(), sets, set_acc: Vec::new() };
     for sc in g.all("UsageScenario") {
         let Some(beh) = g.ref1(&sc, "scenarioBehaviour") else { continue };
         let mut acc = BTreeMap::new();
+        d.set_acc = vec![0.0; n];
         d.scenario(&beh, 1.0, &mut acc);
         out.insert(sc.clone(), acc);
+        if sets.is_some() {
+            out_sets.insert(sc.clone(), std::mem::take(&mut d.set_acc));
+        }
     }
-    (out, ex.warnings)
+    (out, out_sets, ex.warnings)
 }
 
 struct Deps<'a, 'b> {
@@ -883,6 +934,9 @@ struct Deps<'a, 'b> {
     /// Containers of the calls on the current chain.
     chain: Vec<String>,
     warned: std::collections::HashSet<String>,
+    /// Container sets marked as one node each ([`sync_dependencies_sets_pcm`]), with their marks.
+    sets: Option<&'b SetIndex>,
+    set_acc: Vec<f64>,
 }
 
 impl Deps<'_, '_> {
@@ -918,6 +972,17 @@ impl Deps<'_, '_> {
         let c = self.fate.get(&c).cloned().unwrap_or(c);
         if !self.chain.contains(&c) {
             Self::mark(acc, &c, p);
+        }
+        if let Some(sets) = self.sets
+            && let Some(ids) = sets.of.get(&c)
+        {
+            for &i in ids {
+                let m = &sets.members[i];
+                if !self.chain.iter().any(|x| m.contains(x)) {
+                    let e = &mut self.set_acc[i];
+                    *e = 1.0 - (1.0 - *e) * (1.0 - p.clamp(0.0, 1.0));
+                }
+            }
         }
         let Some(comp) = g.ref1(asm, "encapsulatedComponent") else { return };
         let Some(seff) = self.ix.seffs.get(&(comp, sig.to_string())).cloned() else { return };
@@ -1121,7 +1186,7 @@ pub fn sync_dependencies_calls_pcm(g: &Graph, transparent: &HashSet<String>) -> 
     let ix = Index::new(g, &mut ex);
     let fate = HashMap::new();
     let mut out = BTreeMap::new();
-    let mut d = Deps { ix: &ix, ex: &mut ex, fate: &fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default() };
+    let mut d = Deps { ix: &ix, ex: &mut ex, fate: &fate, transparent, depth: 0, chain: Vec::new(), warned: Default::default(), sets: None, set_acc: Vec::new() };
     for call in g.all("EntryLevelSystemCall") {
         let (Some(role), Some(sig)) = (g.ref1(&call, "providedRole"), g.ref1(&call, "operationSignature")) else { continue };
         let Some(asm) = d.ix.delegations.get(&role).cloned() else { continue };

@@ -1,6 +1,6 @@
 [package]
 name = "palladio-arch-service"
-description = "mdeo plugin service: translates architecture decisions on plain Palladio (PCM) models into PCM and simulates the result with SimOxide"
+description = "mdeo plugin service: analyses and simulates plain Palladio (PCM) models with SimOxide, for the architecture optimisation"
 version = "0.1.0"
 edition = "2024"
 license = "EPL-2.0"

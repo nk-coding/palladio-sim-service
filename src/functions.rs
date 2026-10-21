@@ -1,25 +1,15 @@
-//! The functions scripts call: [`manifest`] declares them, [`call`] answers them.
+//! The functions scripts call: [`manifest`] declares them, [`call`] answers them. They work on
+//! the plain PCM part of the model (`crate::pcm`): analyses without simulating, simulations
+//! with overrides, load profiles and usage streams, and dynamic runs with autoscaling.
 //!
 //! ```fn
-//! val r = archSimulate()                         // the translated model, simulated once
-//! val rt = archStat("defaultUsageScenario")      // mean response time of a scenario
-//! val cost = archCost()                          // from the CostModel
-//! val mq = archModularity()                      // cohesive MQ, containers as clusters (D32)
-//! val u = archUtilisation("Server1")             // offered load of a container ("" = highest)
-//! val t = archNoLoadTime("login")                // rate-weighted no-load response time, no simulation
-//! val n = archReplicas()                         // replicas in use, fixed or autoscaled (D50)
-//! val f = archFailure("login")                   // share of failed requests (D53)
-//! val c = archChangeCoupling()                   // containers touched per change (D54)
-//! val i = archInconsistency("login")             // stale reads + remote writes per request (D54)
-//! val v = archLatencyViolation()                 // C1: over the latency budgets (D55)
-//! val p = archPeakViolation()                    // C2: unscaled containers over their limit at the peak (D55)
-//! val h = archHpaSimulate()                      // a dynamic run with Kubernetes-style autoscaling (crate::dynamic)
-//! val c = archHpaCost()                          // its cost: replica-seconds under the HPA over the load profile
-//! val v = archHpaSlo()                           // its share of requests over the service level
-//! val l = archHpaStat("lag")                     // one of its other measures
+//! val rs = pcmResources()                        // offered load per processing resource
+//! val sc = pcmScenarios()                        // arrival rate and no-load time per usage scenario
+//! val f = pcmSourceFailure(cs, ix, us, [], "login") // share of failed requests over failure sources
+//! val r = pcmSimulate(overrides)                 // the model with resource overrides, simulated once
+//! val m = pcmMean("Exp(0.1)")                    // the mean of a StoEx
 //! ```
 
-use crate::translate::Translation;
 use palladio_sim_service::engine::{Engine, Outcome, Prepared, RunParams, SeriesStats};
 use palladio_sim_service::protocol::{HeapKind, HeapObject, WireValue};
 use serde_json::{Value, json};
@@ -84,10 +74,6 @@ const STAT_PARAMS: [Param; 8] = [
     RUN_PARAMS[3],
     RUN_PARAMS[4],
 ];
-
-const UTIL_PARAMS: [Param; 1] = [p("element", Ty::String, Default::Str(""))];
-
-const NO_LOAD_PARAMS: [Param; 1] = [p("exclude", Ty::String, Default::Str(""))];
 
 const PCM_VISITS_PARAMS: [Param; 3] =
     [p("actions", Ty::ListOfAny, Default::None), p("weights", Ty::ListOfDouble, Default::None), p("exclude", Ty::String, Default::Str(""))];
@@ -181,72 +167,29 @@ const PCM_RUN2_STAT_PARAMS: [Param; 11] = [
     RUN_PARAMS[4],
 ];
 
-const HPA_PARAMS: [Param; 2] = [p("seed", Ty::Int, Default::Int(1)), p("exclude", Ty::String, Default::Str("login"))];
-
-const HPA_STAT_PARAMS: [Param; 3] =
-    [p("statistic", Ty::String, Default::None), p("seed", Ty::Int, Default::Int(1)), p("exclude", Ty::String, Default::Str("login"))];
-
-/// The measures `archHpaStat` returns.
-pub const HPA_STATISTICS: &[&str] = &[
-    "cost",
-    "idealCost",
-    "readyReplicaSeconds",
-    "slo",
-    "sloSteps",
-    "requests",
-    "meanMs",
-    "p95Ms",
-    "lag",
-    "lagMax",
-    "flapping",
-    "peakReplicas",
-    "rescales",
-    "createdPods",
-    "capped",
-];
-
 struct Function {
     name: &'static str,
     params: &'static [Param],
     returns: Ty,
-    simulates: bool,
 }
 
 const FUNCTIONS: &[Function] = &[
-    Function { name: "archSimulate", params: &RUN_PARAMS, returns: Ty::Record("ArchResult"), simulates: true },
-    Function { name: "archStat", params: &STAT_PARAMS, returns: Ty::Double, simulates: true },
-    Function { name: "archCost", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archModularity", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archUtilisation", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archInfo", params: &[], returns: Ty::Record("ArchInfo"), simulates: false },
-    Function { name: "archNoLoadTime", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archReplicas", params: &UTIL_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archFailure", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archChangeCoupling", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archInconsistency", params: &NO_LOAD_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archLatencyViolation", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archPeakUtilisation", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archPeakViolation", params: &[], returns: Ty::Double, simulates: false },
-    Function { name: "archHpaSimulate", params: &HPA_PARAMS, returns: Ty::Record("ArchHpaResult"), simulates: false },
-    Function { name: "archHpaCost", params: &HPA_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archHpaSlo", params: &HPA_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "archHpaStat", params: &HPA_STAT_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmResources", params: &[], returns: Ty::ListOf("PcmResource"), simulates: false },
-    Function { name: "pcmScenarios", params: &[], returns: Ty::ListOf("PcmScenario"), simulates: false },
-    Function { name: "pcmOperations", params: &[], returns: Ty::ListOf("PcmOperation"), simulates: false },
-    Function { name: "pcmWeightedVisits", params: &PCM_VISITS_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmCallRates", params: &PCM_CALLS_PARAMS, returns: Ty::ListOf("PcmCall"), simulates: false },
-    Function { name: "pcmFailure", params: &PCM_FAILURE_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmSourceFailure", params: &PCM_SOURCE_FAILURE_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmSimulate", params: &PCM_RUN_PARAMS, returns: Ty::Record("ArchResult"), simulates: false },
-    Function { name: "pcmStat", params: &PCM_STAT_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmMean", params: &PCM_MEAN_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmWarnings", params: &[], returns: Ty::ListOfString, simulates: false },
-    Function { name: "pcmOperationVisits", params: &PCM_OP_VISITS_PARAMS, returns: Ty::ListOf("PcmOperationValue"), simulates: false },
-    Function { name: "pcmOperationFailure", params: &PCM_OP_FAILURE_PARAMS, returns: Ty::ListOf("PcmOperationValue"), simulates: false },
-    Function { name: "pcmRun", params: &PCM_RUN2_PARAMS, returns: Ty::Record("ArchResult"), simulates: false },
-    Function { name: "pcmRunStat", params: &PCM_RUN2_STAT_PARAMS, returns: Ty::Double, simulates: false },
-    Function { name: "pcmHpaRun", params: &PCM_HPA_PARAMS, returns: Ty::Record("PcmHpaResult"), simulates: false },
+    Function { name: "pcmResources", params: &[], returns: Ty::ListOf("PcmResource") },
+    Function { name: "pcmScenarios", params: &[], returns: Ty::ListOf("PcmScenario") },
+    Function { name: "pcmOperations", params: &[], returns: Ty::ListOf("PcmOperation") },
+    Function { name: "pcmWeightedVisits", params: &PCM_VISITS_PARAMS, returns: Ty::Double },
+    Function { name: "pcmCallRates", params: &PCM_CALLS_PARAMS, returns: Ty::ListOf("PcmCall") },
+    Function { name: "pcmFailure", params: &PCM_FAILURE_PARAMS, returns: Ty::Double },
+    Function { name: "pcmSourceFailure", params: &PCM_SOURCE_FAILURE_PARAMS, returns: Ty::Double },
+    Function { name: "pcmSimulate", params: &PCM_RUN_PARAMS, returns: Ty::Record("ArchResult") },
+    Function { name: "pcmStat", params: &PCM_STAT_PARAMS, returns: Ty::Double },
+    Function { name: "pcmMean", params: &PCM_MEAN_PARAMS, returns: Ty::Double },
+    Function { name: "pcmWarnings", params: &[], returns: Ty::ListOfString },
+    Function { name: "pcmOperationVisits", params: &PCM_OP_VISITS_PARAMS, returns: Ty::ListOf("PcmOperationValue") },
+    Function { name: "pcmOperationFailure", params: &PCM_OP_FAILURE_PARAMS, returns: Ty::ListOf("PcmOperationValue") },
+    Function { name: "pcmRun", params: &PCM_RUN2_PARAMS, returns: Ty::Record("ArchResult") },
+    Function { name: "pcmRunStat", params: &PCM_RUN2_STAT_PARAMS, returns: Ty::Double },
+    Function { name: "pcmHpaRun", params: &PCM_HPA_PARAMS, returns: Ty::Record("PcmHpaResult") },
 ];
 
 const RECORDS: &[(&str, &[(&str, Ty)])] = &[
@@ -281,55 +224,6 @@ const RECORDS: &[(&str, &[(&str, Ty)])] = &[
             ("p99", Ty::Double),
             ("timeWeightedMean", Ty::NullableDouble),
             ("ciHalfWidth", Ty::NullableDouble),
-        ],
-    ),
-    (
-        "ArchInfo",
-        &[
-            ("translated", Ty::Boolean),
-            ("instances", Ty::Int),
-            ("cost", Ty::Double),
-            ("modularity", Ty::Double),
-            ("maxUtilisation", Ty::Double),
-            ("resources", Ty::ListOf("ArchResource")),
-            ("warnings", Ty::ListOfString),
-        ],
-    ),
-    (
-        "ArchHpaResult",
-        &[
-            ("cost", Ty::Double),
-            ("idealCost", Ty::Double),
-            ("readyReplicaSeconds", Ty::Double),
-            ("replicaSeconds", Ty::Double),
-            ("slo", Ty::Double),
-            ("sloSteps", Ty::Double),
-            ("requests", Ty::Long),
-            ("meanMs", Ty::Double),
-            ("p95Ms", Ty::Double),
-            ("lag", Ty::Double),
-            ("lagMax", Ty::Double),
-            ("flapping", Ty::Double),
-            ("peakReplicas", Ty::Double),
-            ("rescales", Ty::Long),
-            ("createdPods", Ty::Long),
-            ("capped", Ty::Boolean),
-            ("events", Ty::Long),
-            ("wallMs", Ty::Double),
-            ("groups", Ty::ListOf("ArchHpaGroup")),
-        ],
-    ),
-    (
-        "ArchHpaGroup",
-        &[
-            ("name", Ty::String),
-            ("meanReplicas", Ty::Double),
-            ("idealReplicas", Ty::Double),
-            ("maxReplicas", Ty::Int),
-            ("rescales", Ty::Long),
-            ("createdPods", Ty::Long),
-            ("lag", Ty::Double),
-            ("reversals", Ty::Int),
         ],
     ),
     (
@@ -410,18 +304,6 @@ const RECORDS: &[(&str, &[(&str, Ty)])] = &[
             ("reversals", Ty::Int),
         ],
     ),
-    (
-        "ArchResource",
-        &[
-            ("name", Ty::String),
-            ("container", Ty::String),
-            ("kind", Ty::String),
-            ("replicas", Ty::Double),
-            ("rate", Ty::Double),
-            ("busy", Ty::Double),
-            ("utilisation", Ty::Double),
-        ],
-    ),
 ];
 
 pub const STATISTICS: &[&str] =
@@ -499,7 +381,7 @@ pub fn manifest() -> Value {
     json!({
         "id": PLUGIN_ID,
         "name": "Palladio Architecture",
-        "description": "Translates architecture decisions on Palladio (PCM) models into PCM and simulates the result with SimOxide, as script functions",
+        "description": "Analyses and simulates plain Palladio (PCM) models with SimOxide, as script functions",
         "icon": [
             ["path", {"d": "M4 4h6v6H4z"}],
             ["path", {"d": "M14 14h6v6h-6z"}],
@@ -508,7 +390,7 @@ pub fn manifest() -> Value {
         "languagePlugins": [],
         "contributionPlugins": [{
             "languageId": "script",
-            "description": "archSimulate(), archStat(), archCost(), archModularity(), archUtilisation(), archNoLoadTime(), archReplicas(), archFailure(), archChangeCoupling(), archInconsistency(), archLatencyViolation(), archPeakUtilisation(), archPeakViolation(), archInfo(); archHpaSimulate(), archHpaCost(), archHpaSlo(), archHpaStat(): architecture decisions on Palladio models, translated to PCM and simulated, also with Kubernetes-style autoscaling over a load profile",
+            "description": "pcmResources(), pcmScenarios(), pcmOperations(), pcmCallRates(), pcmWeightedVisits(), pcmFailure(), pcmSourceFailure(), pcmOperationVisits(), pcmOperationFailure(), pcmMean(), pcmWarnings(); pcmSimulate(), pcmStat(), pcmRun(), pcmRunStat(), pcmHpaRun(): analyses and simulations of the plain Palladio (PCM) part of a model, also over load profiles and with Kubernetes-style autoscaling",
             "additionalKeywords": [],
             "serverContributionPlugins": [{
                 "type": "script-language-contribution",
@@ -570,180 +452,7 @@ impl Args<'_> {
             simulate_linking_resources: self.boolean("simulateLinkingResources")?,
         })
     }
-}
 
-pub fn is_operation(name: &str) -> bool {
-    FUNCTIONS.iter().any(|f| f.name == name)
-}
-
-pub fn simulates(name: &str) -> bool {
-    FUNCTIONS.iter().any(|f| f.name == name && f.simulates)
-}
-
-/// Whether `name` needs a dynamic run (`crate::dynamic`).
-pub fn is_dynamic(name: &str) -> bool {
-    name.starts_with("archHpa")
-}
-
-/// The parameters of a dynamic function's run.
-pub fn hpa_params(operation: &str, args: &[WireValue]) -> Result<crate::dynamic::HpaParams, String> {
-    let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
-    let a = Args { f, args };
-    Ok(crate::dynamic::HpaParams { seed: a.long("seed")?, exclude: excluded(&a)? })
-}
-
-/// Answers a dynamic function from the outcome of its run.
-pub fn call_dynamic(
-    operation: &str,
-    args: &[WireValue],
-    o: &crate::dynamic::HpaOutcome,
-    next_id: &mut impl FnMut() -> i64,
-) -> Result<Answer, String> {
-    let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
-    let a = Args { f, args };
-    let double = |v: f64| Ok(Answer { value: WireValue::Double(v), objects: vec![] });
-    match operation {
-        "archHpaCost" => double(o.cost),
-        "archHpaSlo" => double(o.slo),
-        "archHpaStat" => {
-            let st = a.string("statistic")?;
-            double(hpa_stat(o, &st).ok_or_else(|| format!("unknown statistic '{st}'; one of {}", HPA_STATISTICS.join(", ")))?)
-        }
-        "archHpaSimulate" => Ok(hpa_result(o, next_id)),
-        other => Err(format!("{other} is not a dynamic function")),
-    }
-}
-
-/// One measure of a dynamic run (`archHpaStat`).
-pub fn hpa_stat(o: &crate::dynamic::HpaOutcome, statistic: &str) -> Option<f64> {
-    Some(match statistic {
-        "cost" => o.cost,
-        "idealCost" => o.ideal_cost,
-        "readyReplicaSeconds" => o.ready_replica_seconds,
-        "slo" => o.slo,
-        "sloSteps" => o.slo_steps,
-        "requests" => o.requests as f64,
-        "meanMs" => o.mean_ms,
-        "p95Ms" => o.p95_ms,
-        "lag" => o.lag,
-        "lagMax" => o.lag_max,
-        "flapping" => o.flapping,
-        "peakReplicas" => o.peak_replicas,
-        "rescales" => o.rescales as f64,
-        "createdPods" => o.created as f64,
-        "capped" => f64::from(o.capped as u8),
-        _ => return None,
-    })
-}
-
-fn hpa_result(o: &crate::dynamic::HpaOutcome, next_id: &mut impl FnMut() -> i64) -> Answer {
-    let list_id = next_id();
-    let groups: Vec<WireValue> = o
-        .groups
-        .iter()
-        .map(|g| WireValue::Record {
-            class_name: "ArchHpaGroup".into(),
-            fields: vec![
-                ("name".into(), WireValue::String(g.name.clone())),
-                ("meanReplicas".into(), WireValue::Double(g.mean_replicas)),
-                ("idealReplicas".into(), WireValue::Double(g.ideal_replicas)),
-                ("maxReplicas".into(), WireValue::Int(g.max_replicas)),
-                ("rescales".into(), WireValue::Long(g.rescales as i64)),
-                ("createdPods".into(), WireValue::Long(g.created as i64)),
-                ("lag".into(), WireValue::Double(g.lag)),
-                ("reversals".into(), WireValue::Int(g.reversals as i32)),
-            ],
-        })
-        .collect();
-    let value = WireValue::Record {
-        class_name: "ArchHpaResult".into(),
-        fields: vec![
-            ("cost".into(), WireValue::Double(o.cost)),
-            ("idealCost".into(), WireValue::Double(o.ideal_cost)),
-            ("readyReplicaSeconds".into(), WireValue::Double(o.ready_replica_seconds)),
-            ("replicaSeconds".into(), WireValue::Double(o.replica_seconds)),
-            ("slo".into(), WireValue::Double(o.slo)),
-            ("sloSteps".into(), WireValue::Double(o.slo_steps)),
-            ("requests".into(), WireValue::Long(o.requests as i64)),
-            ("meanMs".into(), WireValue::Double(o.mean_ms)),
-            ("p95Ms".into(), WireValue::Double(o.p95_ms)),
-            ("lag".into(), WireValue::Double(o.lag)),
-            ("lagMax".into(), WireValue::Double(o.lag_max)),
-            ("flapping".into(), WireValue::Double(o.flapping)),
-            ("peakReplicas".into(), WireValue::Double(o.peak_replicas)),
-            ("rescales".into(), WireValue::Long(o.rescales as i64)),
-            ("createdPods".into(), WireValue::Long(o.created as i64)),
-            ("capped".into(), WireValue::Bool(o.capped)),
-            ("events".into(), WireValue::Long(o.events as i64)),
-            ("wallMs".into(), WireValue::Double(o.wall_ms)),
-            ("groups".into(), WireValue::Ref(list_id)),
-        ],
-    };
-    Answer { value, objects: vec![HeapObject { id: list_id, kind: HeapKind::List, version: 0, elements: Some(groups), entries: None }] }
-}
-
-/// Answers a call. `prepared` is the translated model, compiled (for the simulating functions).
-pub async fn call(
-    engine: &Arc<Engine>,
-    operation: &str,
-    args: &[WireValue],
-    translation: &Translation,
-    prepared: Option<Arc<Prepared>>,
-    next_id: &mut impl FnMut() -> i64,
-) -> Result<Answer, String> {
-    let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
-    let a = Args { f, args };
-    let entity = |n: &str| entity_of(translation, n);
-    let double = |v: f64| Ok(Answer { value: WireValue::Double(v), objects: vec![] });
-    match operation {
-        "archCost" => double(translation.cost),
-        "archModularity" => double(translation.modularity),
-        "archUtilisation" => double(translation.utilisation(&a.string("element")?, entity)?),
-        "archInfo" => Ok(info(translation, next_id)),
-        "archReplicas" => double(translation.replicas_of(&a.string("element")?, entity)?),
-        "archFailure" => {
-            let per = translation.quality.failure.as_ref().ok_or("archFailure needs a Reliability in the model")?;
-            double(crate::translate::weighted(per, &excluded(&a)?, entity))
-        }
-        "archChangeCoupling" => double(translation.quality.change_coupling.ok_or("archChangeCoupling needs ChangeUnits in the model")?),
-        "archInconsistency" => {
-            let per = translation.quality.inconsistency.as_ref().ok_or("archInconsistency needs a Consistency in the model")?;
-            double(crate::translate::weighted(per, &excluded(&a)?, entity))
-        }
-        "archLatencyViolation" => double(translation.latency_violation()),
-        "archPeakUtilisation" => double(translation.peak_utilisation().ok_or("archPeakUtilisation needs a PeakCapacity in the model")?.0),
-        "archPeakViolation" => {
-            let (u, limit) = translation.peak_utilisation().ok_or("archPeakViolation needs a PeakCapacity in the model")?;
-            double((u - limit).max(0.0))
-        }
-        "archNoLoadTime" => double(translation.no_load_time(&excluded(&a)?, entity)),
-        op if is_dynamic(op) => Err(format!("{op} needs a dynamic run (crate::dynamic)")),
-        "archSimulate" => {
-            let prepared = prepared.ok_or("no model")?;
-            let params = a.run_params()?;
-            let outcome = engine.simulate(prepared.clone(), params.clone()).await?;
-            Ok(simulation_result(&outcome, &prepared, params.seed, next_id))
-        }
-        "archStat" => {
-            let prepared = prepared.ok_or("no model")?;
-            let params = a.run_params()?;
-            let (element, metric, statistic) = (a.string("element")?, a.string("metric")?, a.string("statistic")?);
-            if !STATISTICS.contains(&statistic.as_str()) {
-                return Err(format!("unknown statistic '{statistic}'; one of {}", STATISTICS.join(", ")));
-            }
-            let outcome = engine.simulate(prepared.clone(), params).await?;
-            double(stat(&outcome, &prepared, &element, &metric, &statistic)?)
-        }
-        _ => unreachable!(),
-    }
-}
-
-/// Whether `name` is one of the generic Palladio functions (`crate::pcm`).
-pub fn is_pcm_function(name: &str) -> bool {
-    name.starts_with("pcm")
-}
-
-impl Args<'_> {
     /// A list argument: the elements of the collection it refers to.
     fn list<'l>(&self, name: &str, lists: &'l std::collections::HashMap<i64, Vec<WireValue>>) -> Result<&'l [WireValue], String> {
         match self.get(name)? {
@@ -877,6 +586,10 @@ impl Args<'_> {
     }
 }
 
+pub fn is_operation(name: &str) -> bool {
+    FUNCTIONS.iter().any(|f| f.name == name)
+}
+
 fn number(v: &WireValue) -> Option<f64> {
     match v {
         WireValue::Double(x) => Some(*x),
@@ -904,8 +617,9 @@ fn list_answer(class: &str, items: Vec<Vec<(&str, WireValue)>>, next_id: &mut im
 /// distinct overrides (the last one is kept).
 pub type PcmPrepared = Option<(Vec<(String, i32, f64)>, Arc<Prepared>)>;
 
-/// Answers a generic Palladio function (`crate::pcm`).
-pub async fn call_pcm(
+/// Answers a call on the model's PCM analysis `cache` (`prepared`: the session's last compiled
+/// simulation).
+pub async fn call(
     engine: &Arc<Engine>,
     operation: &str,
     args: &[WireValue],
@@ -1120,7 +834,7 @@ pub async fn call_pcm(
             let outcome = engine.simulate(p.clone(), params).await?;
             double(stat(&outcome, &p, &element, &metric, &statistic)?)
         }
-        other => Err(format!("{other} is not a generic Palladio function")),
+        _ => unreachable!(),
     }
 }
 
@@ -1203,19 +917,6 @@ fn excluded(a: &Args) -> Result<Vec<String>, String> {
     Ok(a.string("exclude")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
 }
 
-fn entity_of(t: &Translation, name: &str) -> String {
-    t.pcm
-        .instances
-        .iter()
-        .find(|x| x.name == name)
-        .and_then(|x| x.attributes.iter().find(|(k, _)| k == "entityName"))
-        .and_then(|(_, v)| match v.first() {
-            Some(WireValue::String(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| name.to_string())
-}
-
 /// One statistic of one series.
 pub fn stat(outcome: &Outcome, prepared: &Prepared, element: &str, metric: &str, statistic: &str) -> Result<f64, String> {
     let s = find_series(outcome, prepared, element, metric)?;
@@ -1236,54 +937,6 @@ pub fn stat(outcome: &Outcome, prepared: &Prepared, element: &str, metric: &str,
         "ciHalfWidth" => s.ci_half_width.ok_or("ciHalfWidth needs at least two replications")?,
         other => return Err(format!("unknown statistic '{other}'")),
     })
-}
-
-fn info(t: &Translation, next_id: &mut impl FnMut() -> i64) -> Answer {
-    let list_id = next_id();
-    let warn_id = next_id();
-    let resources: Vec<WireValue> = t
-        .loads
-        .resources
-        .iter()
-        .map(|r| WireValue::Record {
-            class_name: "ArchResource".into(),
-            fields: vec![
-                ("name".into(), WireValue::String(entity_of(t, &r.spec))),
-                ("container".into(), WireValue::String(entity_of(t, &r.container))),
-                ("kind".into(), WireValue::String(r.kind.clone())),
-                ("replicas".into(), WireValue::Double(r.replicas)),
-                ("rate".into(), WireValue::Double(r.rate)),
-                ("busy".into(), WireValue::Double(r.busy)),
-                ("utilisation".into(), WireValue::Double(r.utilisation())),
-            ],
-        })
-        .collect();
-    let max_u = t.utilisation("", |n| n.to_string()).unwrap_or(0.0);
-    let value = WireValue::Record {
-        class_name: "ArchInfo".into(),
-        fields: vec![
-            ("translated".into(), WireValue::Bool(t.translated)),
-            ("instances".into(), WireValue::Int(t.pcm.instances.len() as i32)),
-            ("cost".into(), WireValue::Double(t.cost)),
-            ("modularity".into(), WireValue::Double(t.modularity)),
-            ("maxUtilisation".into(), WireValue::Double(max_u)),
-            ("resources".into(), WireValue::Ref(list_id)),
-            ("warnings".into(), WireValue::Ref(warn_id)),
-        ],
-    };
-    Answer {
-        value,
-        objects: vec![
-            HeapObject { id: list_id, kind: HeapKind::List, version: 0, elements: Some(resources), entries: None },
-            HeapObject {
-                id: warn_id,
-                kind: HeapKind::List,
-                version: 0,
-                elements: Some(t.warnings.iter().map(|w| WireValue::String(w.clone())).collect()),
-                entries: None,
-            },
-        ],
-    }
 }
 
 /// `UsageScenarioMeasuringPoint[_us1]` → `UsageScenario`.

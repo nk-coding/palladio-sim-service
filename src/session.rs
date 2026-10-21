@@ -6,10 +6,8 @@
 //! simulations at the same time on the shared pool.
 
 use crate::functions;
-use crate::translate::{self, Translation};
-use palladio_sim_service::engine::{Engine, Prepared};
+use palladio_sim_service::engine::Engine;
 use palladio_sim_service::protocol::{ClientMessage, HeapObject, ServiceMessage, UNKNOWN_MODEL, UNKNOWN_OBJECT, WireModel};
-use palladio_sim_service::schema::schema;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -17,10 +15,6 @@ use tracing::{debug, info};
 struct HeldModel {
     id: i64,
     model: Arc<WireModel>,
-    translation: Option<Arc<Translation>>,
-    prepared: Option<Arc<Prepared>>,
-    /// The model of a dynamic run (rule 5), ready to run (`crate::dynamic`).
-    dynamic: Option<Arc<crate::dynamic::Prepared>>,
     /// The plain PCM of the model and its analysis (`pcm*` functions).
     pcm: Option<Arc<crate::pcm::PcmCache>>,
     pcm_prepared: functions::PcmPrepared,
@@ -75,9 +69,6 @@ impl Session {
                 self.model = Some(HeldModel {
                     id: model_id,
                     model: Arc::new(model),
-                    translation: None,
-                    prepared: None,
-                    dynamic: None,
                     pcm: None,
                     pcm_prepared: None,
                 });
@@ -138,101 +129,23 @@ impl Session {
             (_, None) => return Err(("the call names no model to simulate".into(), None)),
             _ => return Err(("the model is not held".into(), Some(UNKNOWN_MODEL))),
         };
-        if functions::is_pcm_function(operation) {
-            let cache = match &held.pcm {
-                Some(c) => c.clone(),
-                None => {
-                    let model = held.model.clone();
-                    let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
-                        .await
-                        .map_err(|e| (format!("the PCM analysis failed: {e}"), None))?;
-                    let c = Arc::new(c);
-                    held.pcm = Some(c.clone());
-                    c
-                }
-            };
-            let mut next = self.next_id;
-            let answer = functions::call_pcm(&self.engine, operation, args, &self.lists, &cache, &mut held.pcm_prepared, &mut || {
-                let id = next;
-                next -= 1;
-                id
-            })
-            .await
-            .map_err(|e| (e, None))?;
-            self.next_id = next;
-            for o in &answer.objects {
-                self.heap.insert(o.id, o.version);
-            }
-            return Ok(ServiceMessage::Result { call_id, objects: answer.objects, value: answer.value });
-        }
-        if functions::is_dynamic(operation) {
-            let dyn_engine = crate::dynamic::engine(&self.engine.config);
-            let prepared = match &held.dynamic {
-                Some(p) => p.clone(),
-                None => {
-                    let model = held.model.clone();
-                    let max_pods = dyn_engine.max_pods;
-                    let (t, p) = tokio::task::spawn_blocking(move || -> Result<(Translation, crate::dynamic::Prepared), String> {
-                        let (t, dm) = translate::translate_dynamic(&model)?;
-                        Ok((t, crate::dynamic::prepare(Arc::new(dm), max_pods)?))
-                    })
-                    .await
-                    .map_err(|e| (format!("the dynamic translation failed: {e}"), None))?
-                    .map_err(|e| (e, None))?;
-                    // the static translation comes with it (the analytic functions use it)
-                    if held.translation.is_none() {
-                        held.translation = Some(Arc::new(t));
-                    }
-                    let p = Arc::new(p);
-                    held.dynamic = Some(p.clone());
-                    p
-                }
-            };
-            let params = functions::hpa_params(operation, args).map_err(|e| (e, None))?;
-            let outcome = dyn_engine.simulate(prepared, params).await.map_err(|e| (e, None))?;
-            let mut next = self.next_id;
-            let answer = functions::call_dynamic(operation, args, &outcome, &mut || {
-                let id = next;
-                next -= 1;
-                id
-            })
-            .map_err(|e| (e, None))?;
-            self.next_id = next;
-            for o in &answer.objects {
-                self.heap.insert(o.id, o.version);
-            }
-            return Ok(ServiceMessage::Result { call_id, objects: answer.objects, value: answer.value });
-        }
-        let translation = match &held.translation {
-            Some(t) => t.clone(),
+        let cache = match &held.pcm {
+            Some(c) => c.clone(),
             None => {
                 let model = held.model.clone();
                 if let Some(dir) = &self.engine.config.dump_dir {
                     crate::dump(dir, &model);
                 }
-                let t = tokio::task::spawn_blocking(move || translate::translate(&model))
+                let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
                     .await
-                    .map_err(|e| (format!("the translation failed: {e}"), None))?
-                    .map_err(|e| (e, None))?;
-                let t = Arc::new(t);
-                held.translation = Some(t.clone());
-                t
+                    .map_err(|e| (format!("the PCM analysis failed: {e}"), None))?;
+                let c = Arc::new(c);
+                held.pcm = Some(c.clone());
+                c
             }
-        };
-        let prepared = if functions::simulates(operation) {
-            match &held.prepared {
-                Some(p) => Some(p.clone()),
-                None => {
-                    let p = self.engine.prepare(schema(), Arc::new(translation.pcm.clone())).await.map_err(|e| (e, None))?;
-                    held.prepared = Some(p.clone());
-                    Some(p)
-                }
-            }
-        } else {
-            None
         };
         let mut next = self.next_id;
-        let answer = functions::call(&self.engine, operation, args, &translation, prepared, &mut || {
+        let answer = functions::call(&self.engine, operation, args, &self.lists, &cache, &mut held.pcm_prepared, &mut || {
             let id = next;
             next -= 1;
             id

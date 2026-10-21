@@ -19,9 +19,7 @@
 //!   request over budget), so an evaluation never grows without bound.
 
 use crate::translate::{DynamicModel, PodGroup};
-use palladio_sim_service::config::Config;
 use palladio_sim_service::{schema, xmi};
-use sha2::{Digest, Sha256};
 use simoxide_reconf::{QvtoAdjuster, QvtoCore, SpdAdjust};
 use simoxide_sim::{CompiledModel, Fast, Limits, LoadProfile, Mode, Outputs, RunSpec, Simulation};
 use simoxide_spd::Quirks;
@@ -29,11 +27,11 @@ use simoxide_spd::hpa::{self, Hpa, HpaConfig};
 use simoxide_spd::log::{Log, Record};
 use simoxide_spd::sim::{SpdRun, spd_of};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// What a dynamic run is asked to do.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HpaParams {
     pub seed: i64,
     /// Usage scenarios (entity names) left out of the response-time measures.
@@ -119,44 +117,14 @@ impl simoxide_spd::sim::Adjuster<simoxide_sim::Fast, simoxide_sim::SimuLizar> fo
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// The engine: one per process, a bounded cache of outcomes and a limit on concurrent runs
-
-/// A cached outcome, computed once (single flight).
-type Cell = Arc<tokio::sync::OnceCell<Arc<HpaOutcome>>>;
-
-pub struct DynEngine {
-    outcomes: Mutex<lru::LruCache<([u8; 32], HpaParams), Cell>>,
-    permits: tokio::sync::Semaphore,
-    timeout_s: u64,
-    max_events: u64,
-    pub max_pods: u32,
-    pub runs: std::sync::atomic::AtomicU64,
-}
-
-/// The process's dynamic engine, sized like the simulation engine (`SIM_THREADS`,
-/// `SIM_RESULT_CACHE_SIZE`, `SIM_TIMEOUT_SECONDS`, `SIM_MAX_EVENTS`; `HPA_MAX_PODS`).
-pub fn engine(config: &Config) -> &'static DynEngine {
-    static E: OnceLock<DynEngine> = OnceLock::new();
-    E.get_or_init(|| DynEngine {
-        outcomes: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(config.result_cache_size.max(1)).unwrap())),
-        permits: tokio::sync::Semaphore::new(config.threads().max(1)),
-        timeout_s: config.sim_timeout_seconds,
-        max_events: config.sim_max_events,
-        max_pods: std::env::var("HPA_MAX_PODS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_PODS),
-        runs: Default::default(),
-    })
-}
-
-/// A dynamic model ready to run: its files and their digest.
+/// A dynamic model ready to run: its files.
 pub struct Prepared {
     pub model: Arc<DynamicModel>,
     pub files: Vec<(String, String)>,
-    pub digest: [u8; 32],
 }
 
 /// The files of a dynamic run: the PCM files of the model, its SPD and semantic configuration,
-/// and the HPA configuration (in the digest; passed in memory).
+/// and the HPA configuration (passed in memory).
 pub fn prepare(dm: Arc<DynamicModel>, max_pods: u32) -> Result<Prepared, String> {
     let pcm = xmi::to_xmi(schema::schema(), &dm.pcm)?;
     let mut files = pcm.files;
@@ -164,74 +132,7 @@ pub fn prepare(dm: Arc<DynamicModel>, max_pods: u32) -> Result<Prepared, String>
     files.push(("dynamic.spd".into(), spd));
     files.push(("dynamic.semanticspd".into(), sem));
     files.push(("hpa.json".into(), hpa_json(&dm, max_pods)));
-    let mut h = Sha256::new();
-    for (name, text) in &files {
-        h.update((name.len() as u64).to_le_bytes());
-        h.update(name.as_bytes());
-        h.update((text.len() as u64).to_le_bytes());
-        h.update(text.as_bytes());
-    }
-    if let Some(p) = &dm.profile {
-        h.update(format!("{:?}", p).as_bytes());
-    }
-    if let Some(p) = &dm.scenario_profile {
-        h.update(format!("{:?}", p).as_bytes());
-    }
-    if dm.usage_streams {
-        h.update(b"usage streams");
-    }
-    Ok(Prepared { model: dm, files, digest: h.finalize().into() })
-}
-
-impl DynEngine {
-    /// The outcome of running `p` with `params`, cached by content (runs are deterministic).
-    pub async fn simulate(&'static self, p: Arc<Prepared>, params: HpaParams) -> Result<Arc<HpaOutcome>, String> {
-        let key = (p.digest, params.clone());
-        let cell = {
-            let mut c = self.outcomes.lock().unwrap();
-            c.get_or_insert(key.clone(), || Arc::new(tokio::sync::OnceCell::new())).clone()
-        };
-        let r = cell
-            .get_or_try_init(|| async {
-                let _permit = self.permits.acquire().await.map_err(|e| e.to_string())?;
-                let limits = Limits {
-                    max_events: self.max_events,
-                    deadline: (self.timeout_s > 0).then(|| Instant::now() + Duration::from_secs(self.timeout_s)),
-                    ..Limits::default()
-                };
-                self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let p2 = p.clone();
-                tokio::task::spawn_blocking(move || {
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&p2, &params, limits)))
-                        .unwrap_or_else(|_| Err("the dynamic run panicked".into()));
-                    match &r {
-                        Ok(o) => tracing::info!(
-                            "dynamic run: {} groups, {} events, {:.0} ms ({:.0} ms adjusting, {} rescales){}",
-                            o.groups.len(),
-                            o.events,
-                            o.wall_ms,
-                            o.adjust_ms,
-                            o.rescales,
-                            if o.capped { ", capped" } else { "" }
-                        ),
-                        Err(e) => tracing::info!("dynamic run failed: {e}"),
-                    }
-                    r
-                })
-                .await
-                .map_err(|e| format!("the dynamic run was abandoned: {e}"))?
-                .map(Arc::new)
-            })
-            .await
-            .cloned();
-        if r.is_err() {
-            let mut c = self.outcomes.lock().unwrap();
-            if c.peek(&key).is_some_and(|x| Arc::ptr_eq(x, &cell) && !x.initialized()) {
-                c.pop(&key);
-            }
-        }
-        r
-    }
+    Ok(Prepared { model: dm, files })
 }
 
 // ---------------------------------------------------------------------------------------------

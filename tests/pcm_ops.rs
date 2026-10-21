@@ -414,7 +414,7 @@ async fn script_functions() {
         next: &mut impl FnMut() -> i64,
     ) -> (WireValue, Vec<HeapObject>) {
         let mut prepared = None;
-        let a = functions::call_pcm(engine, op, &args, lists, cache, &mut prepared, next).await.unwrap_or_else(|e| panic!("{op}: {e}"));
+        let a = functions::call(engine, op, &args, lists, cache, &mut prepared, next).await.unwrap_or_else(|e| panic!("{op}: {e}"));
         (a.value, a.objects)
     }
     let field = |v: &WireValue, k: &str| -> WireValue {

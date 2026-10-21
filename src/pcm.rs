@@ -3,7 +3,7 @@
 //! parameter that says how to read the model (resource overrides, branch probabilities, assemblies
 //! that are part of the communication, unavailabilities) comes from the script. The architecture
 //! layers above PCM are realised in the model by model transformations (the domain project's
-//! DESIGN.md §B); the `arch*` functions with their own translation stay as they were.
+//! DESIGN.md §B).
 //!
 //! - `pcmResources()`: offered load of every processing resource;
 //! - `pcmScenarios()`: arrival rate and no-load response time of every usage scenario;

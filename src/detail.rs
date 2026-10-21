@@ -164,7 +164,7 @@ pub fn detail_json(model: &WireModel, v: &Value, limits: Limits) -> Result<Value
             max: n(g, "max")? as u32,
             target: n(g, "target")?,
             initial: n(g, "initial").unwrap_or(1.0) as u32,
-            startup_s: n(g, "startupS").unwrap_or(crate::translate::DEFAULT_STARTUP_S),
+            startup_s: n(g, "startupS").unwrap_or(crate::dynamic::DEFAULT_STARTUP_S),
             scale_down_s: g.get("scaleDownS").and_then(Value::as_f64),
             cpu_request: g.get("cpuRequest").and_then(Value::as_f64),
         });

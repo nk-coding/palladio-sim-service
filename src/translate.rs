@@ -28,7 +28,7 @@
 use crate::graph::{Graph, is_pcm};
 use crate::load::{self, Loads};
 use palladio_sim_service::protocol::{WireModel, WireValue};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod quality;
 pub use quality::{Quality, weighted};
@@ -192,11 +192,6 @@ struct Autoscale {
     max: Option<f64>,
     /// (factor, weight) per load level; the model's workload alone when none is given.
     levels: Vec<(f64, f64)>,
-    /// The HPA settings of a dynamic run (`translate_dynamic`): minReplicas, the start-up delay
-    /// of a new pod (s) and the scale-down stabilisation window (s); absent: the defaults.
-    min: Option<f64>,
-    startup_s: Option<f64>,
-    scale_down_s: Option<f64>,
 }
 
 impl Autoscale {
@@ -225,22 +220,7 @@ impl Autoscale {
         if !(levels.iter().map(|x| x.1).sum::<f64>() > 0.0) {
             return Err(format!("{a}: the weights of its levels sum to 0"));
         }
-        let min = g.num_attr(a, "minReplicas");
-        if let Some(m) = min
-            && !(m >= 1.0)
-        {
-            return Err(format!("{a}: minReplicas must be at least 1"));
-        }
-        let startup_s = g.num_attr(a, "startupSeconds");
-        let scale_down_s = g.num_attr(a, "scaleDownSeconds");
-        for (k, v) in [("startupSeconds", startup_s), ("scaleDownSeconds", scale_down_s)] {
-            if let Some(v) = v
-                && !(v >= 0.0)
-            {
-                return Err(format!("{a}: {k} must not be negative"));
-            }
-        }
-        Ok(Autoscale { target, max: max.map(f64::floor), levels, min: min.map(f64::floor), startup_s, scale_down_s })
+        Ok(Autoscale { target, max: max.map(f64::floor), levels })
     }
 
     /// The smallest replica count n ≥ 1 with f·u/(n·q) ≤ target and f·u_s/(n·s) ≤ target, capped
@@ -288,54 +268,8 @@ struct RemoteCalls {
     direct: BTreeSet<String>,
 }
 
-/// A time-varying load of the dynamic runs (`LoadProfile`, layer 2): steps of a factor on every
-/// usage scenario's load, in seconds; objectives count from `warm_up` to `end`; a request
-/// violates its service level above `slo_factor` times its latency budget.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadProfileSpec {
-    pub steps: Vec<(f64, f64)>,
-    pub warm_up: f64,
-    pub end: f64,
-    pub slo_factor: f64,
-}
-
-impl LoadProfileSpec {
-    /// The factor at time `t` (s): the last step at or before it, 1 before the first.
-    pub fn factor_at(&self, t: f64) -> f64 {
-        self.steps.iter().take_while(|s| s.0 <= t).last().map_or(1.0, |s| s.1)
-    }
-
-    fn read(g: &Graph, p: &str) -> Result<LoadProfileSpec, String> {
-        let mut steps = Vec::new();
-        for st in g.refs(p, "steps") {
-            steps.push((num(g, &st, "seconds")?, num(g, &st, "factor")?));
-        }
-        steps.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for w in steps.windows(2) {
-            if w[0].0 == w[1].0 {
-                return Err(format!("{p}: two steps at {} s", w[0].0));
-            }
-        }
-        if steps.iter().any(|s| !(s.0 >= 0.0) || !(s.1 > 0.0)) {
-            return Err(format!("{p}: a step needs a time of at least 0 and a positive factor"));
-        }
-        let spec = LoadProfileSpec {
-            steps,
-            warm_up: num(g, p, "warmUpSeconds")?,
-            end: num(g, p, "endSeconds")?,
-            slo_factor: num(g, p, "sloFactor")?,
-        };
-        if !(spec.end > spec.warm_up && spec.warm_up >= 0.0 && spec.slo_factor > 0.0) {
-            return Err(format!("{p}: needs 0 ≤ warmUpSeconds < endSeconds and a positive sloFactor"));
-        }
-        Ok(spec)
-    }
-}
-
 struct Decisions {
     ms_per_unit: f64,
-    /// The load profile of the dynamic runs, when the model has one.
-    profile: Option<LoadProfileSpec>,
     sites: Vec<(String, String, Mechanism)>, // (call site, call, mechanism)
     /// call → the composer's call after which a ComposedCall makes it
     composers: BTreeMap<String, String>,
@@ -676,14 +610,8 @@ impl Decisions {
             || !work.is_empty()
             || !redirects.is_empty()
             || !notifications.is_empty();
-        let profile = match g.all("LoadProfile").as_slice() {
-            [] => None,
-            [p] => Some(LoadProfileSpec::read(g, p)?),
-            more => return Err(format!("the model has {} LoadProfiles; keep one", more.len())),
-        };
         Ok(Decisions {
             ms_per_unit,
-            profile,
             sites,
             composers,
             remote,
@@ -786,8 +714,6 @@ struct Builder {
     orchestrated: BTreeSet<String>,
     /// Quota containers: (container, replicas, cpu per replica).
     quota: Vec<(String, f64, f64)>,
-    /// Offered load of every autoscaled container and of its sidecar (full-speed cores, rule 3a).
-    offered: BTreeMap<String, (f64, f64)>,
     warnings: Vec<String>,
 }
 
@@ -1341,18 +1267,6 @@ pub fn erlang_c(c: u32, a: f64) -> f64 {
 const MAX_SLOWDOWN: f64 = 1000.0;
 
 pub fn translate(model: &WireModel) -> Result<Translation, String> {
-    translate_impl(model, false).map(|(t, _)| t)
-}
-
-/// [`translate`], and the model of a dynamic run with Kubernetes-style autoscaling (rule 5,
-/// [`DynamicModel`]): every autoscaled Deployable as one pod behind load balancers, for
-/// SimOxide's HPA (`crate::dynamic`).
-pub fn translate_dynamic(model: &WireModel) -> Result<(Translation, DynamicModel), String> {
-    let (t, d) = translate_impl(model, true)?;
-    Ok((t, d.ok_or("a dynamic run needs at least one autoscaled Deployable")?))
-}
-
-fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Option<DynamicModel>), String> {
     let g = Graph::new(model);
     let mut warnings = Vec::new();
     let mut d = Decisions::read(&g, &mut warnings)?;
@@ -1385,7 +1299,7 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
         let cost = cost(&g, &d, &placement, &mut warnings);
         let pcm = g.to_wire(|x| is_pcm(&x.class_name));
         let no_load = original.arrivals.iter().map(|(sc, r)| (sc.clone(), (*r, original.times.get(sc).copied().unwrap_or(0.0)))).collect();
-        return Ok((Translation {
+        return Ok(Translation {
             pcm,
             loads: original.clone(),
             calls: original.calls,
@@ -1399,7 +1313,7 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
             replicas: BTreeMap::new(),
             quality,
             ms_per_unit: d.ms_per_unit,
-        }, None));
+        });
     }
 
     let first = |class: &str| g.all(class).into_iter().next().ok_or_else(|| format!("the model has no {class}"));
@@ -1420,7 +1334,6 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
         publishers: BTreeMap::new(),
         orchestrated: BTreeSet::new(),
         quota: Vec::new(),
-        offered: BTreeMap::new(),
         warnings,
         g,
     };
@@ -1470,8 +1383,7 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
     let pcm = b.g.to_wire(|x| is_pcm(&x.class_name));
     let replicas = d.deployables.iter().map(|x| (x.container.clone(), x.replicas)).collect();
     quality::after(&mut quality, &b.g, &d, &placement, &b.sidecars, &idle, &mut warnings);
-    let dynamic = if dynamic { Some(pods(&mut b, &d, &placement, &quality)?) } else { None };
-    Ok((Translation {
+    Ok(Translation {
         pcm,
         loads,
         calls: original.calls,
@@ -1485,7 +1397,7 @@ fn translate_impl(model: &WireModel, dynamic: bool) -> Result<(Translation, Opti
         replicas,
         quality,
         ms_per_unit: d.ms_per_unit,
-    }, dynamic))
+    })
 }
 
 /// Rule 0: orchestrated workflows. The orchestrator (the trigger's component) makes every step
@@ -2014,7 +1926,6 @@ fn autoscale(b: &mut Builder, d: &mut Decisions) {
         let u = work(&x.container);
         let sidecar = b.sidecars.get(&x.container).cloned();
         let us = sidecar.as_deref().map(work).unwrap_or(0.0);
-        b.offered.insert(x.container.clone(), (u, us));
         let (n, capped) = a.count(1.0, u, x.cpu_per_replica, us, x.sidecar_cores);
         if capped {
             b.warnings.push(format!(
@@ -2257,197 +2168,7 @@ pub fn is_decision(class: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Rule 5: the model of a dynamic run (Kubernetes-style autoscaling, SimOxide's HPA)
-
-/// The model of a dynamic run (rule 5, `translate_dynamic`): the translated model (rules 0 to
-/// 4) with every autoscaled Deployable as **one pod** behind load balancers, the structure
-/// SimOxide's HPA scales (SPD elastic infrastructure, Slingshot's adjustments; SimOxide
-/// `DESIGN-SPD.md` §5.10):
-///
-/// - the pod is the Deployable's container with one replica's CPU: ⌈q⌉ cores at the per-core
-///   speed rules 3 and 4 gave it (a quota's speed and a node's slowdown at the static replica
-///   count stay fixed); its HPA request is q cores of full speed;
-/// - every assembly on the pod gets a load balancer (a component whose SEFFs are one branch with
-///   one call per pod, on the container `LoadBalancerServer`, which has no work): the callers'
-///   connectors point at the load balancer, the load balancer at the assembly;
-/// - the sidecar is not scaled: it gets the cores of `max` pods, so it never limits (H3);
-/// - the SPD's target groups and the semantic configuration are written by `crate::dynamic`.
-#[derive(Clone, Debug)]
-pub struct DynamicModel {
-    pub pcm: WireModel,
-    pub groups: Vec<PodGroup>,
-    /// The linking resource the pods join (the first of the resource environment), if any.
-    pub link: Option<String>,
-    pub profile: Option<LoadProfileSpec>,
-    /// Cost of everything but the autoscaled replicas (D13, D22): containers, fixed replicas,
-    /// caches.
-    pub fixed_cost: f64,
-    /// Milliseconds per model time unit.
-    pub ms_per_unit: f64,
-    /// Latency budget per usage scenario (instance name), ms.
-    pub budgets: BTreeMap<String, f64>,
-    /// Instance names of the repository, system, allocation and resource environment.
-    pub roots: [String; 4],
-    /// A per-scenario load profile (model time units) in place of `profile`'s steps (the
-    /// generic `pcm*` dynamic run; `None` for the translation's runs).
-    pub scenario_profile: Option<simoxide_sim::LoadProfile>,
-    /// SimOxide's usage streams (common random numbers; off for the translation's runs).
-    pub usage_streams: bool,
-}
-
-/// One autoscaled Deployable of a [`DynamicModel`].
-#[derive(Clone, Debug)]
-pub struct PodGroup {
-    /// The pod's container (the target group's unit) and its entity name (the target group's
-    /// and the autoscaler's name).
-    pub container: String,
-    pub name: String,
-    /// (assembly on the pod, its load balancer's assembly)
-    pub services: Vec<(String, String)>,
-    pub target: f64,
-    pub min: u32,
-    pub max: u32,
-    /// Pods at the start: the ideal autoscaler's count at the profile's first factor.
-    pub initial: u32,
-    /// Start-up delay of a new pod (s) and the scale-down stabilisation window (s, absent:
-    /// Kubernetes' default).
-    pub startup_s: f64,
-    pub scale_down_s: Option<f64>,
-    /// The HPA's request per pod, in the pod's cores (q of full speed).
-    pub cpu_request: f64,
-    pub pod_cores: f64,
-    pub price_per_replica: f64,
-    /// Offered load of the container and of its sidecar at the model's workload (full-speed
-    /// cores), q and the sidecar's cores per replica: the ideal autoscaler's inputs.
-    pub offered: (f64, f64),
-    pub cpu_per_replica: f64,
-    pub sidecar_cores: f64,
-    /// `maxReplicas` of the Autoscaling, if given.
-    pub max_ideal: Option<f64>,
-}
-
-impl PodGroup {
-    /// The ideal autoscaler's replicas (D50) at `factor` times the model's workload.
-    pub fn ideal(&self, factor: f64) -> f64 {
-        let (u, us) = self.offered;
-        let need = (factor * u / (self.cpu_per_replica * self.target)).max(factor * us / (self.sidecar_cores * self.target));
-        let n = (need - 1e-9).ceil().max(1.0);
-        match self.max_ideal {
-            Some(m) if n > m => m,
-            _ => n,
-        }
-    }
-}
-
-/// Default start-up delay of a pod (s): container start and readiness of a JVM service.
-pub const DEFAULT_STARTUP_S: f64 = 30.0;
-
-fn pods(b: &mut Builder, d: &Decisions, placement: &BTreeMap<String, String>, quality: &Quality) -> Result<DynamicModel, String> {
-    let profile = d.profile.clone();
-    let (f0, fmax) = match &profile {
-        Some(p) => (p.factor_at(0.0), p.steps.iter().map(|s| s.1).fold(p.factor_at(0.0), f64::max)),
-        None => (1.0, 1.0),
-    };
-    let (fixed_cost, per_replica) = cost_parts(&b.g, d, placement);
-    // the load balancers' container: no work runs there
-    let host = b.named("LoadBalancerServer", "ResourceContainer", Some("LoadBalancerServer"));
-    let resenv = b.resenv.clone();
-    b.g.link(&resenv, "resourceContainer", &host);
-    let cpu = b.named(&format!("{host}_cpu"), "ProcessingResourceSpecification", None);
-    b.g.set_attr(&cpu, "schedulingPolicy", s("PROCESSOR_SHARING"));
-    b.g.set_attr(&cpu, "activeResourceType", s("CPU"));
-    b.g.set_attr(&cpu, "processingRate", s("1000000.0"));
-    b.g.set_attr(&cpu, "numberOfReplicas", WireValue::Int(1));
-    b.g.link(&host, "activeResourceSpecifications", &cpu);
-    if std::env::var_os("ARCH_NO_PRUNE").is_none() {
-        prune_unreachable(b);
-    }
-    let link = sorted(b.g.all("LinkingResource")).into_iter().next();
-    if let Some(l) = &link {
-        b.g.link(l, "connectedResourceContainers", &host);
-    }
-    let mut groups = Vec::new();
-    let mut scaled: Vec<&Deployable> = d.deployables.iter().filter(|x| x.autoscale.is_some()).collect();
-    scaled.sort_by(|a, b| a.container.cmp(&b.container));
-    for x in scaled {
-        let a = x.autoscale.as_ref().expect("autoscaled");
-        let c = x.container.clone();
-        if !placement.values().any(|p| p == &c) {
-            continue; // an empty container is not deployed
-        }
-        let mut group = PodGroup {
-            container: c.clone(),
-            name: b.g.entity(&c),
-            services: Vec::new(),
-            target: a.target,
-            min: a.min.unwrap_or(1.0) as u32,
-            max: 0,
-            initial: 1,
-            startup_s: a.startup_s.unwrap_or(DEFAULT_STARTUP_S),
-            scale_down_s: a.scale_down_s,
-            cpu_request: 0.0,
-            pod_cores: x.cpu_per_replica.ceil(),
-            price_per_replica: per_replica.get(&c).copied().unwrap_or(0.0),
-            offered: b.offered.get(&c).copied().unwrap_or((0.0, 0.0)),
-            cpu_per_replica: x.cpu_per_replica,
-            sidecar_cores: x.sidecar_cores,
-            max_ideal: a.max,
-        };
-        let peak = group.ideal(fmax);
-        group.max = match a.max {
-            Some(m) => m as u32,
-            None => (2.0 * peak).max(4.0) as u32,
-        };
-        group.min = group.min.min(group.max).max(1);
-        group.initial = (group.ideal(f0) as u32).clamp(group.min, group.max);
-        // the pod: one replica, at the per-core speed of rules 3 and 4
-        let base = *b.base_cpu.get(&c).ok_or_else(|| format!("container {} has no CPU", b.g.entity(&c)))?;
-        let mut rate = base;
-        for r in b.g.refs(&c, "activeResourceSpecifications") {
-            if b.g.str_attr(&r, "activeResourceType").as_deref() != Some("CPU") {
-                continue;
-            }
-            rate = b.g.str_attr(&r, "processingRate").and_then(|x| load::mean_of(&x)).unwrap_or(base);
-            b.g.set_attr(&r, "numberOfReplicas", WireValue::Int(group.pod_cores as i32));
-        }
-        // utilisation relative to q full-speed cores: busy cores · rate / base / q
-        group.cpu_request = x.cpu_per_replica * base / rate;
-        // the sidecar: not scaled, with the cores of `max` pods
-        if let Some(sc) = b.sidecars.get(&c).cloned() {
-            for r in b.g.refs(&sc, "activeResourceSpecifications") {
-                if b.g.str_attr(&r, "activeResourceType").as_deref() == Some("CPU") {
-                    b.g.set_attr(&r, "numberOfReplicas", WireValue::Int((group.max as f64 * x.sidecar_cores) as i32));
-                }
-            }
-        }
-        let mut on_pod: Vec<String> = b
-            .g
-            .referrers(&c, "resourceContainer")
-            .into_iter()
-            .filter(|ac| b.g.class(ac) == "AllocationContext")
-            .filter_map(|ac| b.g.ref1(&ac, "assemblyContext"))
-            .collect();
-        on_pod.sort();
-        for asm in on_pod {
-            let lb = load_balancer(b, &asm, &host)?;
-            group.services.push((asm, lb));
-        }
-        groups.push(group);
-    }
-    let pcm = b.g.to_wire(|x| is_pcm(&x.class_name));
-    Ok(DynamicModel {
-        pcm,
-        groups,
-        link,
-        profile,
-        fixed_cost,
-        ms_per_unit: d.ms_per_unit,
-        budgets: quality.budgets.iter().cloned().collect(),
-        roots: [b.repo.clone(), b.system.clone(), b.allocation.clone(), b.resenv.clone()],
-        scenario_profile: None,
-        usage_streams: false,
-    })
-}
+// Load balancers (Slingshot's pattern, for the dynamic runs of `crate::pcmhpa`)
 
 /// A load balancer in front of assembly `asm`, on container `host`: a component that provides
 /// and requires the assembly's one interface, with one SEFF per signature (a branch with one
@@ -2468,7 +2189,7 @@ fn load_balancer(b: &mut Builder, asm: &str, host: &str) -> Result<String, Strin
     let lb = b.component(&format!("LoadBalancer_{label}"));
     let lp = b.role(&lb, &iface, true);
     let lr = b.role(&lb, &iface, false);
-    // the signatures the assembly still serves (rule 5 keeps the reachable SEFFs only)
+    // the signatures the assembly serves
     let served: BTreeSet<String> =
         b.g.refs(&comp, "serviceEffectSpecifications").iter().filter_map(|x| b.g.ref1(x, "describedService")).collect();
     for sig in b.g.refs(&iface, "signatures").into_iter().filter(|x| served.contains(x)) {
@@ -2514,10 +2235,10 @@ fn load_balancer(b: &mut Builder, asm: &str, host: &str) -> Result<String, Strin
     Ok(lb_asm)
 }
 
-/// Slingshot's load balancers on plain PCM, as rule 5 builds them, for the generic dynamic runs
-/// (`crate::pcmhpa`): a container `LoadBalancerServer` without work (joined to the first linking
-/// resource) and a load balancer in front of every assembly allocated on each of `containers`.
-/// Returns the model and (container, assembly, load balancer assembly) per assembly.
+/// Slingshot's load balancers on plain PCM, for the dynamic runs (`crate::pcmhpa`): a container
+/// `LoadBalancerServer` without work (joined to the first linking resource) and a load balancer
+/// in front of every assembly allocated on each of `containers`. Returns the model and
+/// (container, assembly, load balancer assembly) per assembly.
 pub fn load_balanced(model: &WireModel, containers: &[String]) -> Result<(WireModel, Vec<(String, String, String)>), String> {
     let g = Graph::new(model);
     let first = |class: &str| g.all(class).into_iter().next().ok_or_else(|| format!("the model has no {class}"));
@@ -2538,7 +2259,6 @@ pub fn load_balanced(model: &WireModel, containers: &[String]) -> Result<(WireMo
         publishers: BTreeMap::new(),
         orchestrated: BTreeSet::new(),
         quota: Vec::new(),
-        offered: BTreeMap::new(),
         warnings: Vec::new(),
         g,
     };
@@ -2570,97 +2290,4 @@ pub fn load_balanced(model: &WireModel, containers: &[String]) -> Result<(WireMo
         }
     }
     Ok((b.g.to_wire(|_| true), out))
-}
-
-/// The cost of `cost` split into the part that does not depend on the autoscaled replicas and
-/// the cost of one replica of each autoscaled container in use.
-fn cost_parts(g: &Graph, d: &Decisions, placement: &BTreeMap<String, String>) -> (f64, BTreeMap<String, f64>) {
-    let mut warnings = Vec::new();
-    let total = cost(g, d, placement, &mut warnings);
-    let [_, per_core, per_replica, _] = d.cost.unwrap_or([1.0, 0.0, 0.0, 0.0]);
-    let used: BTreeSet<&String> = placement.values().collect();
-    let mut per = BTreeMap::new();
-    let mut scaled = 0.0;
-    for x in &d.deployables {
-        if x.autoscale.is_none() || !used.contains(&x.container) {
-            continue;
-        }
-        let p = match d.prices.get(&x.container) {
-            Some(p) => *p,
-            None => per_core * x.cpu_per_replica + per_replica,
-        };
-        let w: f64 = x.levels.iter().map(|l| l.0).sum();
-        let mean = x.levels.iter().map(|(wi, n)| wi * n).sum::<f64>() / w;
-        scaled += p * mean;
-        per.insert(x.container.clone(), p);
-    }
-    (total - scaled, per)
-}
-
-/// Rule 5's reduction: the SEFFs no request reaches go, with their contents. A request starts at
-/// an entry-level call of the usage model, enters the system through its delegation, and runs a
-/// SEFF per (assembly, signature); every external call anywhere in a SEFF continues over its
-/// connector. The middleware of rule 2 has one SEFF per signature of an interface, and most of
-/// them are never called through their connector: in today's cut they are half of the model,
-/// and every scaling step rebuilds the whole model. Nothing a run executes changes.
-fn prune_unreachable(b: &mut Builder) {
-    let g = &b.g;
-    let mut conn: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut deleg: HashMap<String, Vec<String>> = HashMap::new();
-    for c in g.all("AssemblyConnector") {
-        if let (Some(req), Some(role), Some(prov)) =
-            (g.ref1(&c, "requiringAssemblyContext"), g.ref1(&c, "requiredRole"), g.ref1(&c, "providingAssemblyContext"))
-        {
-            conn.entry((req, role)).or_default().push(prov);
-        }
-    }
-    for c in g.all("ProvidedDelegationConnector") {
-        if let (Some(outer), Some(asm)) = (g.ref1(&c, "outerProvidedRole"), g.ref1(&c, "assemblyContext")) {
-            deleg.entry(outer).or_default().push(asm);
-        }
-    }
-    let mut seff_of: HashMap<(String, String), String> = HashMap::new();
-    let mut all_seffs = Vec::new();
-    for comp in g.all("BasicComponent") {
-        for x in g.refs(&comp, "serviceEffectSpecifications") {
-            if let Some(sig) = g.ref1(&x, "describedService") {
-                seff_of.insert((comp.clone(), sig), x.clone());
-            }
-            all_seffs.push(x);
-        }
-    }
-    let mut work: Vec<(String, String)> = Vec::new();
-    for call in g.all("EntryLevelSystemCall") {
-        if let (Some(role), Some(sig)) = (g.ref1(&call, "providedRole"), g.ref1(&call, "operationSignature")) {
-            for asm in deleg.get(&role).into_iter().flatten() {
-                work.push((asm.clone(), sig.clone()));
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    let mut keep = HashSet::new();
-    while let Some((asm, sig)) = work.pop() {
-        if !seen.insert((asm.clone(), sig.clone())) {
-            continue;
-        }
-        let Some(comp) = g.ref1(&asm, "encapsulatedComponent") else { continue };
-        let Some(seff) = seff_of.get(&(comp, sig)) else { continue };
-        keep.insert(seff.clone());
-        for x in g.subtree(seff) {
-            if g.class(&x) != "ExternalCallAction" {
-                continue;
-            }
-            let (Some(role), Some(csig)) = (g.ref1(&x, "role"), g.ref1(&x, "calledService")) else { continue };
-            for prov in conn.get(&(asm.clone(), role)).into_iter().flatten() {
-                work.push((prov.clone(), csig.clone()));
-            }
-        }
-    }
-    let mut gone = HashSet::new();
-    for x in all_seffs {
-        if !keep.contains(&x) {
-            gone.extend(b.g.subtree(&x));
-        }
-    }
-    b.g.remove_all(&gone);
 }

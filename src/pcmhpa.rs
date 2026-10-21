@@ -1,7 +1,6 @@
 //! Dynamic runs of plain PCM with Kubernetes-style autoscaling, through SPD (Palladio's scaling
-//! policy definitions) and SimOxide's HPA: the generic counterpart of `archHpaSimulate`
-//! (`crate::dynamic`), for models whose layer 2 is realised in the model (domain project,
-//! DESIGN.md §B5/§H).
+//! policy definitions) and SimOxide's HPA (`crate::dynamic`), for models whose layer 2 is
+//! realised in the model (domain project, DESIGN.md §B5/§H).
 //!
 //! Per autoscaled container the model holds a pod (the container, its CPU with the cores of one
 //! pod). The script says which containers scale and how (`PcmScalingGroup`: min, max, target
@@ -9,22 +8,20 @@
 //! balancers that SPD's service groups need (Slingshot's pattern: a component per assembly whose
 //! SEFFs branch to the pods, the callers' connectors pointing at it) are either in the model,
 //! named by `PcmServiceGroup`s (assembly, load balancer), or, for a group without any, added by
-//! the plugin for the run as rule 5 adds them (`translate::load_balanced`): they are SPD's
+//! the plugin for the run (`translate::load_balanced`): they are SPD's
 //! realisation of a service group, Palladio, not a layer above it. The plugin writes the SPD
 //! (an elastic infrastructure per group, a service group per pair), the semantic configuration and
 //! the HPA configuration, and runs them with a per-scenario load profile. Nothing above PCM: cost
 //! (price × replica-seconds) and the objectives are the script's.
 
 use crate::detail::{self, DetailRequest};
-use crate::dynamic::{self, HpaParams};
+use crate::dynamic::{self, DynamicModel, PodGroup};
 use crate::graph::Graph;
 use crate::pcm::PcmCache;
 use crate::pcmrun::LoadStep;
-use crate::translate::{DynamicModel, LoadProfileSpec, PodGroup};
 use palladio_sim_service::protocol::WireModel;
 use serde_json::{Value, json};
 use simoxide_sim::Limits;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// One autoscaled container (an SPD elastic infrastructure with a HorizontalPodAutoscaler).
@@ -109,7 +106,7 @@ fn first(g: &Graph, class: &str) -> Result<String, String> {
 /// The dynamic model of `model`'s PCM with full monitoring (as a detail run's).
 pub fn dynamic_model(cache: &PcmCache, req: &HpaRequest) -> Result<(DynamicModel, Graph), String> {
     let mut wire = cache.with_overrides(&req.run.overrides);
-    // groups without service groups: the plugin puts the load balancers in (rule 5's pattern)
+    // groups without service groups: the plugin puts the load balancers in
     let bare: Vec<String> = req.groups.iter().filter(|g| !req.services.iter().any(|s| s.container == g.container)).map(|g| g.container.clone()).collect();
     let mut services = req.services.clone();
     if !bare.is_empty() {
@@ -154,11 +151,6 @@ pub fn dynamic_model(cache: &PcmCache, req: &HpaRequest) -> Result<(DynamicModel
             scale_down_s: s.scale_down_s,
             cpu_request: s.cpu_request.unwrap_or(cores),
             pod_cores: cores,
-            price_per_replica: 0.0,
-            offered: (0.0, 0.0),
-            cpu_per_replica: cores,
-            sidecar_cores: 1.0,
-            max_ideal: None,
         });
     }
     let profile = crate::pcmrun::load_profile(
@@ -171,13 +163,11 @@ pub fn dynamic_model(cache: &PcmCache, req: &HpaRequest) -> Result<(DynamicModel
         pcm: g.to_wire(|_| true),
         groups,
         link: links.into_iter().next(),
-        // no uniform steps: the per-scenario profile drives the load
-        profile: Some(LoadProfileSpec { steps: Vec::new(), warm_up: req.run.warm_up_s, end: req.run.duration_s, slo_factor: req.run.slo_factor }),
-        fixed_cost: 0.0,
+        profile,
+        warm_up_s: req.run.warm_up_s,
+        end_s: req.run.duration_s,
         ms_per_unit: req.run.time_unit_ms,
-        budgets: BTreeMap::new(),
         roots: [first(&g, "Repository")?, first(&g, "System")?, first(&g, "Allocation")?, first(&g, "ResourceEnvironment")?],
-        scenario_profile: Some(profile),
         usage_streams: req.run.usage_streams,
     };
     Ok((dm, g))
@@ -193,7 +183,7 @@ pub fn run_model(model: &WireModel, req: &HpaRequest, limits: Limits) -> Result<
 pub fn run(cache: &PcmCache, req: &HpaRequest, limits: Limits) -> Result<(HpaResult, Value), String> {
     let (dm, g) = dynamic_model(cache, req)?;
     let p = dynamic::prepare(Arc::new(dm), req.max_pods)?;
-    let raw = dynamic::run_raw(&p, &HpaParams { seed: req.run.seed, exclude: Vec::new() }, limits)?;
+    let raw = dynamic::run_raw(&p, req.run.seed, limits)?;
     let dm = &p.model;
     let k = 1000.0 / req.run.time_unit_ms;
     let (w0, w1) = (req.run.warm_up_s, req.run.duration_s);

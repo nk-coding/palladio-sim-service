@@ -123,7 +123,7 @@ struct Exprs {
     means: HashMap<String, Option<f64>>,
     warnings: Vec<String>,
     /// The mean of `Exp(x)` for any constant expression x is 1/x (the `pcm*` functions); without
-    /// it only a literal x is recognised and other arguments are sampled (the `arch*` path).
+    /// it only a literal x is recognised and other arguments are sampled (the translation's path).
     exact_exp: bool,
 }
 

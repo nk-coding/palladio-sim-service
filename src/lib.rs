@@ -1,15 +1,18 @@
-//! An mdeo plugin service that optimises the architecture of plain Palladio (PCM) models: it
-//! translates the architecture decisions of a model (layer 2, `architecture.mm`, with its generic
-//! completions) into plain PCM and simulates the result with SimOxide, through
-//! `palladio-sim-service`. Domain layers are realised in the model by their own transformations.
+//! An mdeo plugin service for the architecture optimisation of plain Palladio (PCM) models: script
+//! functions that analyse the PCM part of a model and simulate it with SimOxide, through
+//! `palladio-sim-service`, also over load profiles and with Kubernetes-style autoscaling. The
+//! architecture layers above PCM are realised in the model by model transformations (the domain
+//! project); the plugin knows PCM only.
 //!
 //! - [`mfile`]: reads `.m` files (for the command line and the tests).
 //! - [`graph`]: the model as an editable instance graph.
-//! - [`translate`]: the completion rules (DESIGN.md §4, §5), cost and modularity; rule 5, the
-//!   model of a dynamic run.
-//! - [`dynamic`]: dynamic runs with Kubernetes-style autoscaling (SimOxide's HPA) over a load
-//!   profile, and their objectives.
 //! - [`load`]: offered load and call frequencies of a PCM model, without simulating.
+//! - [`pcm`]: the analyses of the `pcm*` functions; [`pcmrun`]: simulations with load profiles
+//!   and usage streams; [`pcmhpa`]: dynamic runs with autoscaling, on [`dynamic`] (SimOxide's
+//!   HPA); [`detail`]: the design detail of one simulation.
+//! - [`translate`]: the completion rules of layer 2 (DESIGN.md §4, §5), cost, modularity and
+//!   the quality values: the reference the domain project's realisation is checked against
+//!   (`palladio-arch-service oracle`, `translate`).
 //! - [`functions`], [`session`], [`server`]: the plugin service.
 
 pub mod dynamic;

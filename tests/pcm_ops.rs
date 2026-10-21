@@ -7,6 +7,7 @@
 
 use palladio_arch::detail::{self, DetailRequest};
 use palladio_arch::pcm::PcmCache;
+use palladio_arch::pcmhpa::{self, HpaRequest, ScalingGroup, ServiceGroup};
 use palladio_arch::pcmrun::{self, LoadStep, RunOptions};
 use palladio_arch::{mfile, translate};
 use palladio_sim_service::config::Config;
@@ -297,68 +298,33 @@ scenario_call.inputParameterUsages -- mode_usage
     let c1 = cache.loads.resources.iter().find(|r| r.container == "C1").unwrap();
     assert!(close(c1.busy, 20.0 * 0.0175, 1e-12), "{}", c1.busy);
     assert!(cache.loads.warnings.is_empty(), "{:?}", cache.loads.warnings);
-    // the arch* path (no exact means) still samples: close, not exact
+    // the translation's path (no exact means) still samples: close, not exact
     let g = palladio_arch::graph::Graph::new(&cache.plain);
     let l = palladio_arch::load::analyse(&g);
     assert!((l.times["scenario"] - 0.0275).abs() < 0.0275 * 0.02, "{}", l.times["scenario"]);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Dynamic runs on plain PCM (SPD + HPA): the realised model of rule 5 run generically gives the
-// translation's dynamic run
+// Dynamic runs on plain PCM (SPD + HPA): Backend's container C2 (one core, 10 ms per request)
+// autoscaled at a target utilisation of 0.7
 
-fn arch_hpa_model(rate: f64, steps: &[(f64, f64)], warm_up: f64, end: f64) -> WireModel {
+/// The fixture at `rate` requests per second.
+fn hpa_model(rate: f64) -> WireModel {
     let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two-tier.m")).unwrap();
-    let text = text.replace("RATE", &format!("{rate:?}")).replace("BACKEND_CONTAINER", "C2");
-    let mut d = format!(
-        "decisions : ArchitectureDecisions {{ msPerTimeUnit = 1000.0 }}\nd : Deployable {{ cpuPerReplica = 0.5 }}\nd.container -- C2\nd.autoscaling -- auto\ndecisions.deployables -- d\n\
-         auto : Autoscaling {{ targetUtilisation = 0.7 }}\ndecisions.autoscalings -- auto\n\
-         cost : CostModel {{ perContainer = 0.0 perCore = 1.0 perReplicaOverhead = 0.2 perCache = 0.0 }}\ndecisions.costModel -- cost\n\
-         budget : LatencyBudget {{ ms = 30.0 }}\nbudget.scenario -- scenario\ndecisions.latencyBudgets -- budget\n\
-         profile : LoadProfile {{ warmUpSeconds = {warm_up:?} endSeconds = {end:?} sloFactor = 2.0 }}\ndecisions.loadProfile -- profile\n"
-    );
-    for (i, (t, f)) in steps.iter().enumerate() {
-        d += &format!("profile.steps -- step{i}\nstep{i} : LoadStep {{ seconds = {t:?} factor = {f:?} }}\n");
-    }
-    mfile::parse(&format!("{text}\n{d}")).unwrap()
+    mfile::parse(&text.replace("RATE", &format!("{rate:?}")).replace("BACKEND_CONTAINER", "C2")).unwrap()
 }
 
-#[test]
-fn hpa_on_plain_pcm_matches_the_translations_dynamic_run() {
-    use palladio_arch::dynamic::{self, HpaParams};
-    use palladio_arch::pcmhpa::{self, HpaRequest, ScalingGroup, ServiceGroup};
-    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
-    let m = arch_hpa_model(100.0, &steps, 60.0, 600.0);
-    let (_, dm) = translate::translate_dynamic(&m).unwrap();
-    let arch = dynamic::run(&dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(), &HpaParams { seed: 3, exclude: vec![] }, Default::default()).unwrap();
-    // the realised model: the dynamic model's PCM; the groups as a script would pass them
-    let groups: Vec<ScalingGroup> = dm
-        .groups
-        .iter()
-        .map(|g| ScalingGroup {
-            container: g.container.clone(),
-            min: g.min,
-            max: g.max,
-            target: g.target,
-            initial: g.initial,
-            startup_s: g.startup_s,
-            scale_down_s: g.scale_down_s,
-            cpu_request: Some(g.cpu_request),
-        })
-        .collect();
-    let services: Vec<ServiceGroup> = dm
-        .groups
-        .iter()
-        .flat_map(|g| g.services.iter().map(move |(a, lb)| ServiceGroup { container: g.container.clone(), assembly: a.clone(), load_balancer: lb.clone() }))
-        .collect();
+/// C2 autoscaled (up to `max` pods, one at the start) over the load profile `steps` (`(s,
+/// factor)`), from `warm_up` to `end` (s); a budget of 30 ms on the scenario.
+fn hpa_request(steps: &[(f64, f64)], warm_up: f64, end: f64, max: u32, services: Vec<ServiceGroup>) -> HpaRequest {
     let mut budgets = std::collections::BTreeMap::new();
     budgets.insert("scenario".to_string(), 30.0);
     let run = DetailRequest {
         profile: steps.iter().map(|&(t, f)| LoadStep { scenario: None, time: t, factor: f }).collect(),
         usage_streams: false,
         seed: 3,
-        duration_s: 600.0,
-        warm_up_s: 60.0,
+        duration_s: end,
+        warm_up_s: warm_up,
         bin_s: 30.0,
         time_unit_ms: 1000.0,
         budgets_ms: budgets,
@@ -366,30 +332,72 @@ fn hpa_on_plain_pcm_matches_the_translations_dynamic_run() {
         assembly_operations: false,
         ..DetailRequest::default()
     };
-    let req = HpaRequest { groups, services, run, max_pods: 400 };
-    let (r, detail) = pcmhpa::run_model(&dm.pcm, &req, Default::default()).unwrap();
-    assert_eq!(r.groups.len(), 1);
-    let (a, b) = (&arch.groups[0], &r.groups[0]);
-    assert!(close(a.mean_replicas, b.mean_replicas, 1e-12), "{} vs {}", a.mean_replicas, b.mean_replicas);
-    assert_eq!((a.rescales, a.created, a.reversals), (b.rescales, b.created, b.reversals));
-    assert!(close(arch.ready_replica_seconds, r.ready_replica_seconds, 1e-12));
-    assert!(close(arch.replica_seconds, r.replica_seconds, 1e-12));
-    assert_eq!(arch.peak_replicas, r.peak_replicas);
-    assert_eq!(arch.requests, r.requests);
-    assert!(close(arch.slo, r.slo, 1e-12), "{} vs {}", arch.slo, r.slo);
-    assert!(close(arch.flapping, r.flapping, 1e-12));
-    assert!(!r.capped);
+    let groups = vec![ScalingGroup { container: "C2".into(), min: 1, max, target: 0.7, initial: 1, startup_s: 30.0, scale_down_s: None, cpu_request: None }];
+    HpaRequest { groups, services, run, max_pods: 400 }
+}
+
+/// The model with load balancers in front of C2's assemblies, and them as service groups.
+fn load_balanced(m: &WireModel) -> (WireModel, Vec<ServiceGroup>) {
+    let (w, added) = translate::load_balanced(m, &["C2".to_string()]).unwrap();
+    (w, added.into_iter().map(|(container, assembly, load_balancer)| ServiceGroup { container, assembly, load_balancer }).collect())
+}
+
+/// Without service groups the plugin adds the load balancers itself: the same run as with them
+/// in the model. The pods follow the load.
+#[test]
+fn hpa_with_load_balancers_added_by_the_plugin() {
+    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
+    let m = hpa_model(100.0);
+    let (r, detail) = pcmhpa::run_model(&m, &hpa_request(&steps, 60.0, 600.0, 6, vec![]), Default::default()).unwrap();
+    let (with_lb, services) = load_balanced(&m);
+    let (r2, _) = pcmhpa::run_model(&with_lb, &hpa_request(&steps, 60.0, 600.0, 6, services), Default::default()).unwrap();
+    assert_eq!(r.groups, r2.groups);
+    assert_eq!((r.ready_replica_seconds, r.replica_seconds, r.peak_replicas), (r2.ready_replica_seconds, r2.replica_seconds, r2.peak_replicas));
+    assert_eq!((r.slo, r.requests, r.mean_ms, r.events), (r2.slo, r2.requests, r2.mean_ms, r2.events));
+    // one pod at 0.3 cores of load, two at 1.0 (the scale-in after 0.5 falls after the end)
+    assert!(!r.capped && r.groups[0].rescales >= 1 && r.groups[0].max_replicas == 2, "{r:?}");
     // the scaled container's pods over time: more at the step to 1.0
     let c2 = detail["containers"].as_array().unwrap().iter().find(|c| c["container"] == "C2").unwrap().clone();
     assert_eq!(c2["autoscaled"], true);
     let pods: Vec<f64> = c2["replicas"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
     assert!(pods[12] > pods[5], "{pods:?}");
     // with usage streams and a per-scenario profile it runs as well
-    let mut req2 = req.clone();
-    req2.run.usage_streams = true;
-    req2.run.profile = vec![LoadStep { scenario: Some("scenario".into()), time: 0.0, factor: 0.5 }];
-    let (r2, _) = pcmhpa::run_model(&dm.pcm, &req2, Default::default()).unwrap();
-    assert!(r2.groups[0].mean_replicas < r.groups[0].mean_replicas + 1.0);
+    let mut req = hpa_request(&steps, 60.0, 600.0, 6, vec![]);
+    req.run.usage_streams = true;
+    req.run.profile = vec![LoadStep { scenario: Some("scenario".into()), time: 0.0, factor: 0.5 }];
+    let (r3, _) = pcmhpa::run_model(&m, &req, Default::default()).unwrap();
+    assert!(r3.groups[0].mean_replicas < r.groups[0].mean_replicas + 1.0);
+}
+
+/// At a constant load the HPA's pods settle at the ideal count, ⌈load / target⌉ (within
+/// Kubernetes' 10 % tolerance band: at most one pod off), from one pod.
+#[test]
+fn at_constant_load_the_hpa_settles_at_the_ideal_count() {
+    // Backend's load is rate · 10 ms of a core (Frontend's core on C1 is not scaled: 150/s is
+    // 0.75 of it); a tenth of the load at the start, the load from 60 s on, measured from 360 s
+    for (rate, want) in [(50.0, 1.0), (100.0, 2.0), (150.0, 3.0)] {
+        let req = hpa_request(&[(0.0, 0.1), (60.0, 1.0)], 360.0, 1200.0, 20, vec![]);
+        let (r, _) = pcmhpa::run_model(&hpa_model(rate), &req, Default::default()).unwrap();
+        assert!(!r.capped);
+        assert!((r.groups[0].mean_replicas - want).abs() <= 1.0, "λ = {rate}: HPA {} pods, ideal {want}", r.groups[0].mean_replicas);
+    }
+}
+
+/// An evaluation never grows without bound: past `max_pods` created pods the run stops and is
+/// reported as capped.
+#[test]
+fn pod_creation_is_capped() {
+    let mut steps = Vec::new();
+    for i in 0..40 {
+        steps.push((60.0 + 60.0 * i as f64, if i % 2 == 0 { 2.0 } else { 0.1 }));
+    }
+    let mut req = hpa_request(&steps, 60.0, 2460.0, 20, vec![]);
+    req.groups[0].scale_down_s = Some(0.0);
+    req.groups[0].startup_s = 5.0;
+    req.max_pods = 20;
+    let (r, _) = pcmhpa::run_model(&hpa_model(100.0), &req, Default::default()).unwrap();
+    assert!(r.capped, "{r:?}");
+    assert!(r.created <= 21, "{}", r.created);
 }
 
 /// The script functions, called as the platform calls them (records and lists of instances).
@@ -457,29 +465,28 @@ async fn script_functions() {
     assert!((cnt / (40.0 * 200.0) - 1.0).abs() < 0.05, "{cnt}");
     let (v, _) = call(&engine, "pcmRun", run(vec![]), &lists, &cache, &mut next).await;
     assert!(matches!(field(&v, "events"), WireValue::Long(e) if e > 0));
-    // pcmHpaRun on the realised dynamic model
+    // pcmHpaRun on a model with load balancers, as pcmhpa runs it
     let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
-    let (_, dm) = translate::translate_dynamic(&arch_hpa_model(100.0, &steps, 60.0, 600.0)).unwrap();
-    let g = &dm.groups[0];
-    let cache = Arc::new(PcmCache::new(&dm.pcm));
+    let (with_lb, services) = load_balanced(&hpa_model(100.0));
+    let cache = Arc::new(PcmCache::new(&with_lb));
     let mut lists: HashMap<i64, Vec<WireValue>> = HashMap::new();
     lists.insert(
         1,
         vec![rec(
             "PcmScalingGroup",
             vec![
-                ("container", inst(&g.container)),
-                ("minReplicas", WireValue::Int(g.min as i32)),
-                ("maxReplicas", WireValue::Int(g.max as i32)),
-                ("targetUtilisation", WireValue::Double(g.target)),
-                ("initialReplicas", WireValue::Int(g.initial as i32)),
-                ("startup", WireValue::Double(g.startup_s)),
+                ("container", inst("C2")),
+                ("minReplicas", WireValue::Int(1)),
+                ("maxReplicas", WireValue::Int(6)),
+                ("targetUtilisation", WireValue::Double(0.7)),
+                ("initialReplicas", WireValue::Int(1)),
+                ("startup", WireValue::Double(30.0)),
                 ("scaleDown", WireValue::Double(-1.0)),
-                ("cpuRequest", WireValue::Double(g.cpu_request)),
+                ("cpuRequest", WireValue::Double(1.0)),
             ],
         )],
     );
-    lists.insert(2, g.services.iter().map(|(a, lb)| rec("PcmServiceGroup", vec![("container", inst(&g.container)), ("assembly", inst(a)), ("loadBalancer", inst(lb))])).collect());
+    lists.insert(2, services.iter().map(|x| rec("PcmServiceGroup", vec![("container", inst(&x.container)), ("assembly", inst(&x.assembly)), ("loadBalancer", inst(&x.load_balancer))])).collect());
     lists.insert(3, steps.iter().map(|&(t, f)| rec("PcmLoadStep", vec![("scenario", WireValue::Null), ("time", WireValue::Double(t)), ("factor", WireValue::Double(f))])).collect());
     lists.insert(4, vec![inst("scenario")]);
     lists.insert(5, vec![WireValue::Double(30.0)]);
@@ -500,65 +507,12 @@ async fn script_functions() {
         WireValue::Int(400),
     ];
     let (v, _) = call(&engine, "pcmHpaRun", args.clone(), &lists, &cache, &mut next).await;
-    let arch = palladio_arch::dynamic::run(
-        &palladio_arch::dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(),
-        &palladio_arch::dynamic::HpaParams { seed: 3, exclude: vec![] },
-        Default::default(),
-    )
-    .unwrap();
-    assert_eq!(field(&v, "readyReplicaSeconds"), WireValue::Double(arch.ready_replica_seconds));
-    assert_eq!(field(&v, "slo"), WireValue::Double(arch.slo));
+    let mut req = hpa_request(&steps, 60.0, 600.0, 6, services);
+    req.run.bin_s = 10.0;
+    let (r, _) = pcmhpa::run_model(&with_lb, &req, Default::default()).unwrap();
+    assert_eq!(field(&v, "readyReplicaSeconds"), WireValue::Double(r.ready_replica_seconds));
+    assert_eq!(field(&v, "slo"), WireValue::Double(r.slo));
     // cached per model and request
     let (v2, _) = call(&engine, "pcmHpaRun", args, &lists, &cache, &mut next).await;
     assert_eq!(field(&v2, "wallMs"), field(&v, "wallMs"));
-}
-
-/// Without service groups the plugin adds the load balancers itself (rule 5's pattern): the
-/// translation's static PCM with the pod's cores gives the translation's dynamic run.
-#[test]
-fn hpa_with_load_balancers_added_by_the_plugin() {
-    use palladio_arch::dynamic::{self, HpaParams};
-    use palladio_arch::pcmhpa::{self, HpaRequest, ScalingGroup};
-    let steps = [(0.0, 0.3), (200.0, 1.0), (400.0, 0.5)];
-    let m = arch_hpa_model(100.0, &steps, 60.0, 600.0);
-    let (_, dm) = translate::translate_dynamic(&m).unwrap();
-    let arch = dynamic::run(&dynamic::prepare(Arc::new(dm.clone()), 400).unwrap(), &HpaParams { seed: 3, exclude: vec![] }, Default::default()).unwrap();
-    let plain = translate::translate(&m).unwrap().pcm;
-    let g = &dm.groups[0];
-    let cpu = |w: &WireModel| -> (i32, f64) {
-        let gr = palladio_arch::graph::Graph::new(w);
-        let r = gr.refs(&g.container, "activeResourceSpecifications").into_iter().find(|r| gr.str_attr(r, "activeResourceType").as_deref() == Some("CPU")).unwrap();
-        (gr.num_attr(&r, "numberOfReplicas").unwrap() as i32, palladio_arch::load::mean_of(&gr.str_attr(&r, "processingRate").unwrap()).unwrap())
-    };
-    let (n, rate) = cpu(&dm.pcm);
-    let spec = palladio_arch::graph::Graph::new(&plain).refs(&g.container, "activeResourceSpecifications")[0].clone();
-    let mut budgets = std::collections::BTreeMap::new();
-    budgets.insert("scenario".to_string(), 30.0);
-    let run = DetailRequest {
-        overrides: vec![(spec, n, rate)],
-        profile: steps.iter().map(|&(t, f)| LoadStep { scenario: None, time: t, factor: f }).collect(),
-        usage_streams: false,
-        seed: 3,
-        duration_s: 600.0,
-        warm_up_s: 60.0,
-        bin_s: 30.0,
-        budgets_ms: budgets,
-        slo_factor: 2.0,
-        assembly_operations: false,
-        ..DetailRequest::default()
-    };
-    let groups = vec![ScalingGroup {
-        container: g.container.clone(),
-        min: g.min,
-        max: g.max,
-        target: g.target,
-        initial: g.initial,
-        startup_s: g.startup_s,
-        scale_down_s: g.scale_down_s,
-        cpu_request: Some(g.cpu_request),
-    }];
-    let (r, _) = pcmhpa::run_model(&plain, &HpaRequest { groups, services: vec![], run, max_pods: 400 }, Default::default()).unwrap();
-    assert!(close(arch.ready_replica_seconds, r.ready_replica_seconds, 1e-9), "{} vs {}", arch.ready_replica_seconds, r.ready_replica_seconds);
-    assert_eq!(arch.groups[0].rescales, r.groups[0].rescales);
-    assert!(close(arch.slo, r.slo, 1e-9), "{} vs {}", arch.slo, r.slo);
 }

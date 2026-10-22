@@ -1,48 +1,39 @@
-//! The design detail of a plain PCM model: one simulation with full monitoring, reduced to
-//! generic PCM statistics named by PCM elements (the explorer's backend maps them to its
-//! operations, request types, sessions and services; DESIGN.md §H of the domain project).
+//! The design detail of a plain PCM model: the simulation `pcmEvaluate` runs for the same
+//! request ([`crate::evaluate`]), with more monitors, reduced to generic PCM statistics named by
+//! PCM elements (the explorer's backend maps them to its operations, request types, sessions and
+//! services; DESIGN.md §H of the domain project). The evaluation of the run is part of it
+//! (`evaluation`), so the explorer shows exactly what the search evaluated.
 //!
 //! - **Monitoring.** The model's own monitors are replaced by a complete set: Response Time of
 //!   every usage scenario, entry-level system call, system operation (delegated provided role ×
 //!   signature) and assembly operation (assembly × provided role × signature with a SEFF, measured
 //!   when a connector calls it); State of Active Resource of every core of every processing
 //!   resource (replica 0 of a multi-core one adds SimuLizar's overall utilisation) and its
-//!   Resource Demand.
-//! - **Run.** SimOxide's fast mode with the request's seed, duration, per-scenario load profile
-//!   and usage streams (common random numbers, on by default), virtual-time processor sharing.
+//!   Resource Demand. An evaluation monitors the first three only; monitors do not change the run.
+//! - **Run.** `pcmEvaluate`'s: SimOxide's fast mode with the request's seed, per-scenario load
+//!   profile, usage streams (on by default), SPD and the HPA for the scaled containers.
 //! - **Output** (JSON, times in ms and s via `timeUnitMs`, the model's time unit in ms): per
 //!   response-time series count, mean, percentiles, max, a log-spaced histogram and per-bin mean,
 //!   p95 and throughput; per resource the time-weighted utilisation and queue length (overall and
 //!   per bin) and the mean wait (Little: L/X − S); per container its CPU's utilisation and replicas
-//!   per bin; service-level violations per bin for the series that have a budget; the load profile
-//!   per scenario. Statistics cover `[warmUpS, durationS]`; the bins cover the whole run.
+//!   per bin (ready pods when autoscaled); service-level violations per bin for the series that
+//!   have a budget; the load profile per scenario. Statistics cover `[warmUpS, durationS]`; the
+//!   bins cover the whole run.
 
+use crate::evaluate::{self, LoadStep, Monitors, Request};
 use crate::graph::{Graph, is_a};
 use crate::pcm::PcmCache;
-use crate::pcmrun::{LoadStep, RunOptions};
-use palladio_sim_service::engine::RunParams;
 use palladio_sim_service::protocol::{WireModel, WireValue};
-use palladio_sim_service::{schema, xmi};
 use serde_json::{Value, json};
-use simoxide_sim::{CompiledModel, Limits, RunSpec};
+use simoxide_sim::Limits;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-/// What a detail run does.
+/// What a detail run does: the evaluation's request and the detail's own options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetailRequest {
-    /// (processing resource, replicas, rate), as `pcmSimulate`'s overrides.
-    pub overrides: Vec<(String, i32, f64)>,
-    /// Load steps, times in seconds.
-    pub profile: Vec<LoadStep>,
-    pub usage_streams: bool,
-    pub seed: i64,
-    pub duration_s: f64,
-    pub warm_up_s: f64,
-    pub bin_s: f64,
-    /// Milliseconds per model time unit.
-    pub time_unit_ms: f64,
-    /// Latency budgets (ms) by series key or element name (see [`detail`]).
+    pub run: Request,
+    /// Latency budgets (ms) by series key or element name (see [`reduce`]).
     pub budgets_ms: BTreeMap<String, f64>,
     /// A request violates its service level above `slo_factor` × its budget.
     pub slo_factor: f64,
@@ -53,34 +44,31 @@ pub struct DetailRequest {
 
 impl Default for DetailRequest {
     fn default() -> Self {
-        DetailRequest {
-            overrides: Vec::new(),
-            profile: Vec::new(),
-            usage_streams: true,
-            seed: 1,
-            duration_s: 600.0,
-            warm_up_s: 0.0,
-            bin_s: 10.0,
-            time_unit_ms: 1000.0,
-            budgets_ms: BTreeMap::new(),
-            slo_factor: 1.0,
-            histogram_per_decade: 10,
-            assembly_operations: true,
-        }
+        DetailRequest { run: Request::default(), budgets_ms: BTreeMap::new(), slo_factor: 1.0, histogram_per_decade: 10, assembly_operations: true }
     }
 }
 
 impl DetailRequest {
-    /// From JSON: `{overrides: [{resource, replicas, rate}], profile: [{scenario?, timeS, factor}],
-    /// usageStreams, seed, durationS, warmUpS, binS, timeUnitMs, budgetsMs: {key: ms}, sloFactor,
-    /// histogramPerDecade, assemblyOperations}`, every field optional.
+    /// From JSON: [`Request::from_json`]'s fields plus `budgetsMs: {key: ms}`, `sloFactor`,
+    /// `histogramPerDecade`, `assemblyOperations`, every field optional.
     pub fn from_json(v: &Value) -> Result<DetailRequest, String> {
-        let mut r = DetailRequest::default();
         let o = v.as_object().ok_or("a detail request is a JSON object")?;
-        let num = |k: &str| o.get(k).and_then(Value::as_f64);
         for k in o.keys() {
             if ![
                 "overrides",
+                "groups",
+                "services",
+                "maxPods",
+                "percentiles",
+                "detailCalls",
+                "fixDoubleResume",
+                "hpaSyncS",
+                "hpaTolerance",
+                "hpaDownscaleStabilisationS",
+                "hpaCpuInitialisationS",
+                "maxPathSets",
+                "wallSeconds",
+                "maxEvents",
                 "profile",
                 "usageStreams",
                 "seed",
@@ -101,36 +89,11 @@ impl DetailRequest {
                 return Err(format!("detail request: unknown field {k}"));
             }
         }
-        if let Some(list) = o.get("overrides").and_then(Value::as_array) {
-            for x in list {
-                let res = x.get("resource").and_then(Value::as_str).ok_or("an override needs a resource")?;
-                let n = x.get("replicas").and_then(Value::as_i64).ok_or("an override needs replicas")?;
-                let rate = x.get("rate").and_then(Value::as_f64).ok_or("an override needs a rate")?;
-                r.overrides.push((res.to_string(), n as i32, rate));
-            }
-        }
-        if let Some(list) = o.get("profile").and_then(Value::as_array) {
-            for x in list {
-                r.profile.push(LoadStep {
-                    scenario: x.get("scenario").and_then(Value::as_str).map(str::to_string),
-                    time: x.get("timeS").and_then(Value::as_f64).ok_or("a load step needs timeS")?,
-                    factor: x.get("factor").and_then(Value::as_f64).ok_or("a load step needs a factor")?,
-                });
-            }
-        }
-        if let Some(b) = o.get("usageStreams").and_then(Value::as_bool) {
-            r.usage_streams = b;
-        }
+        let mut r = DetailRequest { run: Request::from_json(v).map_err(|e| format!("detail request: {e}"))?, ..DetailRequest::default() };
+        let num = |k: &str| o.get(k).and_then(Value::as_f64);
         if let Some(b) = o.get("assemblyOperations").and_then(Value::as_bool) {
             r.assembly_operations = b;
         }
-        if let Some(s) = o.get("seed").and_then(Value::as_i64) {
-            r.seed = s;
-        }
-        r.duration_s = num("durationS").unwrap_or(r.duration_s);
-        r.warm_up_s = num("warmUpS").unwrap_or(r.warm_up_s);
-        r.bin_s = num("binS").unwrap_or(r.bin_s);
-        r.time_unit_ms = num("timeUnitMs").unwrap_or(r.time_unit_ms);
         r.slo_factor = num("sloFactor").unwrap_or(r.slo_factor);
         if let Some(k) = num("histogramPerDecade") {
             r.histogram_per_decade = (k as usize).max(1);
@@ -140,48 +103,13 @@ impl DetailRequest {
                 r.budgets_ms.insert(k.clone(), v.as_f64().ok_or("budgetsMs holds numbers")?);
             }
         }
-        if !(r.duration_s > 0.0) || !(r.bin_s > 0.0) || !(r.time_unit_ms > 0.0) || r.warm_up_s < 0.0 || r.warm_up_s >= r.duration_s {
-            return Err("detail request: needs durationS > warmUpS ≥ 0, binS > 0, timeUnitMs > 0".into());
-        }
         Ok(r)
     }
 }
 
-/// The detail of a JSON request (CLI `detail`, `POST /pcm/detail`): [`detail`], or with
-/// `autoscaling: {groups: [{container, min, max, target, initial, startupS, scaleDownS?,
-/// cpuRequest?}], services: [{container, assembly, loadBalancer}], maxPods?}` a dynamic run with
-/// SPD and the HPA ([`crate::pcmhpa`]), its outcome under `autoscaling`.
+/// The detail of a JSON request (CLI `detail`, `POST /pcm/detail`).
 pub fn detail_json(model: &WireModel, v: &Value, limits: Limits) -> Result<Value, String> {
-    let req = DetailRequest::from_json(v)?;
-    let Some(a) = v.get("autoscaling") else { return detail(model, &req, limits) };
-    let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("autoscaling: {k} is missing"));
-    let n = |x: &Value, k: &str| x.get(k).and_then(Value::as_f64).ok_or_else(|| format!("autoscaling: {k} is missing"));
-    let mut groups = Vec::new();
-    for g in a.get("groups").and_then(Value::as_array).into_iter().flatten() {
-        groups.push(crate::pcmhpa::ScalingGroup {
-            container: s(g, "container")?,
-            min: n(g, "min")? as u32,
-            max: n(g, "max")? as u32,
-            target: n(g, "target")?,
-            initial: n(g, "initial").unwrap_or(1.0) as u32,
-            startup_s: n(g, "startupS").unwrap_or(crate::dynamic::DEFAULT_STARTUP_S),
-            scale_down_s: g.get("scaleDownS").and_then(Value::as_f64),
-            cpu_request: g.get("cpuRequest").and_then(Value::as_f64),
-        });
-    }
-    let mut services = Vec::new();
-    for x in a.get("services").and_then(Value::as_array).into_iter().flatten() {
-        services.push(crate::pcmhpa::ServiceGroup { container: s(x, "container")?, assembly: s(x, "assembly")?, load_balancer: s(x, "loadBalancer")? });
-    }
-    let max_pods = a.get("maxPods").and_then(Value::as_u64).unwrap_or(crate::dynamic::DEFAULT_MAX_PODS as u64) as u32;
-    let (r, mut out) = crate::pcmhpa::run_model(model, &crate::pcmhpa::HpaRequest { groups, services, run: req, max_pods }, limits)?;
-    out["autoscaling"] = json!({
-        "readyReplicaSeconds": r.ready_replica_seconds, "replicaSeconds": r.replica_seconds, "peakReplicas": r.peak_replicas,
-        "rescales": r.rescales, "createdPods": r.created, "flapping": r.flapping, "capped": r.capped,
-        "groups": r.groups.iter().map(|g| json!({"container": g.container, "meanReplicas": g.mean_replicas, "maxReplicas": g.max_replicas,
-            "readyReplicaSeconds": g.ready_replica_seconds, "rescales": g.rescales, "createdPods": g.created, "reversals": g.reversals})).collect::<Vec<_>>(),
-    });
-    Ok(out)
+    detail(model, &DetailRequest::from_json(v)?, limits)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -193,8 +121,9 @@ fn is_monitoring(class: &str) -> bool {
         .any(|c| is_a(class, c))
 }
 
-/// Replaces the model's monitoring by the complete set of [`detail`] (in place).
-pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
+/// Replaces the model's monitoring (in place) by the evaluation's monitors (Response Time of
+/// every usage scenario, entry-level system call and system operation) and those of `mon`.
+pub fn monitor(g: &mut Graph, mon: Monitors) {
     let old: std::collections::HashSet<String> = g.insts.iter().filter(|x| is_monitoring(&x.class_name)).map(|x| x.name.clone()).collect();
     g.remove_all(&old);
     let mrep = g.create("detail_monitors", "MonitorRepository");
@@ -240,7 +169,7 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
             }
         }
     }
-    if assembly_operations {
+    if mon.assembly_operations {
         let recursive = recursive_operations(g);
         for asm in g.all("AssemblyContext") {
             let Some(comp) = g.ref1(&asm, "encapsulatedComponent") else { continue };
@@ -257,14 +186,16 @@ pub fn monitor_everything(g: &mut Graph, assembly_operations: bool) {
             }
         }
     }
-    for c in g.all("ResourceContainer") {
-        for spec in g.refs(&c, "activeResourceSpecifications") {
-            let n = g.num_attr(&spec, "numberOfReplicas").unwrap_or(1.0).max(1.0) as i32;
-            let ps = g.str_attr(&spec, "schedulingPolicy").as_deref() == Some("PROCESSOR_SHARING");
-            let cores = if ps { n } else { 1 };
-            for k in 0..cores {
-                let metrics: &[&str] = if k == 0 { &["STATE_OF_ACTIVE_RESOURCE", "RESOURCE_DEMAND"] } else { &["STATE_OF_ACTIVE_RESOURCE"] };
-                add(g, "ActiveResourceMeasuringPoint", &[("activeResource", &spec)], Some(k), metrics);
+    if mon.resources {
+        for c in g.all("ResourceContainer") {
+            for spec in g.refs(&c, "activeResourceSpecifications") {
+                let n = g.num_attr(&spec, "numberOfReplicas").unwrap_or(1.0).max(1.0) as i32;
+                let ps = g.str_attr(&spec, "schedulingPolicy").as_deref() == Some("PROCESSOR_SHARING");
+                let cores = if ps { n } else { 1 };
+                for k in 0..cores {
+                    let metrics: &[&str] = if k == 0 { &["STATE_OF_ACTIVE_RESOURCE", "RESOURCE_DEMAND"] } else { &["STATE_OF_ACTIVE_RESOURCE"] };
+                    add(g, "ActiveResourceMeasuringPoint", &[("activeResource", &spec)], Some(k), metrics);
+                }
             }
         }
     }
@@ -327,60 +258,42 @@ fn recursive_operations(g: &Graph) -> std::collections::HashSet<(String, String)
 /// The detail of `model` (any model; its PCM part is simulated) as JSON.
 pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<Value, String> {
     let t0 = Instant::now();
-    let phase = |what: &str| tracing::debug!("detail: {what} after {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let cache = PcmCache::new(model);
-    phase("analysis");
-    let mut g = Graph::new(&cache.with_overrides(&req.overrides));
-    monitor_everything(&mut g, req.assembly_operations);
-    phase("monitoring");
-    let wire = g.to_wire(|_| true);
-    let files = xmi::to_xmi(schema::schema(), &wire)?.files;
-    phase("xmi");
-    let usage = files.iter().find(|(n, _)| n.ends_with(".usagemodel")).map(|(n, _)| n.clone()).ok_or("the model has no UsageModel")?;
-    let spec = RunSpec { usagemodel: Some(usage), ..RunSpec::default() };
-    let pcm = spec.load_model_memory(&files).map_err(|e| format!("the PCM model is invalid: {e}"))?;
-    let cm = CompiledModel::compile(pcm).map_err(|e| format!("the model cannot be simulated: {e}"))?;
-    phase("compile");
-    let k = 1000.0 / req.time_unit_ms; // model units per second
-    let params = RunParams {
-        seed: req.seed,
-        max_measurements: -1,
-        max_sim_time: (req.duration_s * k).ceil() as i64,
-        replications: 1,
-        simulate_linking_resources: false,
+    let o = evaluate::run(&cache, &req.run, Monitors { assembly_operations: req.assembly_operations, resources: true }, limits)?;
+    let k = 1000.0 / req.run.ms_per_unit;
+    let (Some(g), Some(raw)) = (&o.graph, &o.raw) else {
+        return Ok(json!({"kind": "pcm-detail", "version": 2, "failed": true, "message": o.eval.message, "evaluation": o.eval.to_json()}));
     };
-    let opts = RunOptions {
-        profile: req.profile.iter().map(|s| LoadStep { scenario: s.scenario.clone(), time: s.time * k, factor: s.factor }).collect(),
-        usage_streams: req.usage_streams,
-    };
-    let r = crate::pcmrun::run_with(&cm, &[], &params, &opts, &limits, true, |c| {
-        c.ps_algorithm = simoxide_sim::PsAlgorithm::VirtualTime;
-    })?;
-    phase("run");
-    let (meas, end) = r.runs.into_iter().next().ok_or("no run")?;
-    let mut out = reduce(&g, &cache, req, &meas, end);
+    let mut out = reduce(g, &cache, req, &raw.meas, raw.end);
+    let bins: Vec<f64> = out["t"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+    for pg in &o.groups {
+        let series = raw.ready_series(&pg.name, pg.initial as i32, k);
+        let per_bin: Vec<f64> = bins.iter().map(|&b| step_mean(&series, b, (b + req.run.bin_s).min(req.run.end_s))).collect();
+        if let Some(cs) = out["containers"].as_array_mut() {
+            for c in cs.iter_mut().filter(|c| c["container"] == pg.container.as_str()) {
+                c["replicas"] = json!(per_bin);
+                c["autoscaled"] = json!(true);
+            }
+        }
+    }
+    out["evaluation"] = o.eval.to_json();
     out["simulator"] = json!({
-        "name": "SimOxide",
-        "mode": "fast",
-        "seed": req.seed,
-        "usageStreams": req.usage_streams,
-        "durationS": req.duration_s,
-        "warmUpS": req.warm_up_s,
-        "simulatedS": end / k,
-        "events": r.outcome.events,
-        "measurements": r.outcome.measurements,
-        "computeMs": t0.elapsed().as_secs_f64() * 1e3,
+        "name": "SimOxide", "mode": "fast", "seed": req.run.seed, "usageStreams": req.run.usage_streams,
+        "durationS": req.run.end_s, "warmUpS": req.run.warm_up_s, "simulatedS": raw.end / k, "events": raw.events,
+        "measurements": raw.meas.count, "autoscaling": if o.groups.is_empty() { Value::Null } else { json!("SPD + HPA") },
+        "capped": o.eval.capped, "failed": o.eval.failed, "message": o.eval.message,
+        "simulationMs": raw.wall_ms, "computeMs": t0.elapsed().as_secs_f64() * 1e3,
     });
     Ok(out)
 }
 
 /// Response-time tuples and step series of one run, reduced (`end` in model units).
 pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_sim::Measurements, end: f64) -> Value {
-    let k = 1000.0 / req.time_unit_ms;
-    let ms = req.time_unit_ms;
-    let (w0, w1) = (req.warm_up_s, req.duration_s.min(end / k).max(req.warm_up_s));
-    let nbins = ((req.duration_s / req.bin_s).ceil() as usize).max(1);
-    let bins: Vec<f64> = (0..nbins).map(|i| i as f64 * req.bin_s).collect();
+    let k = 1000.0 / req.run.ms_per_unit;
+    let ms = req.run.ms_per_unit;
+    let (w0, w1) = (req.run.warm_up_s, req.run.end_s.min(end / k).max(req.run.warm_up_s));
+    let nbins = ((req.run.end_s / req.run.bin_s).ceil() as usize).max(1);
+    let bins: Vec<f64> = (0..nbins).map(|i| i as f64 * req.run.bin_s).collect();
     let name = |id: &str| g.entity(id);
     let mut groups: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     let mut slo_bins = vec![(0u64, 0u64); nbins];
@@ -461,7 +374,7 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
             let limit = req.slo_factor * b / ms;
             for &(t, v) in rows.iter() {
                 let ts = t / k;
-                let bi = ((ts / req.bin_s) as usize).min(nbins - 1);
+                let bi = ((ts / req.run.bin_s) as usize).min(nbins - 1);
                 let bad = (v > limit) as u64;
                 slo_bins[bi].0 += 1;
                 slo_bins[bi].1 += bad;
@@ -489,7 +402,7 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
             let n = g.num_attr(&spec, "numberOfReplicas").unwrap_or(1.0).max(1.0);
             let cores = states.get(&spec).cloned().unwrap_or_default();
             // queue length: Σ cores; utilisation: the overall series (multi-core) or state > 0
-            let queue_bins: Vec<f64> = (0..nbins).map(|b| cores.iter().map(|r| step_mean(r, bins[b] * k, (bins[b] + req.bin_s).min(req.duration_s) * k)).sum()).collect();
+            let queue_bins: Vec<f64> = (0..nbins).map(|b| cores.iter().map(|r| step_mean(r, bins[b] * k, (bins[b] + req.run.bin_s).min(req.run.end_s) * k)).sum()).collect();
             let queue = cores.iter().map(|r| step_mean(r, w0 * k, w1 * k)).sum::<f64>();
             let delay = policy == "DELAY";
             let util_of = |a: f64, b: f64| -> Option<f64> {
@@ -503,7 +416,7 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
             };
             let util = util_of(w0 * k, w1 * k);
             let util_bins: Option<Vec<f64>> =
-                if delay { None } else { Some((0..nbins).map(|b| util_of(bins[b] * k, (bins[b] + req.bin_s).min(req.duration_s) * k).unwrap_or(0.0)).collect()) };
+                if delay { None } else { Some((0..nbins).map(|b| util_of(bins[b] * k, (bins[b] + req.run.bin_s).min(req.run.end_s) * k).unwrap_or(0.0)).collect()) };
             // wait: Little's R = L / X, minus the mean service time
             let (mut x, mut s_sum) = (0u64, 0.0);
             if let Some(d) = demands.get(&spec) {
@@ -521,14 +434,13 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
             } else {
                 0.0
             };
-            let analytic = cache.loads.resources.iter().find(|r| r.spec == spec).map(|r| r.utilisation());
             if kind == "CPU" && cpu_util.is_none() {
                 cpu_util = util_bins.clone();
                 cpu_replicas = n;
             }
             resources.push(json!({
                 "resource": spec, "container": c, "containerName": name(&c), "kind": kind, "policy": policy,
-                "replicas": n, "utilisation": util, "analyticUtilisation": analytic,
+                "replicas": n, "utilisation": util,
                 "queueLength": queue, "waitMs": wait_ms, "demands": x,
                 "t": bins, "utilisationOverTime": util_bins, "queueOverTime": queue_bins,
             }));
@@ -544,12 +456,22 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
     let mut base = serde_json::Map::new();
     for sc in g.all("UsageScenario") {
         let f = |t: f64| -> f64 {
-            let named: Vec<&LoadStep> = req.profile.iter().filter(|s| s.scenario.as_deref() == Some(sc.as_str()) || s.scenario.as_deref() == Some(name(&sc).as_str())).collect();
-            let steps: Vec<&LoadStep> = if named.is_empty() { req.profile.iter().filter(|s| s.scenario.is_none()).collect() } else { named };
+            let named: Vec<&LoadStep> = req.run.profile.iter().filter(|s| s.scenario.as_deref() == Some(sc.as_str()) || s.scenario.as_deref() == Some(name(&sc).as_str())).collect();
+            let steps: Vec<&LoadStep> = if named.is_empty() { req.run.profile.iter().filter(|s| s.scenario.is_none()).collect() } else { named };
             steps.iter().filter(|s| s.time <= t).max_by(|a, b| a.time.total_cmp(&b.time)).map_or(1.0, |s| s.factor)
         };
         factors.insert(sc.clone(), json!(bins.iter().map(|&t| f(t)).collect::<Vec<_>>()));
-        base.insert(sc.clone(), json!(cache.loads.arrivals.get(&sc).copied().unwrap_or(0.0) * k));
+        // measured: the sessions completed in the window per second and unit of the profile's
+        // factor (null without sessions)
+        let done = meas
+            .series
+            .iter()
+            .position(|d| d.metric.starts_with("Response Time") && *d.mp == *format!("UsageScenarioMeasuringPoint[{sc}]"))
+            .map_or(0, |i| meas.rows[i].iter().filter(|r| r.0 >= w0 * k && r.0 <= w1 * k).count());
+        let steps = 1000usize;
+        let mean_factor = (0..steps).map(|i| f(w0 + (w1 - w0) * (i as f64 + 0.5) / steps as f64)).sum::<f64>() / steps as f64;
+        let rate = (done > 0 && mean_factor > 0.0 && w1 > w0).then(|| done as f64 / (w1 - w0) / mean_factor);
+        base.insert(sc.clone(), json!(rate));
     }
     let slo = json!({
         "factor": req.slo_factor,
@@ -559,9 +481,9 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
     });
     let mut out = json!({
         "kind": "pcm-detail",
-        "version": 1,
-        "timeUnitMs": req.time_unit_ms,
-        "binS": req.bin_s,
+        "version": 2,
+        "timeUnitMs": req.run.ms_per_unit,
+        "binS": req.run.bin_s,
         "t": bins,
         "load": {"t": bins, "baseRatePerS": base, "factor": factors},
         "resources": resources,
@@ -576,10 +498,10 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
 
 /// Statistics of response-time tuples (model units) in ms: over the window, and per bin.
 fn response_stats(rows: &[(f64, f64)], bins: &[f64], req: &DetailRequest, budget: Option<f64>) -> Value {
-    let k = 1000.0 / req.time_unit_ms;
-    let ms = req.time_unit_ms;
+    let k = 1000.0 / req.run.ms_per_unit;
+    let ms = req.run.ms_per_unit;
     let nb = bins.len();
-    let mut v: Vec<f64> = rows.iter().filter(|r| r.0 / k >= req.warm_up_s && r.0 / k <= req.duration_s).map(|r| r.1 * ms).collect();
+    let mut v: Vec<f64> = rows.iter().filter(|r| r.0 / k >= req.run.warm_up_s && r.0 / k <= req.run.end_s).map(|r| r.1 * ms).collect();
     v.sort_by(f64::total_cmp);
     let n = v.len();
     let pct = |p: f64| if n == 0 { 0.0 } else { v[((p * n as f64).ceil() as usize).clamp(1, n) - 1] };
@@ -606,7 +528,7 @@ fn response_stats(rows: &[(f64, f64)], bins: &[f64], req: &DetailRequest, budget
     // per bin
     let mut per: Vec<Vec<f64>> = vec![Vec::new(); nb];
     for &(t, x) in rows {
-        let bi = ((t / k / req.bin_s) as usize).min(nb - 1);
+        let bi = ((t / k / req.run.bin_s) as usize).min(nb - 1);
         per[bi].push(x * ms);
     }
     let mut means = Vec::with_capacity(nb);
@@ -617,7 +539,7 @@ fn response_stats(rows: &[(f64, f64)], bins: &[f64], req: &DetailRequest, budget
         let len = b.len();
         means.push(if len == 0 { Value::Null } else { json!(b.iter().sum::<f64>() / len as f64) });
         p95s.push(if len == 0 { Value::Null } else { json!(b[((0.95 * len as f64).ceil() as usize).clamp(1, len) - 1]) });
-        let width = (bins[i] + req.bin_s).min(req.duration_s) - bins[i];
+        let width = (bins[i] + req.run.bin_s).min(req.run.end_s) - bins[i];
         thr.push(if width > 0.0 { len as f64 / width } else { 0.0 });
     }
     let violations = budget.map(|b| v.iter().filter(|x| **x > req.slo_factor * b).count());
@@ -669,10 +591,16 @@ mod tests {
 
     #[test]
     fn requests_from_json() {
-        let r = DetailRequest::from_json(&json!({"durationS": 100, "profile": [{"timeS": 10, "factor": 2}], "budgetsMs": {"x": 50}})).unwrap();
-        assert_eq!(r.duration_s, 100.0);
-        assert_eq!(r.profile, vec![LoadStep { scenario: None, time: 10.0, factor: 2.0 }]);
-        assert!(r.usage_streams);
+        let r = DetailRequest::from_json(&json!({"durationS": 100, "profile": [{"timeS": 10, "factor": 2}], "budgetsMs": {"x": 50},
+            "autoscaling": {"groups": [{"container": "C2", "min": 1, "max": 4, "target": 0.7}], "maxPods": 9}})).unwrap();
+        assert_eq!(r.run.end_s, 100.0);
+        assert_eq!(r.run.profile, vec![LoadStep { scenario: None, time: 10.0, factor: 2.0 }]);
+        assert!(r.run.usage_streams);
+        assert_eq!((r.run.groups.len(), r.run.max_pods), (1, 9));
+        assert_eq!(r.budgets_ms["x"], 50.0);
+        let g = DetailRequest::from_json(&json!({"groups": [{"container": "C2", "min": 1, "max": 4, "target": 0.7}], "percentiles": [99], "hpaSyncS": 5})).unwrap();
+        assert_eq!(g.run.groups, r.run.groups);
+        assert_eq!((g.run.percentiles.clone(), g.run.controller.sync_s), (vec![99.0], 5.0));
         assert!(DetailRequest::from_json(&json!({"durationS": 10, "warmUpS": 20})).is_err());
         assert!(DetailRequest::from_json(&json!({"bogus": 1})).is_err());
     }

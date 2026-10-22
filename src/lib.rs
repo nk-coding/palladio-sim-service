@@ -1,32 +1,26 @@
-//! An mdeo plugin service for the architecture optimisation of plain Palladio (PCM) models: script
-//! functions that analyse the PCM part of a model and simulate it with SimOxide, through
-//! `palladio-sim-service`, also over load profiles and with Kubernetes-style autoscaling. The
-//! architecture layers above PCM are realised in the model by model transformations (the domain
-//! project); the plugin knows PCM only.
+//! An mdeo plugin service for the architecture optimisation of plain Palladio (PCM) models:
+//! one script function that simulates the PCM part of a model with SimOxide, through
+//! `palladio-sim-service`, over per-scenario load profiles and with Kubernetes-style autoscaling
+//! (SPD and SimOxide's HPA). The architecture layers above PCM are realised in the model by model
+//! transformations (the domain project); the plugin knows PCM only.
 //!
-//! - [`mfile`]: reads `.m` files (for the command line and the tests).
+//! - [`mfile`]: reads `.m` files and model data (for the command line and the tests).
 //! - [`graph`]: the model as an editable instance graph.
-//! - [`load`]: offered load and call frequencies of a PCM model, without simulating.
-//! - [`pcm`]: the analyses of the `pcm*` functions; [`pcmrun`]: simulations with load profiles
-//!   and usage streams; [`pcmhpa`]: dynamic runs with autoscaling, on [`dynamic`] (SimOxide's
-//!   HPA); [`detail`]: the design detail of one simulation.
-//! - [`translate`]: the completion rules of layer 2 (DESIGN.md §4, §5), cost, modularity and
-//!   the quality values: the reference the domain project's realisation is checked against
-//!   (`palladio-arch-service oracle`, `translate`).
+//! - [`pcm`]: the plain PCM of a model, held per model; [`evaluate`]: `pcmEvaluate`, one
+//!   simulation and its reduction, on [`dynamic`] (the run, SPD and the HPA) and [`lb`] (the
+//!   load balancers of SPD's service groups); [`detail`]: the design detail of the same run.
 //! - [`functions`], [`session`], [`server`]: the plugin service.
 
+pub mod detail;
 pub mod dynamic;
+pub mod evaluate;
 pub mod functions;
 pub mod graph;
-pub mod load;
+pub mod lb;
 pub mod mfile;
 pub mod pcm;
-pub mod pcmhpa;
-pub mod pcmrun;
-pub mod detail;
 pub mod server;
 pub mod session;
-pub mod translate;
 
 use palladio_sim_service::protocol::WireModel;
 

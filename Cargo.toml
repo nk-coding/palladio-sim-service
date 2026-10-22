@@ -1,6 +1,6 @@
 [package]
 name = "palladio-arch-service"
-description = "mdeo plugin service: analyses and simulates plain Palladio (PCM) models with SimOxide, for the architecture optimisation"
+description = "mdeo plugin service: evaluates plain Palladio (PCM) models by simulation with SimOxide (load profiles, SPD + HPA), for the architecture optimisation"
 version = "0.1.0"
 edition = "2024"
 license = "EPL-2.0"
@@ -14,8 +14,6 @@ path = "src/lib.rs"
 palladio-sim-service = { path = "../palladio-sim-service" }
 simoxide-model = { path = "../simoxide/crates/simoxide-model" }
 simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
-simoxide-stoex = { path = "../simoxide/crates/simoxide-stoex" }
-simoxide-random = { path = "../simoxide/crates/simoxide-random" }
 # dynamic runs: SimOxide's SPD layer with the HPA, and Slingshot's adjustments (EPL default builds)
 simoxide-spd = { path = "../simoxide/crates/simoxide-spd", features = ["sim"] }
 simoxide-reconf = { path = "../simoxide/crates/simoxide-reconf" }

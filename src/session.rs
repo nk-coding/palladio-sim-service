@@ -15,9 +15,8 @@ use tracing::{debug, info};
 struct HeldModel {
     id: i64,
     model: Arc<WireModel>,
-    /// The plain PCM of the model and its analysis (`pcm*` functions).
+    /// The plain PCM of the model and its evaluations (`pcm*` functions).
     pcm: Option<Arc<crate::pcm::PcmCache>>,
-    pcm_prepared: functions::PcmPrepared,
 }
 
 pub struct Session {
@@ -70,7 +69,6 @@ impl Session {
                     id: model_id,
                     model: Arc::new(model),
                     pcm: None,
-                    pcm_prepared: None,
                 });
                 None
             }
@@ -138,14 +136,14 @@ impl Session {
                 }
                 let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
                     .await
-                    .map_err(|e| (format!("the PCM analysis failed: {e}"), None))?;
+                    .map_err(|e| (format!("reading the model's PCM failed: {e}"), None))?;
                 let c = Arc::new(c);
                 held.pcm = Some(c.clone());
                 c
             }
         };
         let mut next = self.next_id;
-        let answer = functions::call(&self.engine, operation, args, &self.lists, &cache, &mut held.pcm_prepared, &mut || {
+        let answer = functions::call(&self.engine, operation, args, &self.lists, &cache, &mut || {
             let id = next;
             next -= 1;
             id

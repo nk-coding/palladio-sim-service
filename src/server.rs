@@ -137,9 +137,9 @@ async fn detail_handler(State(state): State<Arc<AppState>>, body: axum::body::By
         Ok(x) => x,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", &e),
     };
-    let runner = crate::pcmrun::runner(&state.engine.config);
+    let runner = crate::evaluate::evaluator(&state.engine.config);
     let limits = runner.limits();
-    let _permit = match runner.acquire().await {
+    let _permit = match runner.permits.acquire().await.map_err(|e| e.to_string()) {
         Ok(p) => p,
         Err(e) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "busy", &e),
     };

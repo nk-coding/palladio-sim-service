@@ -1,6 +1,8 @@
-//! Dynamic runs with Kubernetes-style autoscaling: a [`DynamicModel`] (plain PCM with pod
-//! groups behind load balancers, made by `crate::pcmhpa`) simulated over its load profile with
-//! SimOxide's HPA (`simoxide_spd::hpa`; SimOxide `DESIGN-SPD.md` §5.10, `docs/spec/hpa.md`).
+//! The simulation of an evaluation: a [`DynamicModel`] (plain PCM, with pod groups behind load
+//! balancers when it autoscales; made by `crate::evaluate`) simulated over its load profile,
+//! with SimOxide's HPA (`simoxide_spd::hpa`; SimOxide `DESIGN-SPD.md` §5.10, `docs/spec/hpa.md`)
+//! when it has pod groups. SimOxide's path monitoring (synchronous paths per session, call
+//! counts; MEAS-13) and busy-time hooks are on; the run pauses at the bin edges to read them.
 //!
 //! - **Structure.** One SPD elastic infrastructure per pod group (unit: its pod container), a
 //!   service group per assembly on the pod with its load balancer, one `HorizontalPodAutoscaler`
@@ -16,7 +18,7 @@
 use palladio_sim_service::protocol::WireModel;
 use palladio_sim_service::{schema, xmi};
 use simoxide_reconf::{QvtoAdjuster, QvtoCore, SpdAdjust};
-use simoxide_sim::{CompiledModel, Fast, Limits, LoadProfile, Mode, Outputs, RunSpec, Simulation};
+use simoxide_sim::{CompiledModel, Fast, Limits, LoadProfile, Mode, Outputs, Pause, RunSpec, Simulation};
 use simoxide_spd::Quirks;
 use simoxide_spd::hpa::{self, Hpa, HpaConfig};
 use simoxide_spd::log::{Log, Record};
@@ -53,6 +55,25 @@ pub struct DynamicModel {
     pub roots: [String; 4],
     /// SimOxide's usage streams (common random numbers).
     pub usage_streams: bool,
+    /// SimOxide's fix of SimuLizar's double resume at a fork join (REF-2).
+    pub fix_double_resume: bool,
+    /// The HPA controller's settings.
+    pub controller: Controller,
+}
+
+/// Settings of the HPA controller (Kubernetes' `kube-controller-manager` flags), in s.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Controller {
+    pub sync_s: f64,
+    pub tolerance: f64,
+    pub downscale_stabilisation_s: f64,
+    pub cpu_initialisation_s: f64,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Controller { sync_s: 15.0, tolerance: 0.1, downscale_stabilisation_s: 300.0, cpu_initialisation_s: 300.0 }
+    }
 }
 
 /// One autoscaled container of a [`DynamicModel`].
@@ -76,6 +97,8 @@ pub struct PodGroup {
     /// The HPA's request per pod, in the pod's cores.
     pub cpu_request: f64,
     pub pod_cores: f64,
+    /// A Kubernetes `spec.behavior` object, passed as is.
+    pub behavior: Option<serde_json::Value>,
 }
 
 /// A dynamic model ready to run: its files.
@@ -89,6 +112,9 @@ pub struct Prepared {
 pub fn prepare(dm: Arc<DynamicModel>, max_pods: u32) -> Result<Prepared, String> {
     let pcm = xmi::to_xmi(schema::schema(), &dm.pcm)?;
     let mut files = pcm.files;
+    if dm.groups.is_empty() {
+        return Ok(Prepared { model: dm, files });
+    }
     let (spd, sem) = spd_files(&dm, &files)?;
     files.push(("dynamic.spd".into(), spd));
     files.push(("dynamic.semanticspd".into(), sem));
@@ -182,8 +208,16 @@ fn hpa_json(dm: &DynamicModel, max_pods: u32) -> String {
                 "metrics": [{"type": "Resource", "resource": {"name": "cpu",
                     "target": {"type": "Utilization", "averageUtilization": (100.0 * g.target).round() as i64}}}]
             });
-            if let Some(w) = g.scale_down_s {
-                spec["behavior"] = serde_json::json!({"scaleDown": {"stabilizationWindowSeconds": (w * k).round() as i64}});
+            if let Some(b) = &g.behavior {
+                spec["behavior"] = b.clone();
+            }
+            if let Some(w) = g.scale_down_s
+                && spec["behavior"].get("scaleDown").is_none()
+            {
+                if !spec["behavior"].is_object() {
+                    spec["behavior"] = serde_json::json!({});
+                }
+                spec["behavior"]["scaleDown"] = serde_json::json!({"stabilizationWindowSeconds": (w * k).round() as i64});
             }
             let mut sx = serde_json::json!({"startupDelay": g.startup_s * k});
             if (g.cpu_request - g.pod_cores).abs() > 1e-9 {
@@ -199,9 +233,10 @@ fn hpa_json(dm: &DynamicModel, max_pods: u32) -> String {
         .collect();
     serde_json::json!({
         "controller": {
-            "syncPeriod": 15.0 * k,
-            "downscaleStabilization": 300.0 * k,
-            "cpuInitializationPeriod": 300.0 * k,
+            "syncPeriod": dm.controller.sync_s * k,
+            "tolerance": dm.controller.tolerance,
+            "downscaleStabilization": dm.controller.downscale_stabilisation_s * k,
+            "cpuInitializationPeriod": dm.controller.cpu_initialisation_s * k,
             "maxCreatedPods": max_pods,
         },
         "items": items,
@@ -242,17 +277,50 @@ fn core() -> Result<&'static QvtoCore, String> {
     CORE.get_or_init(|| QvtoCore::new().map_err(|e| format!("QVTo set-up: {e}"))).as_ref().map_err(Clone::clone)
 }
 
-/// What a dynamic run leaves: the measurements, the HPA log and summaries.
+/// A processing resource of the run (of the model, or of a pod created by a scale-out).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResInfo {
+    /// Its container's id, and the scaled container's when the container is a pod of one.
+    pub container: String,
+    pub unit: String,
+    /// The processing resource specification's id and its resource type's name.
+    pub spec: String,
+    pub kind: String,
+}
+
+/// What the run had done at one instant (a bin edge).
+#[derive(Clone, Debug, Default)]
+pub struct Reading {
+    /// Model time units.
+    pub at: f64,
+    /// Busy-time integral (model units) per [`RawRun::resources`] index, tracked since
+    /// `since` (model units); `None`: not tracked yet.
+    pub busy: Vec<Option<(f64, f64)>>,
+    /// Finished sessions: (scenario id, container ids, sessions).
+    pub sessions: Vec<(String, Vec<String>, u64)>,
+    /// External calls so far: (action id, count).
+    pub calls: Vec<(String, u64)>,
+    pub hpa: Vec<simoxide_spd::hpa::HpaSummary>,
+}
+
+/// What a run leaves: the measurements, the HPA log, the readings at the bin edges.
 pub struct RawRun {
     pub meas: simoxide_sim::Measurements,
     log: HpaLog,
-    pub at_warm: Vec<simoxide_spd::hpa::HpaSummary>,
-    pub at_end: Vec<simoxide_spd::hpa::HpaSummary>,
+    pub resources: Vec<ResInfo>,
+    /// One per edge reached, in order (the first at the window's start).
+    pub readings: Vec<Reading>,
+    /// The final reading (at the end of the run).
+    pub last: Reading,
+    /// The run stopped at the pod cap or a limit of the engine (`capped`), or failed: why.
     pub capped: bool,
+    /// The run hit the wall-clock limit.
+    pub timed_out: bool,
+    pub failure: Option<String>,
     pub events: u64,
     /// Simulated time at the end (model units).
     pub end: f64,
-    pub t0: Instant,
+    pub wall_ms: f64,
 }
 
 impl RawRun {
@@ -286,22 +354,96 @@ impl RawRun {
     }
 }
 
-/// Runs a prepared dynamic model with `seed` and keeps what it leaves.
-pub fn run_raw(p: &Prepared, seed: i64, limits: Limits) -> Result<RawRun, String> {
+/// Tracks the resources the run has that `res` does not list yet, and returns the reading at
+/// `at_ns` (the run paused before it).
+fn read(
+    sim: &mut Simulation<'_, Fast>,
+    units: &[(simoxide_model::ContainerId, simoxide_model::ContainerId)],
+    res: &mut Vec<ResInfo>,
+    idx: &mut Vec<u32>,
+    at_ns: i64,
+    hpa: Vec<simoxide_spd::hpa::HpaSummary>,
+) -> Reading {
+    let cm = sim.compiled();
+    let m = &cm.model;
+    let mut new = Vec::new();
+    for (ri, r) in cm.resources.iter().enumerate().skip(idx.last().map_or(0, |&i| i as usize + 1)) {
+        let simoxide_sim::ir::ResKind::Processing(pid) = r.kind else { continue };
+        let pr = &m.processing_resources[pid];
+        let Some(c) = pr.container else { continue };
+        let unit = units.iter().find(|x| x.0 == c).map_or(c, |x| x.1);
+        res.push(ResInfo {
+            container: m.containers[c].id.to_string(),
+            unit: m.containers[unit].id.to_string(),
+            spec: pr.id.to_string(),
+            kind: pr.resource_type.map(|t| m.resource_types[t].name.to_string()).unwrap_or_default(),
+        });
+        idx.push(ri as u32);
+        new.push(ri as u32);
+    }
+    let st = sim.state();
+    let sessions = st
+        .sync_paths(cm)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let ids = s
+                .containers
+                .iter()
+                .map(|&c| {
+                    let u = units.iter().find(|x| x.0 == c).map_or(c, |x| x.1);
+                    m.containers[u].id.to_string()
+                })
+                .collect();
+            (s.scenario_id, ids, s.sessions)
+        })
+        .collect();
+    let calls = st
+        .call_counts()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(a, n)| (cm.action_ids[a].to_string(), *n))
+        .collect();
+    let busy = idx.iter().map(|&ri| sim.busy_integral_at(ri, at_ns)).collect();
+    for ri in new {
+        sim.track_busy(ri);
+    }
+    Reading { at: at_ns as f64 / 1e9, busy, sessions, calls, hpa }
+}
+
+/// Runs a prepared model with `seed`, pausing at `edges` (model time units, increasing) to read
+/// what it did. An error before the run (an invalid model) is an `Err`; a run that fails, hits
+/// the pod cap or a limit returns what it had done (`failure`, `capped`).
+pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result<RawRun, String> {
     let t0 = Instant::now();
     let dm = &p.model;
     let k = units_per_s(dm);
     let usage = file_with(&p.files, ".usagemodel")?;
     let spec = RunSpec { usagemodel: Some(usage), ..RunSpec::default() };
     let model_files: Vec<&(String, String)> = p.files.iter().filter(|(n, _)| n != "hpa.json").collect();
-    let mut model = spec.load_model_memory(&model_files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect::<Vec<_>>())?;
-    let hpa_text = &p.files.iter().find(|(n, _)| n == "hpa.json").ok_or("no HPA configuration")?.1;
-    let cfg = HpaConfig::from_json(hpa_text)?;
-    hpa::attach(&mut model, &cfg)?;
-    let spd = spd_of(&model, Quirks::fixed()).map_err(|e| e.to_string())?.ok_or("the dynamic model has no SPD")?;
-    let hpa = Hpa::new(&cfg, &spd)?;
-    let cm = CompiledModel::compile(model).map_err(|e| format!("the dynamic model cannot be simulated: {e}"))?;
-    let mut sc = spec.sim_config("hpa");
+    let mut model = spec
+        .load_model_memory(&model_files.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect::<Vec<_>>())
+        .map_err(|e| format!("the PCM model is invalid: {e}"))?;
+    let hpa_cfg = match p.files.iter().find(|(n, _)| n == "hpa.json") {
+        Some((_, text)) => {
+            let cfg = HpaConfig::from_json(text)?;
+            hpa::attach(&mut model, &cfg)?;
+            Some(cfg)
+        }
+        None => None,
+    };
+    let spd = match &hpa_cfg {
+        Some(_) => Some(spd_of(&model, Quirks::fixed()).map_err(|e| e.to_string())?.ok_or("the dynamic model has no SPD")?),
+        None => None,
+    };
+    let hpa = match (&hpa_cfg, &spd) {
+        (Some(c), Some(s)) => Some(Hpa::new(c, s)?),
+        _ => None,
+    };
+    let cm = CompiledModel::compile(model).map_err(|e| format!("the model cannot be simulated: {e}"))?;
+    let mut sc = spec.sim_config("evaluate");
     sc.seed = seed;
     sc.max_sim_time = (dm.end_s * k).ceil() as i64;
     sc.max_measurements = -1;
@@ -312,35 +454,88 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits) -> Result<RawRun, String
     sc.limits = limits;
     sc.load_profile = Some(Arc::new(dm.profile.clone()));
     sc.usage_streams = dm.usage_streams;
-    let sim = Simulation::<Fast>::create(&cm, sc, Outputs::default()).map_err(|e| e.message)?;
-    let mut run = SpdRun::new(sim, &spd).map_err(|e| e.message)?.with_hpa(&hpa).map_err(|e| e.message)?;
-    let init: Vec<String> = dm.groups.iter().filter(|g| g.initial > 1).map(init_policy).collect();
-    run.enforce_policies(&init.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
-    let mut adj = QvtoAdjuster::spd(core()?, &SpdAdjust::new(&Quirks::fixed())).map_err(|e| e.to_string())?;
-    let mut log = HpaLog::default();
-    let warm_ns = (dm.warm_up_s * k * 1e9) as i64;
-    let mut capped = false;
-    let mut at_warm = Vec::new();
-    let r1 = run.run_until(&mut adj, &mut log, Some(warm_ns));
-    let r2 = match r1 {
-        Ok(_) => {
-            at_warm = run.hpa_summary();
-            run.run(&mut adj, &mut log)
+    sc.sync_paths = true;
+    sc.call_counts = true;
+    // SimuLizar's double resume at a synchronous fork join (REF-2) fixed
+    sc.fix_double_resume = dm.fix_double_resume;
+    let mut sim = Simulation::<Fast>::create(&cm, sc, Outputs::default()).map_err(|e| e.message)?;
+    let (mut res, mut idx) = (Vec::new(), Vec::new());
+    let _ = read(&mut sim, &[], &mut res, &mut idx, 0, Vec::new());
+    let mut readings = Vec::new();
+    let mut error: Option<simoxide_sim::SimError> = None;
+    let end_ns = |sim: &Simulation<'_, Fast>| sim.state().now_ns();
+    let (meas, events, end, last, log) = match (&spd, &hpa) {
+        (Some(spd), Some(hpa)) => {
+            let mut run = match SpdRun::new(sim, spd).and_then(|r| r.with_hpa(hpa)) {
+                Ok(r) => r,
+                Err(e) => return Err(format!("the dynamic model cannot be simulated: {}", e.message)),
+            };
+            let init: Vec<String> = dm.groups.iter().filter(|g| g.initial > 1).map(init_policy).collect();
+            run.enforce_policies(&init.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+            let mut adj = QvtoAdjuster::spd(core()?, &SpdAdjust::new(&Quirks::fixed())).map_err(|e| e.to_string())?;
+            let mut log = HpaLog::default();
+            for &e in edges {
+                let ns = (e * 1e9).round() as i64;
+                match run.run_until(&mut adj, &mut log, Some(ns)) {
+                    Ok(simoxide_sim::Status::Paused) => {
+                        let units = run.container_units().to_vec();
+                        let h = run.hpa_summary();
+                        readings.push(read(&mut run.sim, &units, &mut res, &mut idx, ns, h));
+                    }
+                    Ok(simoxide_sim::Status::Finished) => break,
+                    Err(x) => {
+                        error = Some(x);
+                        break;
+                    }
+                }
+            }
+            if error.is_none()
+                && let Err(x) = run.run(&mut adj, &mut log)
+            {
+                error = Some(x);
+            }
+            let units = run.container_units().to_vec();
+            let h = run.hpa_summary();
+            let now = end_ns(&run.sim);
+            let last = read(&mut run.sim, &units, &mut res, &mut idx, now, h);
+            let st = run.sim.state();
+            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, log)
         }
-        Err(e) => Err(e),
+        _ => {
+            for &e in edges {
+                let ns = (e * 1e9).round() as i64;
+                match sim.run_until(Pause::Before(ns)) {
+                    Ok(simoxide_sim::Status::Paused) => readings.push(read(&mut sim, &[], &mut res, &mut idx, ns, Vec::new())),
+                    Ok(simoxide_sim::Status::Finished) => break,
+                    Err(x) => {
+                        error = Some(x);
+                        break;
+                    }
+                }
+            }
+            if error.is_none()
+                && let Err(x) = sim.run_until(Pause::Never)
+            {
+                error = Some(x);
+            }
+            let now = end_ns(&sim);
+            let last = read(&mut sim, &[], &mut res, &mut idx, now, Vec::new());
+            let st = sim.state();
+            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, HpaLog::default())
+        }
     };
-    if let Err(e) = r2 {
-        // the pod cap, or a limit of the run (deadline, events): capped, not an error
-        if e.message.contains("maxCreatedPods") || e.kind == simoxide_sim::SimErrorKind::Limit {
-            capped = true;
+    let (mut capped, mut timed_out, mut failure) = (false, false, None);
+    if let Some(e) = error {
+        // the pod cap or the event limit: capped; the deadline: timed out
+        timed_out = e.kind == simoxide_sim::SimErrorKind::Cancelled;
+        capped = e.message.contains("maxCreatedPods") || e.kind == simoxide_sim::SimErrorKind::Limit;
+        failure = Some(if e.message.contains("maxCreatedPods") {
+            format!("the run created more pods than allowed (maxPods): {}", e.message)
+        } else if timed_out {
+            format!("the simulation hit its wall-clock limit (wallSeconds): {e}")
         } else {
-            return Err(format!("the dynamic run failed: {}", e.message));
-        }
+            format!("the simulation failed: {e}")
+        });
     }
-    let at_end = run.hpa_summary();
-    let events = run.sim.state().events();
-    let measurements = run.sim.state().measurements().clone();
-    let end = run.sim.state().now_ns() as f64 / 1e9;
-    drop(run);
-    Ok(RawRun { meas: measurements, log, at_warm, at_end, capped, events, end, t0 })
+    Ok(RawRun { meas, log, resources: res, readings, last, capped, timed_out, failure, events, end, wall_ms: t0.elapsed().as_secs_f64() * 1e3 })
 }

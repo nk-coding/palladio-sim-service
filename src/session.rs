@@ -17,6 +17,8 @@ struct HeldModel {
     model: Arc<WireModel>,
     /// The plain PCM of the model and its evaluations (`pcm*` functions).
     pcm: Option<Arc<crate::pcm::PcmCache>>,
+    /// Where the model was dumped (`SIM_DUMP_DIR`).
+    dumped: Option<std::path::PathBuf>,
 }
 
 pub struct Session {
@@ -69,6 +71,7 @@ impl Session {
                     id: model_id,
                     model: Arc::new(model),
                     pcm: None,
+                    dumped: None,
                 });
                 None
             }
@@ -132,7 +135,7 @@ impl Session {
             None => {
                 let model = held.model.clone();
                 if let Some(dir) = &self.config.dump_dir {
-                    crate::dump(dir, &model);
+                    held.dumped = crate::dump(dir, &model);
                 }
                 let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
                     .await
@@ -143,7 +146,8 @@ impl Session {
             }
         };
         let mut next = self.next_id;
-        let answer = functions::call(&self.config, operation, args, &self.lists, &cache, &mut || {
+        let dumped = held.dumped.clone();
+        let answer = functions::call(&self.config, operation, args, &self.lists, &cache, dumped.as_deref(), &mut || {
             let id = next;
             next -= 1;
             id

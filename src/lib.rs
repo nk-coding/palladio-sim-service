@@ -37,10 +37,12 @@ pub mod xmi;
 
 use protocol::WireModel;
 
-/// Writes a received model to `dir/<n>.txt`, for inspecting what the platform sent.
-pub fn dump(dir: &std::path::Path, model: &WireModel) {
+/// Writes a received model to `dir/received-<pid>-<n>.json` as the platform sent it (a wire
+/// model, [`mfile::to_wire_json`]), for inspecting it or evaluating it again on the command line.
+pub fn dump(dir: &std::path::Path, model: &WireModel) -> Option<std::path::PathBuf> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let _ = std::fs::create_dir_all(dir);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _ = std::fs::write(dir.join(format!("received-{n:06}.txt")), format!("{model:#?}"));
+    let path = dir.join(format!("received-{}-{n:06}.json", std::process::id()));
+    std::fs::write(&path, mfile::to_wire_json(model).to_string()).ok().map(|_| path)
 }

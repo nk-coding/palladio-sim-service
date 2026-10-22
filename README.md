@@ -51,7 +51,7 @@ build with it.
 | `SIM_TIMEOUT_SECONDS` | `600` | hard wall-clock limit per simulation (the call's `wallSeconds`, default 60, is usually lower) |
 | `SIM_MAX_EVENTS` | `0` (none) | hard event limit per simulation |
 | `MAX_SESSIONS` | `256` | concurrent script sessions |
-| `SIM_DUMP_DIR` | unset | writes every received model there (`received-*.txt`), for debugging |
+| `SIM_DUMP_DIR` | unset | writes every received model there as the platform sent it (`received-<pid>-<n>.json`, a wire model keeping every value's type) and every `pcmEvaluate` request beside it (`….request-<k>.json`); `palladio-sim-service evaluate received-….json ….request-<k>.json` re-runs exactly that evaluation |
 | `RUST_LOG` | `info` | log filter (tracing) |
 | `PCM_DETAIL_ENDPOINT` | unset | `1` enables `POST /pcm/detail` (unauthenticated simulations; leave off on a shared server) |
 
@@ -112,7 +112,12 @@ hpaCpuInitialisationSeconds = 300, maxPathSets = 10000, wallSeconds = 60, maxEve
   results are mapped back to the caller's instances, lists in canonical order. Residual:
   interchangeable instances (structurally identical, e.g. unused identical containers) are
   ordered by name; their values are equal as a multiset, which caller instance gets which may
-  follow the names.
+  follow the names. Nor does it depend on how values were sent: the platform sends integers as
+  `Int`, enums as `Enum` and unset attributes as empty lists, model data on disk has doubles,
+  strings and nulls; the canonical form normalises them, so the script path (`pcmEvaluate`) and
+  the command line (`evaluate`, `detail` on the model-data file) give the same evaluation
+  (`the_script_path_and_the_command_line_give_the_same_evaluation`, on a realised MiSArch design
+  as dumped from a search).
 - *Caching.* Deterministic, so cached per (digest of the model's canonical PCM, arguments) in the
   session's model and in the process (bounded by `SIM_RESULT_CACHE_SIZE` and `PCM_CACHE_MB`); a
   script can call `pcmEvaluate` with the same arguments in every metric function for one

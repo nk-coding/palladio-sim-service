@@ -201,6 +201,37 @@ impl Request {
         r
     }
 
+    /// The request as the JSON [`Request::from_json`] reads (the command line's and the design
+    /// detail's request): `from_json(to_json(r)) == r`.
+    pub fn to_json(&self) -> Value {
+        let mut v = json!({
+            "overrides": self.overrides.iter().map(|(r, n, rate)| json!({"resource": r, "replicas": n, "rate": rate})).collect::<Vec<_>>(),
+            "groups": self.groups.iter().map(|g| {
+                let mut x = json!({"container": g.container, "min": g.min, "max": g.max, "target": g.target, "initial": g.initial, "startupS": g.startup_s});
+                if let Some(s) = g.scale_down_s { x["scaleDownS"] = json!(s); }
+                if let Some(c) = g.cpu_request { x["cpuRequest"] = json!(c); }
+                if let Some(b) = &g.behavior { x["behavior"] = b.clone(); }
+                x
+            }).collect::<Vec<_>>(),
+            "services": self.services.iter().map(|s| json!({"container": s.container, "assembly": s.assembly, "loadBalancer": s.load_balancer})).collect::<Vec<_>>(),
+            "profile": self.profile.iter().map(|p| {
+                let mut x = json!({"timeS": p.time, "factor": p.factor});
+                if let Some(s) = &p.scenario { x["scenario"] = json!(s); }
+                x
+            }).collect::<Vec<_>>(),
+            "warmUpS": self.warm_up_s, "durationS": self.end_s, "binS": self.bin_s, "timeUnitMs": self.ms_per_unit,
+            "percentiles": self.percentiles, "detailCalls": self.detail_calls, "histogramPerDecade": self.histogram_per_decade,
+            "seed": self.seed, "usageStreams": self.usage_streams, "fixDoubleResume": self.fix_double_resume, "maxPods": self.max_pods,
+            "hpaSyncS": self.controller.sync_s, "hpaTolerance": self.controller.tolerance,
+            "hpaDownscaleStabilisationS": self.controller.downscale_stabilisation_s, "hpaCpuInitialisationS": self.controller.cpu_initialisation_s,
+            "maxPathSets": self.max_path_sets, "wallSeconds": self.wall_s, "maxEvents": self.max_events,
+        });
+        if v["groups"].as_array().is_some_and(Vec::is_empty) {
+            v.as_object_mut().unwrap().remove("groups");
+        }
+        v
+    }
+
     /// A canonical text of the request (cache key).
     pub fn key(&self) -> String {
         format!("{self:?}")

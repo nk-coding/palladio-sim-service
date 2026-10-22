@@ -55,6 +55,66 @@ fn fnv(s: &[u8]) -> u64 {
     h
 }
 
+/// The value of an attribute independent of how it was sent: numbers of any wire type as the same
+/// double, enum entries as their names (the platform sends `Enum`, model data a string), nothing
+/// for null. Two values that the XMI writer writes alike normalise alike.
+fn norm(v: &WireValue) -> Option<String> {
+    Some(match v {
+        WireValue::Null => return None,
+        WireValue::Bool(b) => format!("b:{b}"),
+        WireValue::Int(x) => format!("n:{:?}", f64::from(*x)),
+        WireValue::Long(x) => format!("n:{:?}", *x as f64),
+        WireValue::Float(x) => format!("n:{:?}", f64::from(*x)),
+        WireValue::Double(x) => format!("n:{:?}", x),
+        WireValue::String(t) => format!("s:{t}"),
+        WireValue::Enum { entry, .. } => format!("s:{entry}"),
+        WireValue::Instance(t) => format!("i:{t}"),
+        other => format!("{other:?}"),
+    })
+}
+
+/// The attributes of an instance that carry a value, normalised ([`norm`]) and sorted: unset
+/// attributes (no value, or null; the platform sends them empty, model data as null or not at
+/// all) are left out.
+pub fn attributes_key(x: &WireInstance, with_entity: bool) -> Vec<String> {
+    let mut attrs: Vec<String> = x
+        .attributes
+        .iter()
+        .filter(|(k, _)| with_entity || k != "entityName")
+        .filter_map(|(k, v)| {
+            let vs: Vec<String> = v.iter().filter_map(norm).collect();
+            (!vs.is_empty()).then(|| format!("{k}={}", vs.join("\u{1f}")))
+        })
+        .collect();
+    attrs.sort();
+    attrs
+}
+
+/// A text of a model that does not depend on how its values were sent (wire types, unset
+/// attributes): what the digest of the evaluations' cache hashes.
+pub fn normal_text(m: &WireModel) -> String {
+    let mut out = String::new();
+    for x in &m.instances {
+        out.push_str(&x.name);
+        out.push('\u{1e}');
+        out.push_str(&x.class_name);
+        for a in attributes_key(x, true) {
+            out.push('\u{1e}');
+            out.push_str(&a);
+        }
+        let mut refs: Vec<&(String, Vec<String>)> = x.references.iter().filter(|(_, t)| !t.is_empty()).collect();
+        refs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (f, ts) in refs {
+            out.push('\u{1e}');
+            out.push_str(f);
+            out.push('=');
+            out.push_str(&ts.join(","));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The canonical name of colour `c`.
 pub fn name_of(c: usize) -> String {
     format!("_c{c}")
@@ -106,8 +166,7 @@ pub fn canonicalise(model: &WireModel) -> Canonical {
     let init: Vec<u64> = insts
         .iter()
         .map(|x| {
-            let mut attrs: Vec<String> = x.attributes.iter().filter(|(k, _)| k != "entityName").map(|(k, v)| format!("{k}={v:?}")).collect();
-            attrs.sort();
+            let attrs = attributes_key(x, false);
             let mut h = fnv(x.class_name.as_bytes());
             for a in &attrs {
                 h = mix(h ^ fnv(a.as_bytes()));
@@ -181,20 +240,27 @@ pub fn canonicalise(model: &WireModel) -> Canonical {
         .iter()
         .map(|&i| {
             let x = &insts[i];
+            // unset attributes left out (however they were sent); the entity name canonical
             let attributes = x
                 .attributes
                 .iter()
+                .filter(|(_, v)| v.iter().any(|w| norm(w).is_some()))
                 .map(|(k, v)| if k == "entityName" { (k.clone(), vec![WireValue::String(canon[i].clone())]) } else { (k.clone(), v.clone()) })
                 .collect();
-            let references = x
+            let mut attributes: Vec<(String, Vec<WireValue>)> = attributes;
+            attributes.sort_by(|a, b| a.0.cmp(&b.0));
+            // reference lists sorted by colour, empty ones left out, features in name order
+            let mut references: Vec<(String, Vec<String>)> = x
                 .references
                 .iter()
+                .filter(|(_, ts)| ts.iter().any(|t| index.contains_key(t.as_str())))
                 .map(|(f, ts)| {
                     let mut ts: Vec<(u32, String)> = ts.iter().filter_map(|t| index.get(t.as_str()).map(|&j| (colour[j as usize], canon[j as usize].clone()))).collect();
                     ts.sort();
                     (f.clone(), ts.into_iter().map(|(_, t)| t).collect())
                 })
                 .collect();
+            references.sort_by(|a, b| a.0.cmp(&b.0));
             WireInstance { name: canon[i].clone(), class_name: x.class_name.clone(), attributes, references }
         })
         .collect();
@@ -319,4 +385,46 @@ mod tests {
         assert_eq!(a.ties, 1);
         assert_eq!(format!("{:?}", a.model), format!("{:?}", b.model));
     }
+
+    #[test]
+    fn how_values_are_sent_does_not_matter() {
+        // as the platform sends it (typed numbers, enums, unset attributes empty) and as model data
+        let attr = |k: &str, v: Vec<WireValue>| (k.to_string(), v);
+        let a = WireModel {
+            metamodel_path: "m".into(),
+            instances: vec![
+                WireInstance {
+                    name: "s".into(),
+                    class_name: "Spec".into(),
+                    attributes: vec![
+                        attr("numberOfReplicas", vec![WireValue::Int(2)]),
+                        attr("schedulingPolicy", vec![WireValue::Enum { enum_name: "SchedulingPolicy".into(), entry: "FCFS".into() }]),
+                        attr("MTTR", vec![]),
+                        attr("entityName", vec![]),
+                    ],
+                    references: vec![("c".into(), vec!["t".into()])],
+                },
+                inst("t", "T", "t", &[]),
+                inst("u", "T", "u", &[("x", &["s"])]),
+            ],
+        };
+        let b = WireModel {
+            metamodel_path: "other".into(),
+            instances: vec![
+                inst("t2", "T", "t", &[]),
+                inst("u2", "T", "u", &[("x", &["s2"])]),
+                WireInstance {
+                    name: "s2".into(),
+                    class_name: "Spec".into(),
+                    attributes: vec![attr("schedulingPolicy", vec![WireValue::String("FCFS".into())]), attr("numberOfReplicas", vec![WireValue::Double(2.0)]), attr("MTTR", vec![WireValue::Null])],
+                    references: vec![("c".into(), vec!["t2".into()])],
+                },
+            ],
+        };
+        let (ca, cb) = (canonicalise(&a), canonicalise(&b));
+        assert_eq!(normal_text(&ca.model), normal_text(&cb.model));
+        let names = |c: &Canonical| c.model.instances.iter().map(|x| (x.name.clone(), x.references.clone())).collect::<Vec<_>>();
+        assert_eq!(names(&ca), names(&cb));
+    }
 }
+

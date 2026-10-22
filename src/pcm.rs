@@ -45,8 +45,8 @@ impl PcmCache {
     pub fn digest(&self) -> [u8; 32] {
         *self.digest.get_or_init(|| {
             let mut h = Sha256::new();
-            // the instances only: equal designs from other files are equal
-            h.update(format!("{:?}", self.plain.instances).as_bytes());
+            // the instances only, independent of how values were sent: equal designs are equal
+            h.update(crate::canon::normal_text(&self.plain).as_bytes());
             h.finalize().into()
         })
     }

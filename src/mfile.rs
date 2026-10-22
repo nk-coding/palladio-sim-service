@@ -315,3 +315,101 @@ pub fn from_model_data(v: &serde_json::Value) -> Result<WireModel, String> {
     }
     Ok(model)
 }
+
+/// A wire model as JSON that keeps every value's wire type (`{"format": "wire-model", …}`):
+/// what `SIM_DUMP_DIR` writes for every model a session receives, and what the command line reads
+/// back ([`from_wire_json`]), so a model exactly as the platform sent it can be evaluated again.
+pub fn to_wire_json(m: &crate::protocol::WireModel) -> serde_json::Value {
+    use crate::protocol::WireValue as W;
+    use serde_json::json;
+    fn value(v: &W) -> serde_json::Value {
+        match v {
+            W::Null => json!("Null"),
+            W::Bool(b) => json!({"Bool": b}),
+            W::Int(i) => json!({"Int": i}),
+            W::Long(i) => json!({"Long": i}),
+            W::Float(x) => json!({"Float": x}),
+            W::Double(x) => json!({"Double": x}),
+            W::String(s) => json!({"String": s}),
+            W::Instance(s) => json!({"Instance": s}),
+            W::Enum { enum_name, entry } => json!({"Enum": [enum_name, entry]}),
+            W::Ref(i) => json!({"Ref": i}),
+            other => json!({"Unsupported": format!("{other:?}")}),
+        }
+    }
+    json!({
+        "format": "wire-model",
+        "metamodelPath": m.metamodel_path,
+        "instances": m.instances.iter().map(|x| json!({
+            "name": x.name,
+            "className": x.class_name,
+            "attributes": x.attributes.iter().map(|(k, vs)| json!([k, vs.iter().map(value).collect::<Vec<_>>()])).collect::<Vec<_>>(),
+            "references": x.references.iter().map(|(k, ts)| json!([k, ts])).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The model of [`to_wire_json`]'s JSON.
+pub fn from_wire_json(v: &serde_json::Value) -> Result<crate::protocol::WireModel, String> {
+    use crate::protocol::{WireInstance, WireModel, WireValue as W};
+    fn value(v: &serde_json::Value) -> Result<W, String> {
+        if v == "Null" {
+            return Ok(W::Null);
+        }
+        let o = v.as_object().filter(|o| o.len() == 1).ok_or_else(|| format!("not a wire value: {v}"))?;
+        let (k, x) = o.iter().next().unwrap();
+        let num = || x.as_f64().ok_or_else(|| format!("{k} needs a number: {x}"));
+        let int = || x.as_i64().ok_or_else(|| format!("{k} needs an integer: {x}"));
+        let s = || x.as_str().map(str::to_string).ok_or_else(|| format!("{k} needs a string: {x}"));
+        Ok(match k.as_str() {
+            "Bool" => W::Bool(x.as_bool().ok_or("Bool needs a boolean")?),
+            "Int" => W::Int(int()? as i32),
+            "Long" => W::Long(int()?),
+            "Float" => W::Float(num()? as f32),
+            "Double" => W::Double(num()?),
+            "String" => W::String(s()?),
+            "Instance" => W::Instance(s()?),
+            "Ref" => W::Ref(int()?),
+            "Enum" => W::Enum {
+                enum_name: x[0].as_str().unwrap_or_default().to_string(),
+                entry: x[1].as_str().unwrap_or_default().to_string(),
+            },
+            other => return Err(format!("unsupported wire value {other}")),
+        })
+    }
+    let mut instances = Vec::new();
+    for i in v["instances"].as_array().ok_or("no instances")? {
+        let pairs = |key: &str| -> Vec<(String, &serde_json::Value)> {
+            i[key].as_array().into_iter().flatten().filter_map(|p| Some((p[0].as_str()?.to_string(), &p[1]))).collect()
+        };
+        let mut attributes = Vec::new();
+        for (k, vs) in pairs("attributes") {
+            attributes.push((k, vs.as_array().into_iter().flatten().map(value).collect::<Result<Vec<_>, _>>()?));
+        }
+        let references = pairs("references")
+            .into_iter()
+            .map(|(k, ts)| (k, ts.as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect()))
+            .collect();
+        instances.push(WireInstance {
+            name: i["name"].as_str().ok_or("an instance without a name")?.to_string(),
+            class_name: i["className"].as_str().unwrap_or_default().to_string(),
+            attributes,
+            references,
+        });
+    }
+    Ok(WireModel { metamodel_path: v["metamodelPath"].as_str().unwrap_or_default().to_string(), instances })
+}
+
+/// A model file: `.m` text, model data as the platform stores it (`.json`), or a wire model
+/// (`.json` with `"format": "wire-model"`, see [`to_wire_json`]).
+pub fn read_any(path: &std::path::Path) -> Result<crate::protocol::WireModel, String> {
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        return read(path);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if v["format"] == "wire-model" {
+        return from_wire_json(&v).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    from_model_data(&v).map_err(|e| format!("{}: {e}", path.display()))
+}

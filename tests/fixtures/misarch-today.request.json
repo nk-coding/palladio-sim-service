@@ -1,0 +1,450 @@
+{
+ "overrides": [
+  {
+   "resource": "scCpu12",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu30",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu16",
+   "replicas": 200,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu24",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu33",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu1",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu21",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu31",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu26",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu22",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu14",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu4",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu2",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu23",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu10",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu28",
+   "replicas": 50,
+   "rate": 1000.0
+  },
+  {
+   "resource": "scCpu6",
+   "replicas": 50,
+   "rate": 1000.0
+  }
+ ],
+ "groups": [
+  {
+   "container": "OrderService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "MediaService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "GatewayServer",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 2.4
+  },
+  {
+   "container": "ReviewService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "CategoryService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "ShoppingCartService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "UserAddressService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "WishlistService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "CouponService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "InvoiceService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "ProductItemService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "UserService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "PaymentService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "ReturnService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "NotificationService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "TaxRateService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  },
+  {
+   "container": "ShipmentService",
+   "min": 1,
+   "max": 50,
+   "target": 0.7,
+   "initial": 1,
+   "startupS": 30.0,
+   "cpuRequest": 1.0
+  }
+ ],
+ "services": [],
+ "profile": [
+  {
+   "timeS": 780.0,
+   "factor": 3.9,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 1080.0,
+   "factor": 0.388889,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 900.0,
+   "factor": 1.3,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 300.0,
+   "factor": 0.8,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 1080.0,
+   "factor": 1.375,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 600.0,
+   "factor": 1.6,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 900.0,
+   "factor": 1.3,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 600.0,
+   "factor": 1.6,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 660.0,
+   "factor": 1.0,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 1080.0,
+   "factor": 0.333333,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 0.0,
+   "factor": 0.2,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 600.0,
+   "factor": 1.6,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 780.0,
+   "factor": 0.4875,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 300.0,
+   "factor": 0.8,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 900.0,
+   "factor": 1.3,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 660.0,
+   "factor": 1.0,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 900.0,
+   "factor": 1.3,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 420.0,
+   "factor": 1.0,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 0.0,
+   "factor": 0.825,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 660.0,
+   "factor": 1.0,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 420.0,
+   "factor": 1.0,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 780.0,
+   "factor": 1.95,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 1080.0,
+   "factor": 0.277778,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 0.0,
+   "factor": 0.166667,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 300.0,
+   "factor": 0.8,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 420.0,
+   "factor": 1.0,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 420.0,
+   "factor": 1.0,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 0.0,
+   "factor": 0.233333,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 1200.0,
+   "factor": 0.166667,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 1200.0,
+   "factor": 0.233333,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 1200.0,
+   "factor": 0.2,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 1200.0,
+   "factor": 0.825,
+   "scenario": "session_browser"
+  },
+  {
+   "timeS": 780.0,
+   "factor": 3.177778,
+   "scenario": "session_account"
+  },
+  {
+   "timeS": 300.0,
+   "factor": 0.8,
+   "scenario": "session_cartAbandoner"
+  },
+  {
+   "timeS": 660.0,
+   "factor": 1.0,
+   "scenario": "session_buyer"
+  },
+  {
+   "timeS": 600.0,
+   "factor": 1.6,
+   "scenario": "session_browser"
+  }
+ ],
+ "warmUpS": 120.0,
+ "durationS": 1320.0,
+ "binS": 10.0,
+ "timeUnitMs": 1000.0,
+ "percentiles": [
+  50.0,
+  90.0,
+  95.0,
+  99.0
+ ],
+ "detailCalls": false,
+ "histogramPerDecade": 10,
+ "seed": 1,
+ "usageStreams": true,
+ "fixDoubleResume": true,
+ "maxPods": 400,
+ "hpaSyncS": 15.0,
+ "hpaTolerance": 0.1,
+ "hpaDownscaleStabilisationS": 300.0,
+ "hpaCpuInitialisationS": 300.0,
+ "maxPathSets": 10000,
+ "wallSeconds": 900.0,
+ "maxEvents": 200000000
+}

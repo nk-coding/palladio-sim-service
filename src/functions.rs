@@ -634,10 +634,18 @@ pub async fn call(
     args: &[WireValue],
     lists: &Lists,
     cache: &Arc<crate::pcm::PcmCache>,
+    dumped: Option<&std::path::Path>,
     next_id: &mut impl FnMut() -> i64,
 ) -> Result<Answer, String> {
     let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
-    let req = Args { f, args }.request(lists)?.canonical(&cache.canon);
+    let req = Args { f, args }.request(lists)?;
+    // with SIM_DUMP_DIR: the request next to the dumped model, for `palladio-sim-service evaluate`
+    if let Some(m) = dumped {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::write(m.with_extension(format!("request-{n:04}.json")), req.to_json().to_string());
+    }
+    let req = req.canonical(&cache.canon);
     let e = evaluate::evaluator(config).evaluate(cache, req).await.map_err(|e| cache.canon.orig_text(&e, false))?;
     Ok(evaluation(&e.to_caller(&cache.canon), next_id))
 }

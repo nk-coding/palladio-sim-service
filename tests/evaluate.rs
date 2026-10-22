@@ -287,7 +287,7 @@ async fn the_script_function() {
         n += 1;
         n
     };
-    let a = functions::call(&engine, "pcmEvaluate", &args, &lists, &cache, &mut next).await.unwrap();
+    let a = functions::call(&engine, "pcmEvaluate", &args, &lists, &cache, None, &mut next).await.unwrap();
     let field = |v: &WireValue, k: &str| -> WireValue {
         let WireValue::Record { fields, .. } = v else { panic!("not a record: {v:?}") };
         fields.iter().find(|(n, _)| n == k).unwrap_or_else(|| panic!("no {k}")).1.clone()
@@ -310,7 +310,7 @@ async fn the_script_function() {
     let res = list(&a.objects, field(&a.value, "resources"));
     assert_eq!(list(&a.objects, field(&res[0], "binUtilisation")).len(), 10);
     // cached: the second call is the first's evaluation
-    let b = functions::call(&engine, "pcmEvaluate", &args, &lists, &cache, &mut next).await.unwrap();
+    let b = functions::call(&engine, "pcmEvaluate", &args, &lists, &cache, None, &mut next).await.unwrap();
     assert_eq!(field(&b.value, "wallMs"), field(&a.value, "wallMs"));
 }
 
@@ -444,4 +444,130 @@ fn a_realised_misarch_design_does_not_depend_on_names_or_order() {
     let cache = PcmCache::new(&m);
     eprintln!("{}: {} PCM instances, canonical form {:.0} ms ({} ties), cache built in {:.0} ms", path.display(), cache.plain.instances.len(), cache.canon_ms, cache.canon.ties, t0.elapsed().as_secs_f64() * 1e3);
     invariant(&m, &Request { ..steady(0.0, 60.0) }, rename_request);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The script path and the command-line path give the same evaluation
+
+fn gunzip_json(name: &str) -> serde_json::Value {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("gzip").arg("-dc").arg(&path).output().expect("gzip");
+    assert!(out.status.success(), "{path}");
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// A realised MiSArch design (the domain project's today, day profile) as the platform sent it to
+/// the plugin in a search (`misarch-today.wire.json.gz`, dumped with SIM_DUMP_DIR: integer
+/// attributes as Int, enums as Enum, unset attributes as empty lists) and as model data on disk
+/// (`misarch-today.model-data.json.gz`: the file the explorer's `detail` reads), with the search's
+/// request (`misarch-today.request.json`). Both paths must give one canonical model (digest) and
+/// the same evaluation: the script function on the wire model, the command line's evaluation on
+/// the model data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_script_path_and_the_command_line_give_the_same_evaluation() {
+    use palladio_sim_service::functions;
+    let wire = mfile::from_wire_json(&gunzip_json("misarch-today.wire.json.gz")).unwrap();
+    let data = mfile::from_model_data(&gunzip_json("misarch-today.model-data.json.gz")).unwrap();
+    let (cw, cd) = (PcmCache::new(&wire), PcmCache::new(&data));
+    assert_eq!(cw.digest(), cd.digest(), "one canonical model");
+    assert_eq!(format!("{:?}", cw.plain.instances.iter().map(|x| (&x.name, &x.class_name, &x.references)).collect::<Vec<_>>()),
+        format!("{:?}", cd.plain.instances.iter().map(|x| (&x.name, &x.class_name, &x.references)).collect::<Vec<_>>()));
+    // the search's request, a shorter run
+    let mut rv: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/misarch-today.request.json")).unwrap()).unwrap();
+    rv["durationS"] = serde_json::json!(420.0);
+    let req = Request::from_json(&rv).unwrap();
+    assert_eq!(Request::from_json(&req.to_json()).unwrap(), req, "the request's JSON round trip");
+    // the command line's path
+    let want = evaluate::run_caller(&cd, &req, Monitors::default(), Default::default()).unwrap();
+    assert!(!want.failed, "{}", want.message);
+    // the script path: the request as the script's records and arguments
+    let rec = |c: &str, f: Vec<(&str, WireValue)>| WireValue::Record { class_name: c.into(), fields: f.into_iter().map(|(k, v)| (k.to_string(), v)).collect() };
+    let inst = |n: &serde_json::Value| WireValue::Instance(n.as_str().unwrap().to_string());
+    let d = |x: &serde_json::Value| WireValue::Double(x.as_f64().unwrap());
+    let i = |x: &serde_json::Value| WireValue::Int(x.as_f64().unwrap() as i32);
+    let mut lists: HashMap<i64, Vec<WireValue>> = HashMap::new();
+    lists.insert(1, rv["profile"].as_array().unwrap().iter().map(|p| rec("PcmLoadStep", vec![("scenario", p.get("scenario").map_or(WireValue::Null, inst)), ("time", d(&p["timeS"])), ("factor", d(&p["factor"]))])).collect());
+    lists.insert(
+        2,
+        rv["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                rec(
+                    "PcmScalingGroup",
+                    vec![
+                        ("container", inst(&g["container"])),
+                        ("minReplicas", i(&g["min"])),
+                        ("maxReplicas", i(&g["max"])),
+                        ("targetUtilisation", d(&g["target"])),
+                        ("initialReplicas", i(&g["initial"])),
+                        ("startupSeconds", d(&g["startupS"])),
+                        ("scaleDownSeconds", g.get("scaleDownS").map_or(WireValue::Double(-1.0), d)),
+                        ("cpuRequest", g.get("cpuRequest").map_or(WireValue::Double(0.0), d)),
+                        ("behaviorJson", WireValue::String(String::new())),
+                    ],
+                )
+            })
+            .collect(),
+    );
+    lists.insert(3, vec![]);
+    lists.insert(4, rv["overrides"].as_array().unwrap().iter().map(|o| rec("PcmOverride", vec![("resource", inst(&o["resource"])), ("replicas", i(&o["replicas"])), ("rate", d(&o["rate"]))])).collect());
+    lists.insert(5, rv["percentiles"].as_array().unwrap().iter().map(d).collect());
+    let args = vec![
+        d(&rv["durationS"]),
+        d(&rv["warmUpS"]),
+        d(&rv["binS"]),
+        d(&rv["timeUnitMs"]),
+        WireValue::Ref(1),
+        WireValue::Ref(2),
+        WireValue::Ref(3),
+        WireValue::Ref(4),
+        WireValue::Ref(5),
+        WireValue::Bool(false),
+        i(&rv["histogramPerDecade"]),
+        i(&rv["seed"]),
+        WireValue::Bool(true),
+        WireValue::Bool(true),
+        i(&rv["maxPods"]),
+        d(&rv["hpaSyncS"]),
+        d(&rv["hpaTolerance"]),
+        d(&rv["hpaDownscaleStabilisationS"]),
+        d(&rv["hpaCpuInitialisationS"]),
+        i(&rv["maxPathSets"]),
+        d(&rv["wallSeconds"]),
+        WireValue::Long(rv["maxEvents"].as_i64().unwrap()),
+    ];
+    let config = Arc::new(Config::from_env().unwrap());
+    let mut n = 0;
+    let mut next = move || {
+        n -= 1;
+        n
+    };
+    let a = functions::call(&config, "pcmEvaluate", &args, &lists, &Arc::new(cw), None, &mut next).await.unwrap();
+    let field = |v: &WireValue, k: &str| -> WireValue {
+        let WireValue::Record { fields, .. } = v else { panic!("not a record: {v:?}") };
+        fields.iter().find(|(n, _)| n == k).unwrap_or_else(|| panic!("no {k}")).1.clone()
+    };
+    let list = |v: WireValue| -> Vec<WireValue> {
+        let WireValue::Ref(id) = v else { panic!("{v:?}") };
+        a.objects.iter().find(|o| o.id == id).unwrap().elements.clone().unwrap()
+    };
+    assert_eq!(field(&a.value, "failed"), WireValue::Bool(false));
+    assert_eq!(field(&a.value, "events"), WireValue::Long(want.events as i64));
+    assert_eq!(field(&a.value, "peakPods"), WireValue::Double(want.peak_pods));
+    let ops = list(field(&a.value, "operations"));
+    assert_eq!(ops.len(), want.operations.len());
+    for (o, w) in ops.iter().zip(&want.operations) {
+        assert_eq!(field(o, "key"), WireValue::String(w.key.clone()));
+        assert_eq!(field(o, "count"), WireValue::Long(w.count as i64));
+        assert_eq!(list(field(o, "percentilesMs")), w.percentiles_ms.iter().map(|x| WireValue::Double(*x)).collect::<Vec<_>>());
+    }
+    let res = list(field(&a.value, "resources"));
+    for (r, w) in res.iter().zip(&want.resources) {
+        assert_eq!(field(r, "container"), WireValue::Instance(w.container.clone()));
+        assert_eq!(field(r, "maxBinUtilisation"), WireValue::Double(w.max_bin_utilisation));
+        assert_eq!(field(r, "replicaCoreSeconds"), WireValue::Double(w.replica_core_seconds));
+    }
+    assert_eq!(list(field(&a.value, "pathSets")).len(), want.path_sets.len());
 }

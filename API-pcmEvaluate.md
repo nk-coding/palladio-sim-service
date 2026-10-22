@@ -23,7 +23,10 @@ refers to the caller's own instances, and its lists come in the canonical order 
 equal lists). Residual: instances that the structure cannot tell apart (interchangeable ones,
 e.g. two identical unused containers or two identical branches) are ordered by their names;
 their measurements are the same multiset either way, but which of the caller's instances
-carries which value may follow the names. Deterministic in every case.
+carries which value may follow the names. Deterministic in every case. Nor do results depend on
+how the model's values were sent (the platform's typed integers, enums and empty unset
+attributes vs model data's doubles, strings and nulls): the script function and the command line
+(`evaluate`, `detail`) give the same evaluation of the same model and request.
 
 ## Signature
 

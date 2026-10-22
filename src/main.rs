@@ -112,12 +112,7 @@ fn detail_cmd(args: &[String], evaluate: bool) -> Result<(), String> {
 }
 
 fn read_any(path: &Path) -> Result<palladio_sim_service::protocol::WireModel, String> {
-    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-        return mfile::read(path);
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    mfile::from_model_data(&v).map_err(|e| format!("{}: {e}", path.display()))
+    mfile::read_any(path)
 }
 
 fn gen_metamodel(dir: &Path) -> Result<(), String> {

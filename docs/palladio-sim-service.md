@@ -123,26 +123,27 @@ SIM_THREADS=22 cargo test --release --test session throughput -- --ignored --noc
 
 `palladio-sim-service gen-metamodel [DIR]` writes the metamodel into `DIR`. It is generated from
 SimOxide's PCM 5.2 Ecore tables and holds the classes and features the simulator reads, 155
-classes. It comes in parts, which `palladio.mm` gathers; models and scripts use `palladio.mm`.
+classes. Models and scripts use `palladio.mm`.
 
-| File | Classes | Contents |
-| --- | --- | --- |
-| `palladio.mm` | | Imports the parts; the mapping rules |
-| `pcm/repository.mm` | 33 | Component types, interfaces, signatures, roles, data types |
-| `pcm/architecture.mm` | 70 | Components, their behaviour (SEFFs), parameter usages, the system, the usage model |
-| `pcm/deployment.mm` | 8 | Resource environment and allocation |
-| `pcm/measurement.mm` | 44 | Monitors, measurement specifications, measuring points |
+| File | Contents |
+| --- | --- |
+| `pcm/repository.mm` | The base part, which imports nothing: component types, interfaces, signatures, roles, data types (33 classes) |
+| `palladio.mm` | Imports the base part and holds everything else (122 classes); the mapping rules; one view per package group |
 
-Each part imports only the parts before it. Every class starts in the part of its PCM package
-and moves to a later one only where the metamodel language requires it:
+A class lives in the base part when its PCM package is `pcm.core` or `pcm.repository`, unless the
+metamodel language forces it into `palladio.mm`:
 - A file may name an association end only on a class of its own. A containment or pair of
   opposites is named at both ends, so its two classes share a file.
 - Parameter usages (`VariableUsage`) are contained by component implementations, SEFF actions,
-  assembly contexts and usage model calls. Components, SEFFs, composition and the usage model
-  therefore share `architecture.mm`.
+  assembly contexts and usage model calls, so these share `palladio.mm`.
 - Only `BasicComponent`, `CompositeComponent`, `ImplementationComponentType` and `PassiveResource`
-  move: from the repository to `architecture.mm`.
-- Each enum lives in the first part that uses it.
+  move.
+- Each enum lives in the first file that uses it.
+
+Where a class lives does not decide how the metamodel is shown: `palladio.mm` declares a view for
+every package group (`Core`, `Repository`, `Behaviour`, `Parameters`, `Composition`,
+`ResourceEnvironment`, `Allocation`, `UsageModel`, `Monitoring`), listing the group's classes from
+either file. The metamodel editor switches between them in its toolbox.
 
 `cargo test` checks these rules on the generated layout (`mm::tests`).
 

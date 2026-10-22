@@ -7,7 +7,7 @@ use std::fmt::Write;
 /// Words the metamodel, model or script languages reserve; a name that is one is written quoted.
 const KEYWORDS: &[&str] = &[
     "abstract", "as", "break", "class", "continue", "else", "enum", "extends", "false", "for", "fun", "if",
-    "import", "in", "is", "null", "record", "return", "true", "using", "val", "var", "void", "while",
+    "import", "in", "is", "null", "record", "return", "true", "using", "val", "var", "view", "void", "while",
 ];
 
 /// A name as the mdeo languages read it: quoted with backticks unless it is a plain identifier.
@@ -18,29 +18,40 @@ pub fn ident(name: &str) -> String {
     if plain { name.to_string() } else { format!("`{name}`") }
 }
 
-/// The files of the metamodel beside the aggregate `palladio.mm`, in import order (a file may
-/// import only files before it): name, heading and contents.
-pub const FILES: &[(&str, &str, &str)] = &[
-    ("repository.mm", "Repository", "component types, interfaces, signatures, roles and data types"),
-    ("architecture.mm", "Architecture", "components, their behaviour (SEFFs), the system and the usage model"),
-    ("deployment.mm", "Deployment", "the resource environment and the allocation of the system onto it"),
-    ("measurement.mm", "Measurement", "monitors, measurement specifications and measuring points"),
+/// The files of the metamodel in import order (a file may import only files before it): path
+/// relative to the aggregate, and contents.
+///
+/// The base part holds what the rest of PCM builds on and imports nothing; everything else lives
+/// in the aggregate `palladio.mm`, which models and scripts use. Views of the aggregate show the
+/// metamodel by package group (see [`SECTIONS`]), whichever file a class lives in.
+pub const FILES: &[(&str, &str)] = &[
+    ("pcm/repository.mm", "component types, interfaces, signatures, roles and data types"),
+    (AGGREGATE, "everything else, and a view of every package group"),
 ];
 
-/// The directory of [`FILES`], relative to the aggregate.
-pub const DIR: &str = "pcm";
+/// The file models and scripts use.
+pub const AGGREGATE: &str = "palladio.mm";
 
-/// The package groups of a file, in the order the file lists them.
-const SECTIONS: &[(&str, &[&str])] = &[
-    ("Core: named elements and roles", &["pcm.core", "pcm.core.entity"]),
-    ("Repository: components, interfaces, signatures, data types", &["pcm.repository", "pcm.subsystem"]),
-    ("Behaviour (SEFFs): actions, resource demands, calls", &["pcm.seff", "pcm.seff.seff_performance", "pcm.seff.seff_reliability"]),
-    ("Parameters: variable usages and characterisations", &["pcm.parameter"]),
-    ("Composition and system: assembly contexts and connectors", &["pcm.core.composition", "pcm.system"]),
-    ("Resource environment: containers, processing and linking resources", &["pcm.resourceenvironment"]),
-    ("Allocation", &["pcm.allocation"]),
-    ("Usage model: scenarios, workloads, user behaviour", &["pcm.usagemodel"]),
+/// The package groups: the view showing them, and their heading in the file that lists them.
+const SECTIONS: &[(&str, &str, &[&str])] = &[
+    ("Core", "Core: named elements and roles", &["pcm.core", "pcm.core.entity"]),
+    ("Repository", "Repository: components, interfaces, signatures, data types", &["pcm.repository", "pcm.subsystem"]),
     (
+        "Behaviour",
+        "Behaviour (SEFFs): actions, resource demands, calls",
+        &["pcm.seff", "pcm.seff.seff_performance", "pcm.seff.seff_reliability"],
+    ),
+    ("Parameters", "Parameters: variable usages and characterisations", &["pcm.parameter"]),
+    ("Composition", "Composition and system: assembly contexts and connectors", &["pcm.core.composition", "pcm.system"]),
+    (
+        "ResourceEnvironment",
+        "Resource environment: containers, processing and linking resources",
+        &["pcm.resourceenvironment"],
+    ),
+    ("Allocation", "Allocation", &["pcm.allocation"]),
+    ("UsageModel", "Usage model: scenarios, workloads, user behaviour", &["pcm.usagemodel"]),
+    (
+        "Monitoring",
         "Monitoring: monitors, measurement specifications and measuring points",
         &["monitorrepository", "models.measuringpoint", "pcmmeasuringpoint", "simulizarmeasuringpoint"],
     ),
@@ -57,10 +68,7 @@ pub struct Layout {
 fn package_file(package: &str) -> usize {
     match package {
         "pcm.core" | "pcm.core.entity" | "pcm.repository" => 0,
-        "pcm.seff" | "pcm.seff.seff_performance" | "pcm.seff.seff_reliability" | "pcm.parameter"
-        | "pcm.core.composition" | "pcm.system" | "pcm.subsystem" | "pcm.usagemodel" => 1,
-        "pcm.resourceenvironment" | "pcm.allocation" => 2,
-        _ => 3,
+        _ => 1,
     }
 }
 
@@ -141,64 +149,71 @@ fn references(s: &Schema, l: &Layout, file: usize) -> Vec<usize> {
     out
 }
 
-/// The metamodel as files: the aggregate `palladio.mm` first, then [`FILES`] under [`DIR`], each
+/// The metamodel as files: the aggregate `palladio.mm` first, then the parts it imports, each
 /// with its path relative to the aggregate.
 pub fn write(s: &Schema) -> Vec<(String, String)> {
     let l = layout(s);
-    let mut files = vec![("palladio.mm".to_string(), write_aggregate())];
-    for (fi, (name, heading, contents)) in FILES.iter().enumerate() {
-        files.push((format!("{DIR}/{name}"), write_file(s, &l, fi, heading, contents)));
-    }
-    files
+    (0..FILES.len()).rev().map(|fi| (FILES[fi].0.to_string(), write_file(s, &l, fi))).collect()
 }
 
-fn write_aggregate() -> String {
-    let mut out = String::from(
-        "// The Palladio Component Model (PCM 5.2), as simulated by SimuLizar 5.2.2.\n\
-         //\n\
-         // Generated from the PCM Ecore metamodel by `palladio-sim-service gen-metamodel`: the\n\
-         // subset of classes and features the simulator reads. Mapping rules:\n\
-         // - classes keep their PCM names; features drop their EMF suffix\n\
-         //   (`components__Repository` -> `components`);\n\
-         // - an instance's name is its PCM id;\n\
-         // - stochastic expressions (PCMRandomVariable) are strings holding the StoEx, e.g. \"Exp(2.0)\";\n\
-         // - variable references are dot-separated names, e.g. \"items.NUMBER_OF_ELEMENTS\";\n\
-         // - references into Palladio's library models (resource types, scheduling policies,\n\
-         //   resource interfaces, metrics) are enums.\n\
-         //\n\
-         // Every root (Repository, System, ResourceEnvironment, Allocation, UsageModel,\n\
-         // MonitorRepository, MeasuringPointRepository) becomes one PCM file for the simulator.\n\
-         //\n\
-         // This file only gathers the parts, which models and scripts use through it. Each part\n\
-         // imports the parts before it:\n",
-    );
-    for (name, _, contents) in FILES {
-        let _ = writeln!(out, "// - {DIR}/{name}: {contents}");
+/// The path under which one file of [`FILES`] imports another.
+fn import_path(from: usize, to: usize) -> String {
+    let dir = |f: usize| FILES[f].0.rsplit_once('/').map_or("", |(d, _)| d);
+    let name = FILES[to].0.rsplit('/').next().unwrap_or(FILES[to].0);
+    match (dir(from), dir(to)) {
+        (a, b) if a == b => format!("./{name}"),
+        ("", b) => format!("./{b}/{name}"),
+        (_, "") => format!("../{name}"),
+        _ => format!("../{}", FILES[to].0),
     }
-    out.push('\n');
-    for (name, _, _) in FILES {
-        let _ = writeln!(out, "import \"./{DIR}/{name}\"");
-    }
-    out
 }
 
-fn write_file(s: &Schema, l: &Layout, file: usize, heading: &str, contents: &str) -> String {
+fn write_file(s: &Schema, l: &Layout, file: usize) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "// {heading}: {contents}.");
-    out.push_str("//\n// Part of the Palladio metamodel, which ../palladio.mm gathers.\n");
-    if file == 1 {
+    if FILES[file].0 == AGGREGATE {
         out.push_str(
-            "//\n\
-             // These areas share one file because the metamodel language declares an association\n\
-             // end with its class, and parameter usages (VariableUsage) are contained by component\n\
-             // implementations, SEFF actions, assembly contexts and usage model calls alike.\n",
+            "// The Palladio Component Model (PCM 5.2), as simulated by SimuLizar 5.2.2.\n\
+             //\n\
+             // Generated from the PCM Ecore metamodel by `palladio-sim-service gen-metamodel`: the\n\
+             // subset of classes and features the simulator reads. Mapping rules:\n\
+             // - classes keep their PCM names; features drop their EMF suffix\n\
+             //   (`components__Repository` -> `components`);\n\
+             // - an instance's name is its PCM id;\n\
+             // - stochastic expressions (PCMRandomVariable) are strings holding the StoEx, e.g. \"Exp(2.0)\";\n\
+             // - variable references are dot-separated names, e.g. \"items.NUMBER_OF_ELEMENTS\";\n\
+             // - references into Palladio's library models (resource types, scheduling policies,\n\
+             //   resource interfaces, metrics) are enums.\n\
+             //\n\
+             // Every root (Repository, System, ResourceEnvironment, Allocation, UsageModel,\n\
+             // MonitorRepository, MeasuringPointRepository) becomes one PCM file for the simulator.\n\
+             //\n",
+        );
+        let _ = writeln!(
+            out,
+            "// The {} live in\n\
+             // {}, which this file imports; everything else lives here.\n\
+             //\n\
+             // BasicComponent, CompositeComponent, ImplementationComponentType and PassiveResource are\n\
+             // repository classes, but live here: the metamodel language declares an association end with\n\
+             // its class, and parameter usages (VariableUsage) are contained by component implementations,\n\
+             // SEFF actions, assembly contexts and usage model calls alike. The views at the end show the\n\
+             // metamodel by package group, wherever a class lives.",
+            FILES[0].1,
+            import_path(file, 0)
+        );
+    } else {
+        let _ = writeln!(out, "// The Palladio metamodel's {}.", FILES[file].1);
+        let _ = writeln!(
+            out,
+            "//\n// The base part of the metamodel, which {} imports.",
+            import_path(file, FILES.len() - 1)
         );
     }
     let imports = references(s, l, file);
     if !imports.is_empty() {
         out.push('\n');
         for f in imports {
-            let _ = writeln!(out, "import \"./{}\"", FILES[f].0);
+            let _ = writeln!(out, "import \"{}\"", import_path(file, f));
         }
     }
 
@@ -213,9 +228,9 @@ fn write_file(s: &Schema, l: &Layout, file: usize, heading: &str, contents: &str
         out.push('\n');
     }
 
-    for (title, packages) in SECTIONS {
+    for (_, title, packages) in SECTIONS {
         let mut members: Vec<usize> = (0..s.classes.len())
-            .filter(|&ci| l.class_file[ci] == file && packages.contains(&s.classes[ci].eclass.def().package.def().name))
+            .filter(|&ci| l.class_file[ci] == file && packages.contains(&package_of(s, ci)))
             .collect();
         if members.is_empty() {
             continue;
@@ -242,10 +257,43 @@ fn write_file(s: &Schema, l: &Layout, file: usize, heading: &str, contents: &str
         }
         out.push('\n');
     }
+    if FILES[file].0 == AGGREGATE {
+        write_views(s, &mut out);
+    }
     while out.ends_with("\n\n") {
         out.pop();
     }
     out
+}
+
+/// The PCM package a class belongs to.
+fn package_of(s: &Schema, ci: usize) -> &'static str {
+    s.classes[ci].eclass.def().package.def().name
+}
+
+/// The classes a view shows: those of its package group, wherever they live.
+fn view_members(s: &Schema, packages: &[&str]) -> Vec<usize> {
+    let mut members: Vec<usize> = (0..s.classes.len()).filter(|&ci| packages.contains(&package_of(s, ci))).collect();
+    members.sort_by(|&a, &b| s.classes[a].name.cmp(&s.classes[b].name));
+    members
+}
+
+/// Writes one view per package group. A view lists the group's classes; the associations and
+/// inheritance between them come with them.
+fn write_views(s: &Schema, out: &mut String) {
+    out.push_str("// ---------------------------------------------------------------------------------------\n");
+    out.push_str("// Views: the metamodel by package group\n\n");
+    for (view, _, packages) in SECTIONS {
+        let members = view_members(s, packages);
+        if members.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "view {} {{", ident(view));
+        for ci in members {
+            let _ = writeln!(out, "    {}", ident(&s.classes[ci].name));
+        }
+        out.push_str("}\n\n");
+    }
 }
 
 fn write_enum(s: &Schema, e: usize, out: &mut String) {
@@ -322,6 +370,7 @@ mod tests {
         for f in 0..FILES.len() {
             assert!(references(s, &l, f).iter().all(|&g| g < f), "{} imports a later file", FILES[f].0);
         }
+        assert!(references(s, &l, 0).is_empty(), "the base part imports another file");
         for ci in 0..s.classes.len() {
             for &pi in &s.classes[ci].own {
                 if let Some(e) = enum_of(s, pi) {
@@ -344,11 +393,37 @@ mod tests {
         assert_eq!(
             moved,
             [
-                "BasicComponent -> architecture.mm",
-                "CompositeComponent -> architecture.mm",
-                "ImplementationComponentType -> architecture.mm",
-                "PassiveResource -> architecture.mm",
+                "BasicComponent -> palladio.mm",
+                "CompositeComponent -> palladio.mm",
+                "ImplementationComponentType -> palladio.mm",
+                "PassiveResource -> palladio.mm",
             ]
         );
+    }
+
+    /// Every class is written, and shown by exactly one view.
+    #[test]
+    fn views_cover_every_class_once() {
+        let s = schema();
+        let mut shown = vec![0; s.classes.len()];
+        for (_, _, packages) in SECTIONS {
+            for ci in view_members(s, packages) {
+                shown[ci] += 1;
+            }
+        }
+        let wrong: Vec<&str> = (0..s.classes.len()).filter(|&ci| shown[ci] != 1).map(|ci| s.classes[ci].name.as_str()).collect();
+        assert!(wrong.is_empty(), "not shown by exactly one view: {wrong:?}");
+    }
+
+    /// The aggregate imports the base part by its path, and the base part imports nothing.
+    #[test]
+    fn files_and_imports() {
+        let files = write(schema());
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["palladio.mm", "pcm/repository.mm"]);
+        assert!(files[0].1.contains("\nimport \"./pcm/repository.mm\"\n"));
+        assert!(!files[1].1.contains("\nimport "));
+        assert!(files[0].1.contains("\nview Repository {\n"));
+        assert!(!files[1].1.contains("\nview "));
     }
 }

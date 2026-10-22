@@ -1,0 +1,5 @@
+# The build needs the sources, Cargo.lock, simoxide.rev and .git (build.rs derives the plugin
+# version from the last commit). Everything else stays out of the context.
+target/
+target-*/
+*.log

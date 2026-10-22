@@ -1,0 +1,74 @@
+name: Build and Publish Docker Image
+
+# Publishes ghcr.io/<owner>/palladio-sim-service: on a tag v1.2.3 as 1.2.3, on a manual run as
+# sha-<commit> (plus the tag given as input, if any). SimOxide is checked out inside the build at
+# the commit in simoxide.rev. linux/amd64 only.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Additional image tag (optional, e.g. test-1)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build palladio-sim-service (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Refuse the licence-restricted feature
+        run: |
+          if grep -nE -- '--features[ =]+[^ ]*exact|CARGO_FEATURES=.*exact' Dockerfile; then
+            echo "the cargo feature 'exact' must never be built into an image" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/palladio-sim-service
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=palladio-sim-service-amd64
+          cache-to: type=gha,mode=max,scope=palladio-sim-service-amd64
+
+      - name: Smoke test
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/palladio-sim-service:sha-${GITHUB_SHA::7}"
+          docker run -d --name smoke -p 3022:3022 "$image"
+          for i in $(seq 30); do curl -fsS http://127.0.0.1:3022/ -o manifest.json && break; sleep 1; done
+          python3 -c "import json; d=json.load(open('manifest.json')); assert d['id']=='palladio-arch-service', d['id']; print(d['name'], d['version'])"
+          docker rm -f smoke

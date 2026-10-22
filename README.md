@@ -40,6 +40,22 @@ feature `exact` (SimuLizar-exact mode, only for the `roundtrip` command's compar
 reference) links code without a licence grant (SimOxide's LICENSES, section 7): never deploy a
 build with it.
 
+**Container image.** `Dockerfile` builds the same binary in Docker: it fetches SimOxide at the
+commit in `simoxide.rev` (the commit this repository builds against; update it together with a
+SimOxide change), refuses the feature `exact`, and runs on Debian slim (glibc malloc, not musl)
+as a non-root user, port 3022, with a health check on `GET /`. `.github/workflows/docker-publish.yml`
+publishes `ghcr.io/<owner>/palladio-sim-service:<version>` on a tag `v<version>` (and
+`sha-<commit>` on a manual run).
+
+```bash
+docker build --build-arg BUILD_JOBS=4 -t palladio-sim-service .
+docker run --rm -p 3022:3022 -e BACKEND_API_URL=http://backend:8080/api -e SIM_THREADS=16 palladio-sim-service
+```
+
+`--build-arg CARGO_FEATURES=mimalloc` builds with mimalloc instead of glibc's allocator (not
+measured against it). In mdeo's single-server deployment the instances run behind one load
+balancer and are sized from its manager (mdeo-cloud `infra/manager/`).
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT`, `HOST` | `3022`, `0.0.0.0` | where it listens |

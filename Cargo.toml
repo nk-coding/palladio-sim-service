@@ -31,6 +31,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
 # SimuLizar-exact mode for the `roundtrip` command's comparison with the reference. Local use
@@ -38,6 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # build with it must not be distributed. The plugin build leaves it off (pcmEvaluate always runs
 # the fast mode).
 exact = ["simoxide-sim/exact"]
+# mimalloc as the global allocator, for the static musl build (musl's malloc is slow for this
+# allocation-heavy workload). The default (glibc) build keeps the system allocator.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

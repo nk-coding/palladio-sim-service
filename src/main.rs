@@ -5,6 +5,10 @@ use simoxide_sim::{CompiledModel, Outputs, RunSpec};
 use std::path::Path;
 use std::process::ExitCode;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 usage: palladio-sim-service [serve]                  run the plugin service (port 3022; configured by the environment)
        palladio-sim-service evaluate MODEL [REQUEST.json] [--out FILE]

@@ -12,6 +12,19 @@ log histogram plus per-bin series; `containers` renamed `resources` with per-bin
 setting is an argument with a default; `wallSeconds`, `maxEvents` limits; `timedOut`;
 `version`.
 
+## Invariance to names and order
+
+Results do not depend on element names, ids or the order of instances and lists: before
+simulating, the plugin brings the PCM into a canonical form (`src/canon.rs`: colour refinement
+of the instance graph by class, attribute values and references, entity names left out; names,
+instance order and every reference list then follow from the structure). Two models that differ
+only in names and order are simulated identically and hit the same cache entry; the result
+refers to the caller's own instances, and its lists come in the canonical order (equal designs:
+equal lists). Residual: instances that the structure cannot tell apart (interchangeable ones,
+e.g. two identical unused containers or two identical branches) are ordered by their names;
+their measurements are the same multiset either way, but which of the caller's instances
+carries which value may follow the names. Deterministic in every case.
+
 ## Signature
 
 Use **named arguments**; everything but `end` has a default.

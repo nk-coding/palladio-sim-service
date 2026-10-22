@@ -6,11 +6,14 @@
 //!
 //! - [`mfile`]: reads `.m` files and model data (for the command line and the tests).
 //! - [`graph`]: the model as an editable instance graph.
+//! - [`canon`]: the canonical form of a model (names and order from its structure), so that
+//!   results do not depend on names and order.
 //! - [`pcm`]: the plain PCM of a model, held per model; [`evaluate`]: `pcmEvaluate`, one
 //!   simulation and its reduction, on [`dynamic`] (the run, SPD and the HPA) and [`lb`] (the
 //!   load balancers of SPD's service groups); [`detail`]: the design detail of the same run.
 //! - [`functions`], [`session`], [`server`]: the plugin service.
 
+pub mod canon;
 pub mod detail;
 pub mod dynamic;
 pub mod evaluate;

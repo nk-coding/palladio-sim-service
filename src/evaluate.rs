@@ -175,6 +175,26 @@ impl Default for Request {
 }
 
 impl Request {
+    /// The request with the caller's names replaced by canonical ones ([`crate::canon`]).
+    pub fn canonical(&self, c: &crate::canon::Canonical) -> Request {
+        let mut r = self.clone();
+        for o in &mut r.overrides {
+            o.0 = c.canon(&o.0);
+        }
+        for g in &mut r.groups {
+            g.container = c.canon(&g.container);
+        }
+        for s in &mut r.services {
+            s.container = c.canon(&s.container);
+            s.assembly = c.canon(&s.assembly);
+            s.load_balancer = c.canon(&s.load_balancer);
+        }
+        for p in &mut r.profile {
+            p.scenario = p.scenario.as_deref().map(|s| c.canon(s));
+        }
+        r
+    }
+
     /// A canonical text of the request (cache key).
     pub fn key(&self) -> String {
         format!("{self:?}")
@@ -378,6 +398,44 @@ fn response_json(s: &ResponseStat) -> Value {
 }
 
 impl Evaluation {
+    /// The evaluation with canonical names replaced by the caller's ([`crate::canon`]); lists
+    /// keep their canonical order, so equal designs give equal lists.
+    pub fn to_caller(&self, c: &crate::canon::Canonical) -> Evaluation {
+        let mut e = self.clone();
+        let o = |s: &mut String| *s = c.orig(s);
+        let oo = |s: &mut Option<String>| {
+            if let Some(x) = s {
+                *x = c.orig(x);
+            }
+        };
+        for v in [&mut e.operations, &mut e.sessions, &mut e.calls, &mut e.assembly_operations] {
+            for s in v.iter_mut() {
+                s.key = c.orig_text(&s.key, false);
+                oo(&mut s.scenario);
+                oo(&mut s.call);
+                oo(&mut s.role);
+                oo(&mut s.signature);
+                oo(&mut s.assembly);
+            }
+        }
+        for r in &mut e.resources {
+            o(&mut r.container);
+            o(&mut r.resource);
+        }
+        for (a, _) in &mut e.call_counts {
+            o(a);
+        }
+        for p in &mut e.path_sets {
+            o(&mut p.scenario);
+            p.containers.iter_mut().for_each(o);
+        }
+        e.message = c.orig_text(&e.message, false);
+        for w in &mut e.warnings {
+            *w = c.orig_text(w, false);
+        }
+        e
+    }
+
     pub fn failure(req: &Request, message: String) -> Evaluation {
         Evaluation {
             failed: true,
@@ -543,6 +601,12 @@ pub fn run(cache: &PcmCache, req: &Request, mon: Monitors, service: Limits) -> R
     };
     let eval = reduce(cache, &g, req, &groups, &raw, edges.len());
     Ok(Outcome { eval, graph: Some(g), raw: Some(raw), groups })
+}
+
+/// [`run`] for a request in the caller's names, the evaluation in the caller's names.
+pub fn run_caller(cache: &PcmCache, req: &Request, mon: Monitors, service: Limits) -> Result<Evaluation, String> {
+    let c = &cache.canon;
+    Ok(run(cache, &req.canonical(c), mon, service).map_err(|e| c.orig_text(&e, false))?.eval.to_caller(c))
 }
 
 /// The bin edges (s): warm-up, every bin width after it, the end.
@@ -843,7 +907,13 @@ fn reduce(cache: &PcmCache, g: &Graph, req: &Request, groups: &[PodGroup], raw: 
     }
     // ------------------------------------------------ synchronous paths
     let mut sets: BTreeMap<(String, Vec<String>), i64> = BTreeMap::new();
-    let of_model = |set: &[String]| -> Vec<String> { set.iter().filter(|c| input.class(c) == "ResourceContainer").cloned().collect() };
+    // a set of the model's containers (pods counted as their container once), in canonical order
+    let of_model = |set: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = set.iter().filter(|c| input.class(c) == "ResourceContainer").cloned().collect();
+        v.sort_by_key(|c| c.strip_prefix("_c").and_then(|d| d.parse::<u64>().ok()).unwrap_or(u64::MAX));
+        v.dedup();
+        v
+    };
     for (sc, set, n) in &last.sessions {
         *sets.entry((sc.clone(), of_model(set))).or_default() += *n as i64;
     }
@@ -853,9 +923,8 @@ fn reduce(cache: &PcmCache, g: &Graph, req: &Request, groups: &[PodGroup], raw: 
         }
     }
     let mut by_scenario: BTreeMap<String, Vec<PathSet>> = BTreeMap::new();
-    for ((sc, mut containers), n) in sets {
+    for ((sc, containers), n) in sets {
         if n > 0 {
-            containers.sort();
             by_scenario.entry(sc.clone()).or_default().push(PathSet { scenario: sc, containers, count: n as u64 });
         }
     }

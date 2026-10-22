@@ -21,7 +21,7 @@ fn fixture(name: &str, rate: f64) -> WireModel {
 }
 
 fn eval(m: &WireModel, req: &Request) -> Evaluation {
-    evaluate::run(&PcmCache::new(m), req, Monitors::default(), Default::default()).unwrap().eval
+    evaluate::run_caller(&PcmCache::new(m), req, Monitors::default(), Default::default()).unwrap()
 }
 
 fn near(a: f64, b: f64, rel: f64) -> bool {
@@ -92,7 +92,12 @@ fn sync_path_sets() {
     assert!(!e.failed, "{}", e.message);
     let sessions = e.sessions[0].count;
     assert!(sessions > 11_000);
-    let sets: HashMap<Vec<&str>, u64> = e.path_sets.iter().map(|s| (s.containers.iter().map(String::as_str).collect(), s.count)).collect();
+    fn sorted(v: &[String]) -> Vec<&str> {
+        let mut x: Vec<&str> = v.iter().map(String::as_str).collect();
+        x.sort();
+        x
+    }
+    let sets: HashMap<Vec<&str>, u64> = e.path_sets.iter().map(|s| (sorted(&s.containers), s.count)).collect();
     assert_eq!(sets.len(), 2, "{sets:?}");
     let total: u64 = sets.values().sum();
     assert!((total as i64 - sessions as i64).abs() <= 2, "{total} vs {sessions}");
@@ -144,7 +149,10 @@ fn autoscaled_replicas_cost_and_paths() {
     // container of the model
     let total: u64 = e.path_sets.iter().map(|s| s.count).sum();
     assert!(total > 80_000);
-    assert!(e.path_sets.iter().all(|s| s.containers == ["C1", "C2"]), "{:?}", e.path_sets);
+    assert_eq!(e.path_sets.len(), 1, "{:?}", e.path_sets);
+    let mut cs = e.path_sets[0].containers.clone();
+    cs.sort();
+    assert_eq!(cs, ["C1", "C2"]);
     assert!(!e.resources.iter().any(|x| x.container == "LoadBalancerServer"));
     assert!(e.call_counts.iter().all(|(a, _)| !a.contains("LoadBalancer")));
 }
@@ -197,9 +205,9 @@ fn failures_are_evaluations() {
     assert!(e.failed && !e.capped && !e.message.is_empty(), "{e:?}");
     // a group on something that is not a container; a percentile outside 0..100
     let bad = Request { groups: vec![ScalingGroup::new("AssemblyBackend")], ..steady(0.0, 60.0) };
-    assert!(evaluate::run(&PcmCache::new(&fixture("two-tier.m", 20.0)), &bad, Monitors::default(), Default::default()).is_err());
+    assert!(evaluate::run_caller(&PcmCache::new(&fixture("two-tier.m", 20.0)), &bad, Monitors::default(), Default::default()).is_err());
     let bad = Request { percentiles: vec![101.0], ..steady(0.0, 60.0) };
-    assert!(evaluate::run(&PcmCache::new(&fixture("two-tier.m", 20.0)), &bad, Monitors::default(), Default::default()).is_err());
+    assert!(evaluate::run_caller(&PcmCache::new(&fixture("two-tier.m", 20.0)), &bad, Monitors::default(), Default::default()).is_err());
 }
 
 /// A per-scenario load profile scales the scenario's sessions; usage streams keep the users of
@@ -305,4 +313,136 @@ async fn the_script_function() {
     // cached: the second call is the first's evaluation
     let b = functions::call(&engine, "pcmEvaluate", &args, &lists, &cache, &mut next).await.unwrap();
     assert_eq!(field(&b.value, "wallMs"), field(&a.value, "wallMs"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Invariance to names and order
+
+/// `m` with every instance renamed, every entity name changed, the instances and every
+/// reference list shuffled (deterministically by `seed`); and the new name of each old name.
+fn scramble(m: &WireModel, seed: u64) -> (WireModel, HashMap<String, String>) {
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut next = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s >> 33
+    };
+    let mut ids: Vec<usize> = (0..m.instances.len()).collect();
+    for i in (1..ids.len()).rev() {
+        ids.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    let rename: HashMap<String, String> = m.instances.iter().zip(&ids).map(|(x, i)| (x.name.clone(), format!("q{i}"))).collect();
+    let mut instances: Vec<_> = m
+        .instances
+        .iter()
+        .map(|x| {
+            let mut y = x.clone();
+            y.name = rename[&x.name].clone();
+            for (k, v) in &mut y.attributes {
+                if k == "entityName" {
+                    *v = vec![WireValue::String(format!("renamed {}", next()))];
+                }
+            }
+            for (_, ts) in &mut y.references {
+                for t in ts.iter_mut() {
+                    if let Some(n) = rename.get(t) {
+                        *t = n.clone();
+                    }
+                }
+            }
+            y
+        })
+        .collect();
+    fn shuffle<T>(v: &mut [T], next: &mut dyn FnMut() -> u64) {
+        for i in (1..v.len()).rev() {
+            v.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+    }
+    let mut nx = {
+        let mut t = seed ^ 0xABCDEF;
+        move || {
+            t = t.wrapping_mul(6364136223846793005).wrapping_add(1);
+            t >> 33
+        }
+    };
+    shuffle(&mut instances, &mut nx);
+    for x in &mut instances {
+        for (_, ts) in &mut x.references {
+            shuffle(ts, &mut nx);
+        }
+    }
+    (WireModel { metamodel_path: m.metamodel_path.clone(), instances }, rename)
+}
+
+/// The evaluation as JSON with names mapped by `back` (ids joined by `|` too).
+fn renamed(e: &Evaluation, back: &HashMap<String, String>) -> serde_json::Value {
+    fn walk(v: &mut serde_json::Value, back: &HashMap<String, String>) {
+        match v {
+            serde_json::Value::String(s) => *s = s.split('|').map(|p| back.get(p).cloned().unwrap_or_else(|| p.to_string())).collect::<Vec<_>>().join("|"),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, back)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|x| walk(x, back)),
+            _ => {}
+        }
+    }
+    let mut v = Evaluation { wall_ms: 0.0, ..e.clone() }.to_json();
+    walk(&mut v, back);
+    v
+}
+
+/// Renaming every element (ids and entity names) and shuffling every list gives the same
+/// evaluation, element for element and in the same list order.
+fn invariant(m: &WireModel, req: &Request, rename_req: impl Fn(&Request, &HashMap<String, String>) -> Request) {
+    let a = eval(m, req);
+    assert!(!a.failed, "{}", a.message);
+    // instances that colour refinement cannot tell apart (interchangeable): their labels may
+    // swap, their values may not
+    let ca = PcmCache::new(m);
+    let tied: HashMap<String, String> = ca.canon.tied.iter().map(|c| (ca.canon.orig(c), "<tied>".to_string())).collect();
+    let a = renamed(&a, &tied);
+    let a = serde_json::from_value::<serde_json::Value>(a).unwrap();
+    for seed in [1, 2] {
+        let (sm, map) = scramble(m, seed);
+        let back: HashMap<String, String> =
+            map.iter().map(|(k, v)| (v.clone(), if tied.contains_key(k) { "<tied>".to_string() } else { k.clone() })).collect();
+        let b = eval(&sm, &rename_req(req, &map));
+        let (x, y) = (renamed(&b, &back), a.clone());
+        if x != y && let Ok(d) = std::env::var("PCM_INVARIANCE_DUMP") {
+            std::fs::write(format!("{d}/b{seed}.json"), serde_json::to_string_pretty(&x).unwrap()).unwrap();
+            std::fs::write(format!("{d}/a.json"), serde_json::to_string_pretty(&y).unwrap()).unwrap();
+        }
+        assert!(x == y, "seed {seed}: the evaluations differ");
+    }
+}
+
+fn rename_request(r: &Request, map: &HashMap<String, String>) -> Request {
+    let m = |s: &str| map.get(s).cloned().unwrap_or_else(|| s.to_string());
+    let mut r = r.clone();
+    r.groups.iter_mut().for_each(|g| g.container = m(&g.container));
+    r.overrides.iter_mut().for_each(|o| o.0 = m(&o.0));
+    r.profile.iter_mut().for_each(|p| p.scenario = p.scenario.as_deref().map(m));
+    r
+}
+
+#[test]
+fn results_do_not_depend_on_names_or_order() {
+    invariant(&fixture("paths.m", 20.0), &steady(30.0, 330.0), rename_request);
+    // with autoscaling (pods created during the run), a per-scenario profile and an override
+    let mut req = Request { groups: vec![backend_group(6)], overrides: vec![("C1_cpu".into(), 2, 1000.0)], ..steady(60.0, 600.0) };
+    req.profile = vec![LoadStep { scenario: Some("scenario".into()), time: 0.0, factor: 0.2 }, LoadStep { scenario: Some("scenario".into()), time: 100.0, factor: 1.0 }];
+    invariant(&fixture("two-tier.m", 100.0), &req, rename_request);
+}
+
+/// The same on a realised MiSArch design of the domain project (skipped without it).
+#[test]
+fn a_realised_misarch_design_does_not_depend_on_names_or_order() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../palladio-architecture-optimization-domain/build/domain/detail-work");
+    let Some(path) = std::fs::read_dir(dir).ok().and_then(|d| d.flatten().map(|e| e.path().join("realised/design.model.json")).find(|p| p.exists())) else {
+        eprintln!("no realised design in {dir}: skipped");
+        return;
+    };
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let m = mfile::from_model_data(&v).unwrap();
+    let t0 = std::time::Instant::now();
+    let cache = PcmCache::new(&m);
+    eprintln!("{}: {} PCM instances, canonical form {:.0} ms ({} ties), cache built in {:.0} ms", path.display(), cache.plain.instances.len(), cache.canon_ms, cache.canon.ties, t0.elapsed().as_secs_f64() * 1e3);
+    invariant(&m, &Request { ..steady(0.0, 60.0) }, rename_request);
 }

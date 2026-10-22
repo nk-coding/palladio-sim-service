@@ -65,7 +65,11 @@ fn detail_cmd(args: &[String], evaluate: bool) -> Result<(), String> {
     let v = if evaluate {
         let r = palladio_arch::evaluate::Request::from_json(&req)?;
         let cache = palladio_arch::pcm::PcmCache::new(&model);
-        palladio_arch::evaluate::run(&cache, &r, Default::default(), limits)?.eval.to_json()
+        let mut v = palladio_arch::evaluate::run_caller(&cache, &r, Default::default(), limits)?.to_json();
+        v["canonicalMs"] = serde_json::json!(cache.canon_ms);
+        v["ties"] = serde_json::json!(cache.canon.ties);
+        v["modelDigest"] = serde_json::json!(cache.digest().iter().map(|b| format!("{b:02x}")).collect::<String>());
+        v
     } else {
         palladio_arch::detail::detail_json(&model, &req, limits)?
     };

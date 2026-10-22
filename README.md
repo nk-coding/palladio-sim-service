@@ -91,7 +91,14 @@ hpaCpuInitialisationSeconds = 300, maxPathSets = 10000, wallSeconds = 60, maxEve
   limit returns `failed = true` with a `message` (and `capped` / `timedOut`), never an error of
   the call; a panic is caught the same way. Wrong arguments (a group on something that is not a
   ResourceContainer, a percentile outside 0..100) are errors of the call.
-- *Caching.* Deterministic, so cached per (digest of the model's PCM, arguments) in the
+- *Invariance.* Results do not depend on element names, ids or list order: the PCM is
+  brought into a canonical form first (`src/canon.rs`, colour refinement of the instance graph;
+  92 ms for a realised MiSArch design of 8 065 PCM instances, once per model), simulated, and the
+  results are mapped back to the caller's instances, lists in canonical order. Residual:
+  interchangeable instances (structurally identical, e.g. unused identical containers) are
+  ordered by name; their values are equal as a multiset, which caller instance gets which may
+  follow the names.
+- *Caching.* Deterministic, so cached per (digest of the model's canonical PCM, arguments) in the
   session's model and in the process (bounded by `SIM_RESULT_CACHE_SIZE` and `PCM_CACHE_MB`); a
   script can call `pcmEvaluate` with the same arguments in every metric function for one
   simulation. Timed-out runs are not cached.
@@ -120,8 +127,8 @@ palladio-arch-service detail MODEL [REQUEST.json] [--out FILE]
 
 ## Verification
 
-`cargo test --release` (`tests/evaluate.rs`, 8 tests; unit tests for the manifest with its
-defaults, the detail request and step means). Fixtures: `tests/fixtures/two-tier.m` (Frontend on
+`cargo test --release` (`tests/evaluate.rs`, 10 tests; unit tests for the manifest with its
+defaults, the canonical form, the detail request and step means). Fixtures: `tests/fixtures/two-tier.m` (Frontend on
 C1, 5 ms, calls Backend on C2, 10 ms) and `tests/fixtures/paths.m` (Frontend calls Backend with
 probability 0.3 and forks Audit on C3 asynchronously):
 
@@ -135,6 +142,8 @@ probability 0.3 and forks Audit on C3 asynchronously):
 | `load_profile_and_usage_streams` | a per-scenario step raises the sessions after it; another design sees the same users |
 | `the_detail_is_the_evaluated_run` | the detail's `evaluation` equals `pcmEvaluate`'s; the JSON request maps to the same request |
 | `the_script_function` | `pcmEvaluate` as the platform calls it (records with defaults, nested lists); cached |
+| `results_do_not_depend_on_names_or_order` | the fixtures (also autoscaled, with a profile and an override) with every id and entity name changed and every list shuffled give the same evaluation, element for element |
+| `a_realised_misarch_design_does_not_depend_on_names_or_order` | the same on a realised design of the domain project (8 065 instances; interchangeable instances compared by value) |
 
 Measured (release, this dev VM, one simulation thread), the today design of the domain project
 (`build/domain/detail-work/domain-w-today-*/realised/design.model.json`, 34 autoscaled services,
@@ -152,7 +161,8 @@ in 6.1 s (0.21 GB); with `fixDoubleResume = false` it returns `failed` with Simu
 | `src/dynamic.rs` | The run: SPD and HPA configuration, SimOxide with path monitoring, readings at the bin edges |
 | `src/lb.rs` | The load balancers of SPD's service groups (Slingshot's pattern) |
 | `src/detail.rs` | The design detail and the monitors |
-| `src/pcm.rs` | The plain PCM of a model, held per model, with overrides |
+| `src/pcm.rs` | The plain PCM of a model in canonical form, held per model, with overrides |
+| `src/canon.rs` | The canonical form (names and order from the structure) and the way back |
 | `src/graph.rs` | The model as an editable instance graph (keeps opposite ends) |
 | `src/mfile.rs` | `.m` and model data reader |
 | `src/session.rs`, `src/server.rs` | Sessions and HTTP/WebSocket, adapted from palladio-sim-service |

@@ -259,10 +259,33 @@ fn recursive_operations(g: &Graph) -> std::collections::HashSet<(String, String)
 pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<Value, String> {
     let t0 = Instant::now();
     let cache = PcmCache::new(model);
-    let o = evaluate::run(&cache, &req.run, Monitors { assembly_operations: req.assembly_operations, resources: true }, limits)?;
+    let c = &cache.canon;
+    // the request in canonical names; budgets by element name to the elements of that name
+    let mut req = DetailRequest { run: req.run.canonical(c), ..req.clone() };
+    let mut by_entity: HashMap<&str, Vec<&String>> = HashMap::new();
+    for (k, v) in &c.entity {
+        by_entity.entry(v.as_str()).or_default().push(k);
+    }
+    let budgets = std::mem::take(&mut req.budgets_ms);
+    for (k, ms) in budgets {
+        let parts: Vec<&str> = k.split('|').collect();
+        if parts.iter().all(|p| c.to_canon.contains_key(*p)) {
+            req.budgets_ms.insert(parts.iter().map(|p| c.canon(p)).collect::<Vec<_>>().join("|"), ms);
+        } else if let Some(xs) = by_entity.get(k.as_str()) {
+            for x in xs {
+                req.budgets_ms.insert((*x).clone(), ms);
+            }
+        } else {
+            req.budgets_ms.insert(k, ms);
+        }
+    }
+    let req = &req;
+    let o = evaluate::run(&cache, &req.run, Monitors { assembly_operations: req.assembly_operations, resources: true }, limits).map_err(|e| c.orig_text(&e, false))?;
     let k = 1000.0 / req.run.ms_per_unit;
     let (Some(g), Some(raw)) = (&o.graph, &o.raw) else {
-        return Ok(json!({"kind": "pcm-detail", "version": 2, "failed": true, "message": o.eval.message, "evaluation": o.eval.to_json()}));
+        let mut v = json!({"kind": "pcm-detail", "version": 2, "failed": true, "message": o.eval.message, "evaluation": o.eval.to_json()});
+        c.orig_json(&mut v);
+        return Ok(v);
     };
     let mut out = reduce(g, &cache, req, &raw.meas, raw.end);
     let bins: Vec<f64> = out["t"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
@@ -282,8 +305,10 @@ pub fn detail(model: &WireModel, req: &DetailRequest, limits: Limits) -> Result<
         "durationS": req.run.end_s, "warmUpS": req.run.warm_up_s, "simulatedS": raw.end / k, "events": raw.events,
         "measurements": raw.meas.count, "autoscaling": if o.groups.is_empty() { Value::Null } else { json!("SPD + HPA") },
         "capped": o.eval.capped, "failed": o.eval.failed, "message": o.eval.message,
-        "simulationMs": raw.wall_ms, "computeMs": t0.elapsed().as_secs_f64() * 1e3,
+        "simulationMs": raw.wall_ms, "computeMs": t0.elapsed().as_secs_f64() * 1e3, "canonicalMs": cache.canon_ms,
     });
+    // the caller's names (the lists keep the canonical order)
+    c.orig_json(&mut out);
     Ok(out)
 }
 

@@ -637,9 +637,9 @@ pub async fn call(
     next_id: &mut impl FnMut() -> i64,
 ) -> Result<Answer, String> {
     let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
-    let req = Args { f, args }.request(lists)?;
-    let e = evaluate::evaluator(&engine.config).evaluate(cache, req).await?;
-    Ok(evaluation(&e, next_id))
+    let req = Args { f, args }.request(lists)?.canonical(&cache.canon);
+    let e = evaluate::evaluator(&engine.config).evaluate(cache, req).await.map_err(|e| cache.canon.orig_text(&e, false))?;
+    Ok(evaluation(&e.to_caller(&cache.canon), next_id))
 }
 
 #[cfg(test)]

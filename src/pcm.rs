@@ -14,10 +14,15 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// The plain PCM of a model, computed once per model, and the evaluations run on it.
+/// The plain PCM of a model in canonical form ([`crate::canon`]: names and order from the
+/// structure), computed once per model, and the evaluations run on it. Everything inside the
+/// plugin works on canonical names; [`PcmCache::canon`] leads to and from the caller's.
 pub struct PcmCache {
     pub plain: WireModel,
     pub graph: Graph,
+    pub canon: crate::canon::Canonical,
+    /// Milliseconds the canonical form took.
+    pub canon_ms: f64,
     /// A digest of `plain` (computed on first use): the key of the evaluations shared across
     /// models with the same PCM ([`crate::evaluate::Evaluator`]).
     digest: OnceLock<[u8; 32]>,
@@ -27,15 +32,21 @@ pub struct PcmCache {
 
 impl PcmCache {
     pub fn new(model: &WireModel) -> PcmCache {
-        let plain = Graph::new(model).to_wire(|x| is_pcm(&x.class_name));
+        let t0 = std::time::Instant::now();
+        let raw = Graph::new(model).to_wire(|x| is_pcm(&x.class_name));
+        let mut canon = crate::canon::canonicalise(&raw);
+        let plain = std::mem::take(&mut canon.model.instances);
+        let plain = WireModel { metamodel_path: raw.metamodel_path, instances: plain };
         let graph = Graph::new(&plain);
-        PcmCache { plain, graph, digest: OnceLock::new(), evals: Mutex::default() }
+        let canon_ms = t0.elapsed().as_secs_f64() * 1e3;
+        PcmCache { plain, graph, canon, canon_ms, digest: OnceLock::new(), evals: Mutex::default() }
     }
 
     pub fn digest(&self) -> [u8; 32] {
         *self.digest.get_or_init(|| {
             let mut h = Sha256::new();
-            h.update(format!("{:?}", self.plain).as_bytes());
+            // the instances only: equal designs from other files are equal
+            h.update(format!("{:?}", self.plain.instances).as_bytes());
             h.finalize().into()
         })
     }

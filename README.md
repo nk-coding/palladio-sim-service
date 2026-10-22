@@ -1,181 +1,169 @@
 # Palladio Architecture plugin service (`palladio-arch-service`)
 
-An mdeo plugin service, written in Rust, for the architecture optimisation of Palladio (PCM)
-models ([palladio-architecture-optimization-domain](../palladio-architecture-optimization-domain)).
-It knows PCM only: the architecture layers above it are realised in the model by model
-transformations. Its script functions (`pcm*`) analyse the plain PCM part of the model a script
-runs on (offered loads, no-load times, call rates, failures) and simulate it with
-[SimOxide](../simoxide), also over load profiles and with Kubernetes-style autoscaling, through
-[palladio-sim-service](../palladio-sim-service), which it uses as a library (protocol, auth, PCM
-schema, XMI writer, simulation engine). The command line adds the design detail of a model and
-the layer-2 translation the domain project checks its realisation against.
+An mdeo plugin service, written in Rust, that does one thing: it **simulates the plain Palladio
+(PCM) part of a model with [SimOxide](../simoxide)** and returns what the simulation measured.
+One script function, `pcmEvaluate`, runs one dynamic simulation (per-scenario load profile,
+Kubernetes-style autoscaling through SPD and SimOxide's HPA) and returns raw measurements:
+response-time statistics, utilisation and pods per processing resource, call counts and the
+container sets of the sessions' synchronous paths, over a window and per time bin. Every
+interpretation (cost, failure model, budgets, consistency, which percentile matters) belongs to
+the mdeo scripts. It uses [palladio-sim-service](../palladio-sim-service) as a library
+(protocol, auth, PCM schema, XMI writer). Used by the domain project
+([palladio-architecture-optimization-domain](../palladio-architecture-optimization-domain)).
 
-The `arch*` and `archHpa*` functions of the earlier projects (layer-2 decisions translated by the
-plugin, `eval` and `hpa` commands) were removed on 2026-10-22; tag `pre-cleanup` has them.
+The analytic functions (`pcmResources`, `pcmScenarios`, `pcmOperations`, `pcmCallRates`,
+`pcmWeightedVisits`, `pcmOperationVisits`, `pcmFailure`, `pcmSourceFailure`,
+`pcmOperationFailure`, `pcmWarnings`), the StoEx evaluator `pcmMean`, the per-call simulation
+functions (`pcmSimulate`, `pcmStat`, `pcmRun`, `pcmRunStat`, `pcmHpaRun`) and the layer-2
+translation with its `oracle` and `translate` commands were removed on 2026-10-22; tag
+`pre-simulation` has them (tag `pre-cleanup` the earlier `arch*` functions).
 
-## Run it
+## Deployment
 
 ```bash
-./run.sh              # build (release), then serve on http://localhost:3022
-./run.sh --no-build   # start the last build
+cargo build --release          # → target/release/palladio-arch-service
+PORT=3022 target/release/palladio-arch-service serve
+./run.sh                       # the same: build, then serve on 3022 (./run.sh --no-build: no build)
 ```
 
-Register `http://localhost:3022/` under **Settings → Plugins** and enable **Palladio
-Architecture** in a project. The environment variables are those of palladio-sim-service
-(`SIM_THREADS`, `SIM_DUMP_DIR`, ...), except that the default port is 3022. Cap the caches for
-large models: a compiled MiSArch model (9 200 PCM objects) takes about 10 MB, so the default
-`SIM_MODEL_CACHE_SIZE=256` can hold about 2.5 GB; the dev stack runs with
-`SIM_MODEL_CACHE_SIZE=16 SIM_RESULT_CACHE_SIZE=1024`. `SIM_DUMP_DIR` also receives every model as
-the platform sent it (`received-*.txt`). The domain project's harness runs a copy of
-`target/release/palladio-arch-service` (`tools/run-domain.sh`).
+Build against SimOxide's `main` (`../simoxide`, path dependencies; at least `1429209`, which has
+the path monitoring and `fix_double_resume`) and `../palladio-sim-service`. The binary needs no
+files at run time.
 
-## Functions
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT`, `HOST` | `3022`, `0.0.0.0` | where it listens |
+| `BACKEND_API_URL` | `http://localhost:8080/api` | the mdeo backend whose session tokens it verifies (JWKS) |
+| `JWT_ISSUER` | `mdeo-platform` | expected token issuer |
+| `SIM_THREADS` | one per CPU | simulations at once (each one thread) |
+| `SIM_RESULT_CACHE_SIZE` | `4096` | evaluations kept (LRU) |
+| `PCM_CACHE_MB` | `1024` | memory bound of the kept evaluations (estimated), LRU |
+| `SIM_TIMEOUT_SECONDS` | `600` | hard wall-clock limit per simulation (the call's `wallSeconds`, default 60, is usually lower) |
+| `SIM_MAX_EVENTS` | `0` (none) | hard event limit per simulation |
+| `MAX_SESSIONS` | `256` | concurrent script sessions |
+| `SIM_DUMP_DIR` | unset | writes every received model there (`received-*.txt`), for debugging |
+| `PCM_DETAIL_ENDPOINT` | unset | `1` enables `POST /pcm/detail` (unauthenticated simulations; leave off on a shared server) |
 
-Plain PCM in, numbers out: they read the model's PCM part as it is (instances of other classes
-are ignored) and know nothing above PCM; whatever says how to read the model (overrides, branch
-probabilities, unavailabilities, transparent assemblies, load profiles, scaling groups, budgets)
-comes from the script. Used by the domain project (`palladio-architecture-optimization-domain`,
-DESIGN.md §B and §H), whose layer 2 is realised in the model by transformations: its
-`transform/metrics.fn` calls `pcmResources`, `pcmScenarios`, `pcmOperations`, `pcmCallRates`,
-`pcmFailure`, `pcmSourceFailure`, `pcmMean` and `pcmSimulate`, its explorer the design detail.
-Times in model time units unless a name says `Ms`/`Seconds`.
+**Registering it in mdeo:** under **Settings → Plugins** add the URL the service is reachable at
+(e.g. `http://host:3022/`); mdeo reads the manifest from `GET /` and opens script sessions on
+`/ws/sessions/...`. Enable **Palladio Architecture** in a project; scripts then see
+`pcmEvaluate` and its records (`PcmEvaluation`, …).
 
-| Function | Returns |
-| --- | --- |
-| `pcmResources()` | `PcmResource` per processing resource: container, kind, rate, replicas, demand, busy, utilisation |
-| `pcmScenarios()` | `PcmScenario` per usage scenario: arrival rate, no-load response time |
-| `pcmOperations()` | `PcmOperation` per entry-level system call: signature, callee, calls per time unit, no-load time per call |
-| `pcmWeightedVisits(actions, weights, exclude = "")` | rate-weighted mean over the scenarios of Σ expected executions per request × weight |
-| `pcmOperationVisits(actions, weights)` | `PcmOperationValue` per entry-level call: Σ expected executions per call × weight (the call itself counts once) |
-| `pcmCallRates(transitions, probabilities)` | `PcmCall` per external and entry-level call: calls per time unit, branch probabilities overridden |
-| `pcmFailure(containers, unavailabilities, transparent, exclude = "")` | rate-weighted share of requests needing an unavailable container on their synchronous path |
-| `pcmSourceFailure(containers, sources, unavailabilities, transparent, exclude = "")` | rate-weighted share of failed requests with failure sources (common causes): source s (`unavailabilities[s]`) takes down the containers `containers[i]` with `sources[i] = s`; sources are independent, a request fails with 1 − Π_s (1 − P(touch any container of S_s) · u_s), P by `pcmFailure`'s walk with S_s as one node (one walk for all sources). One source per container is `pcmFailure` |
-| `pcmOperationFailure(containers, unavailabilities, transparent)` | `PcmOperationValue` per entry-level call: the probability that one call fails so |
-| `pcmSimulate(overrides, ...)`, `pcmStat(overrides, element, metric, statistic, ...)` | a simulation with processing resources' replicas and rates overridden (`PcmOverride`) |
-| `pcmRun(overrides, profile, usageStreams = false, ...)`, `pcmRunStat(...)` | the same with a per-scenario load profile (`PcmLoadStep` {scenario or null = every scenario, time, factor}; SimOxide LP-1) and SimOxide's usage streams (common random numbers, RND-11) |
-| `pcmHpaRun(overrides, groups, services, profile, budgetElements, budgetsMs, warmUp, end, msPerTimeUnit, sloFactor, usageStreams = false, seed = 1, maxPods = 400)` | `PcmHpaResult`: a dynamic run with SPD and SimOxide's HPA: per `PcmScalingGroup` (container = the pod, min/max/initial replicas, target utilisation, start-up, scale-down window (< 0: default), CPU request (≤ 0: the pod's cores)) an elastic infrastructure, per `PcmServiceGroup` (assembly, its load balancer) a service group (a group without any gets load balancers from the plugin, Slingshot's pattern: one branch with one call per pod, on a container `LoadBalancerServer` without work); replica-seconds, peak, rescales, created pods, flapping, the share over `sloFactor` × budget of the budgeted elements (scenarios, calls, or signatures as system operations), mean and p95 of the calls; cached per model and request |
-| `pcmMean(expr)`, `pcmWarnings()` | the mean of a variable-free StoEx; the analysis' warnings |
+**Version:** the manifest's `version` (also in its descriptions) and every `PcmEvaluation`'s
+`version` field are `<date of the last commit>+<git hash>` (`-dirty` for a build with uncommitted
+changes), set by `build.rs`. `curl -s http://host:3022/ | jq .version` shows what is deployed.
 
-The analysis behind them walks expectations: a discrete probability function literal as an input
-of an entry-level call (`IntPMF`, `EnumPMF`, ...) is enumerated (one walk per value combination,
-exact), and only expressions that draw random numbers make a walk fall back to 4 000 sampled
-walks.
+## The function
+
+`pcmEvaluate(end, warmUp = 0, binSeconds = 10, msPerTimeUnit = 1000, profile = null, groups =
+null, services = null, overrides = null, percentiles = null, detailCalls = false,
+histogramPerDecade = 10, seed = 1, usageStreams = true, fixDoubleResume = true, maxPods = 400,
+hpaSyncSeconds = 15, hpaTolerance = 0.1, hpaDownscaleStabilisationSeconds = 300,
+hpaCpuInitialisationSeconds = 300, maxPathSets = 10000, wallSeconds = 60, maxEvents = 0)` →
+`PcmEvaluation`. The contract, with every record field, is
+[`API-pcmEvaluate.md`](API-pcmEvaluate.md). In short (`src/evaluate.rs`, `src/dynamic.rs`,
+`src/lb.rs`):
+
+- *Model.* The PCM with processing resources overridden (`PcmOverride`). Every
+  `PcmScalingGroup` (a pod container; min/max/initial pods, target utilisation, start-up and
+  scale-down seconds, CPU request, an optional Kubernetes `behavior` as JSON) is an SPD elastic
+  infrastructure with a `HorizontalPodAutoscaler` (SimOxide `docs/spec/hpa.md`, Slingshot's
+  adjustments); its assemblies are SPD service groups behind load balancers (`PcmServiceGroup`,
+  or the plugin's: Slingshot's pattern, a branch with one call per pod, on a container
+  `LoadBalancerServer` without work). The model's monitors are replaced by Response Time of
+  every usage scenario, entry-level system call, system operation and, with `detailCalls`,
+  assembly operation.
+- *Run.* SimOxide, fast mode, SimuLizar flavour, virtual-time processor sharing, the request's
+  seed, per-scenario load profile (`PcmLoadStep`, LP-1) and usage streams (RND-11), SimuLizar's
+  double resume fixed by default (REF-2), SimOxide's path monitoring (MEAS-13: synchronous paths
+  per session, call counts) and busy-time hooks read at the window's start, at every bin edge and
+  at the end (pauses do not change the run). The wall-clock (`wallSeconds`) and event limits
+  bound one simulation.
+- *Result* over the window `[warmUp, end]` and per bin: response times per system operation and
+  usage scenario (and per entry-level call and assembly operation with `detailCalls`): count,
+  mean, max, the requested percentiles, a log histogram, per-bin counts, means and percentiles;
+  per processing resource of every container: utilisation (window, per bin, max bin), ready and
+  all pods (mean, peak, per bin), replica-core-seconds, the group's HPA activity; call counts per
+  ExternalCallAction and EntryLevelSystemCall; per usage scenario the distinct container sets of
+  the sessions' synchronous paths with their counts (pods count as their scaled container);
+  created pods, rescales, peak pods, reversals.
+- *Failures.* A simulation that fails, hits the pod cap, the event limit or the wall-clock
+  limit returns `failed = true` with a `message` (and `capped` / `timedOut`), never an error of
+  the call; a panic is caught the same way. Wrong arguments (a group on something that is not a
+  ResourceContainer, a percentile outside 0..100) are errors of the call.
+- *Caching.* Deterministic, so cached per (digest of the model's PCM, arguments) in the
+  session's model and in the process (bounded by `SIM_RESULT_CACHE_SIZE` and `PCM_CACHE_MB`); a
+  script can call `pcmEvaluate` with the same arguments in every metric function for one
+  simulation. Timed-out runs are not cached.
 
 **Design detail** (`src/detail.rs`): `palladio-arch-service detail MODEL [REQUEST.json] [--out
 FILE]` (MODEL `.m` or mdeo model data `.json`), or `POST /pcm/detail` with the request plus
-`modelText` or `model` when the service runs with `PCM_DETAIL_ENDPOINT=1`. One simulation with full
-monitoring (scenarios, entry-level calls, system operations, assembly operations except recursive
-ones, every core of every processing resource), reduced to JSON named by PCM elements:
-response-time statistics, log histogram and per-bin mean/p95/throughput per series, utilisation,
-queue length and wait per resource, utilisation and replicas per container over time, SLO
-violations over time for the budgeted series, the load profile. Request: `durationS`, `warmUpS`,
-`binS`, `timeUnitMs`, `seed`, `usageStreams` (default on), `profile` [{scenario?, timeS,
-factor}], `overrides` [{resource, replicas, rate}], `budgetsMs` {key or name: ms}, `sloFactor`,
-`histogramPerDecade`, `assemblyOperations`, and `autoscaling` {groups, services, maxPods} for a
-dynamic run. A run that creates more than `maxPods` pods (default 400) stops and is reported as
-capped.
+`modelText` or `model` (only with `PCM_DETAIL_ENDPOINT=1`). The request is `pcmEvaluate`'s in
+JSON (API doc) plus `budgetsMs`, `sloFactor`, `histogramPerDecade`, `assemblyOperations`. It runs
+**the same simulation** with more monitors (assembly operations, every core of every processing
+resource; monitors do not change the run) and returns response-time statistics, histograms and
+per-bin series per scenario, call, system and assembly operation, utilisation, queue length and
+wait per resource, utilisation and replicas per container over time, SLO violations over time
+for the budgeted series, the load profile with the measured session rate per unit of the
+profile's factor, and the run's evaluation under `evaluation`. `palladio-arch-service evaluate
+MODEL REQUEST.json` prints only that evaluation.
 
 ## Command line
 
 ```text
 palladio-arch-service serve                      the plugin service (the default)
+palladio-arch-service evaluate MODEL [REQUEST.json] [--out FILE]
+                                                 pcmEvaluate on a model, the PcmEvaluation as JSON
 palladio-arch-service detail MODEL [REQUEST.json] [--out FILE]
-                                                 the design detail of a model's PCM (above)
-palladio-arch-service oracle MODEL... [--exclude A,B]
-                                                 the translation's analytic values (cost, modularity,
-                                                 utilisation, replicas, no-load times, failure, change
-                                                 coupling, inconsistency, latency and peak violations) of
-                                                 each model, one JSON object per line
-palladio-arch-service translate MODEL OUT_DIR    OUT_DIR/<name>.translated.m (plain PCM, formatted with the
-                                                 project's tools/format_model.py) and OUT_DIR/pcm/ (PCM XMI)
+                                                 the design detail of the same run (above)
 ```
-
-`MODEL` is an mdeo `.m` file or, for `detail` and `oracle`, mdeo model data (`.json`).
-`--exclude` names the usage scenarios the rate-weighted values leave out (default `login`).
-
-## Translation
-
-The completion of layer 2 (`architecture.mm`) into plain PCM, with its analytic cost,
-modularity and quality values: what the `arch*` functions evaluated. It stays as the reference
-the domain project checks its realisation by model transformations against (`oracle`,
-`translate`; DESIGN.md B3 there). The D numbers are the decisions in §12 of the archived
-project's DESIGN.md (`../old/palladio-architecture-optimization`). Applied to a copy of the
-model, in this order (`src/translate.rs`):
-
-| Step | Decision | PCM result |
-| --- | --- | --- |
-| 0 | `Colocation` | the assembly (which has no AllocationContext) is allocated in the container of its host, after the walks of the model before translation (placement, modularity, O3, O4 do not see it) |
-| 0 | `Work` | the InternalAction gets exponential demands, `cpuMs` on the CPU, then `hddMs` on the HDD, at the rates of the container of its component's first assembly (none without an assembly) |
-| 0 | `Workflow` with an `Orchestrated` style | every step (the call with its loop or branch) leaves its SEFF; the trigger's component makes them at the end of the trigger's SEFF, `stepCpuMs` each, as a forest (parallel siblings) or level by level; an asynchronous step to another container is a request and a reply through the broker; all in the background when the first step is asynchronous and remote (D42) |
-| 0 | `CallSite` with a `Bypass` | across containers: the callee's top-level CPU work on the caller, `latencyMs`, and the callee's calls into `direct` containers, made by the caller (D40) |
-| 0 | `CallSite` with a `ComposedCall` | across containers: the call (with its loop or branch) moves after the composer's call into the caller: `composeCpuMs`, then the composer's cache branch or the call; several in parallel (D39) |
-| 0 | `Redirect` | the call is re-pointed to `service` of `provider` through a role of the caller's component (wired from all its assemblies) and loses its parameter and return usages; its callee does not run, also not in the walks before translation |
-| 0 | `Notification` | right after `after`: `cpuMs` on its container's CPU, then an asynchronous fork with one call per `Delivery`; `published`, with a broker: first one publish through the publisher of the container (on its sidecar), the deliveries are messages whose stubs only travel (D43). Several after one action: the published ones end up last |
-| 0 | a `Mechanism` of another class | the call as modelled (that layer realises it with the completions); its `couplingWeight` and `staleReads` feed the modularity and O4 |
-| 1 | `AsyncCall` | the call inside a `ForkAction` with an asynchronous forked behaviour; through the broker to another container, no fork here: the stub publishes on the caller's path and forks the rest (D43) |
-| 1 | `CachedCall` | a probabilistic branch: hit = CPU `hitCpuMs` on the caller, miss = the call |
-| 2 | `RemoteCalls` | per assembly connector between two containers: a stub with the caller and a skeleton with the callee; one SEFF per signature, forwarding parameters and return values. Plain call: caller CPU, latency, call / callee CPU, call. Asynchronous: publish, then broker, latency, call in the background / deliver, call. Delivery of a published Notification: broker, latency, call / deliver, call. Orchestrated request: publish, broker, latency, call, broker, latency, deliver / deliver, call, publish (D43). Connectors into a `direct` container are left alone (D19); a sidecar has `sidecarCores` per replica (D20) |
-| 3a | `Deployable.autoscaling` → `Autoscaling` | n = the smallest count ≥ 1 with u/(n·q) ≤ `targetUtilisation` and u_s/(n·sidecarCores) ≤ target, u and u_s the CPU loads of the container and its sidecar (full-speed cores, one walk after rule 2), capped at `maxReplicas`; the sidecar gets n·sidecarCores cores; per `LoadLevel` the same with the load × factor, for the cost's weighted mean (D50) |
-| 3 | `Deployable` | n replicas of q cores: `numberOfReplicas` = n·⌈q⌉, `processingRate` × q/⌈q⌉ (limit-speed); with `quota`, full speed here |
-| 4 | `Deployable.quota`, `Node` | one load analysis (its walk gives the no-load times); a quota container runs at max(q′, 1 − u/(n⌈q⌉)·(1 − q′)/q′) of full speed (D45); node slowdown s = 1 + C(c, U)/(c − U) from the node's CPU load U; every CPU on the node runs at most at 1/s of full speed |
-
-Placement needs no step: the allocation is PCM. Generated names derive from the names of what
-they complete, and every step runs in name order, so the result does not depend on the order of
-the instances.
-
-Offered loads (`src/load.rs`) come from a walk over the PCM model with expected values, not from
-a simulation; see D11.
-
-Modularity (`translate.rs` `modularity`, DESIGN D32, D44) is the cohesive MQ of msa-sim-service's
-round 2, made generic: the modules are the components with a `Placement` that may sit outside the
-`RemoteCalls.direct` containers; each module's executions per time unit count as cohesion of its
-container; a call between two modules in different containers couples them by its frequency times
-its mechanism's `couplingWeight`, else 2 (bypass), 1 (sync, cached, a mechanism of another layer),
-0.5 (composed call) or 0.3 (async). A redirected call, or one that bypasses its callee across
-containers, does not run its callee. `ARCH_DEBUG_MQ=1`
-prints every cluster's intra and inter weight to stderr.
 
 ## Verification
 
-`cargo test --release` (52 tests, one more ignored; `tests/fixtures/two-tier.m` is a frontend →
-backend system, `tests/fixtures/chain.m` a gateway → frontend → backend chain with a database, a
-read side, a notifier and placeholders; the MiSArch tests read the domain project's
-`models/misarch-today.m` and are skipped without it):
+`cargo test --release` (`tests/evaluate.rs`, 8 tests; unit tests for the manifest with its
+defaults, the detail request and step means). Fixtures: `tests/fixtures/two-tier.m` (Frontend on
+C1, 5 ms, calls Backend on C2, 10 ms) and `tests/fixtures/paths.m` (Frontend calls Backend with
+probability 0.3 and forks Audit on C3 asynchronously):
 
-| Tests | Check |
+| Test | Check |
 | --- | --- |
-| `tests/pcm_ops.rs` | per-operation analyses (visits, failures, no-load times) against the per-scenario ones, also on MiSArch; per-scenario load profiles and usage streams (deterministic, common random numbers across designs, the runner's cache); the design detail (counts, histograms, budgets, utilisation against the analysis); PMF inputs enumerated exactly; the script functions as the platform calls them; dynamic runs: load balancers added by the plugin give the same run as given ones, the pods follow the load, settle at the ideal count at a constant load (1, 2, 3 pods), and creation is capped |
-| `tests/pcm_sources.rs` | `pcmSourceFailure`: a dedicated database counts a release once, a shared server with every tenant's, branches and chains mark a set once, one source per container is `pcmFailure` (also on MiSArch); `cost_per_call` (ignored) times both |
-| `tests/pcm.rs` | on the translated MiSArch model the `pcm*` analyses give the translation's offered loads and failure share |
-| `tests/translation.rs` | the translation rules above: demands and simulated response times per mechanism, replicas, quota, node slowdown, autoscaler counts and cost, cost, modularity, failure, change coupling, inconsistency, latency budget and peak capacity; deterministic and order independent; models without decisions simulate exactly as in palladio-sim-service |
-| unit tests | the manifest declares every function and record; the design detail's step means and request parsing |
+| `counts_response_times_and_core_seconds` | session, operation and call counts against the arrival rate; requested percentiles, histogram and per-bin series consistent with the window's; utilisation λD per container and per bin; cores × window as core-seconds; deterministic; `detailCalls` adds calls and assembly operations without changing the run |
+| `sync_path_sets` | the path sets {C1} and {C1, C2}, the latter 30 % (± 4 σ), C3 (asynchronous) never; the cap keeps the most frequent; call counts 1 and 0.3 per session |
+| `autoscaled_replicas_cost_and_paths` | the HPA settles at two pods at one core of load; core-seconds, per-bin pods, utilisation per pod; every session's set is {C1, C2} whichever pod served it; the plugin's load balancers are not reported |
+| `hpa_settings_are_arguments` | a `behavior` limiting scale-ups and a shorter sync period change the run |
+| `failures_are_evaluations` | pod cap, wall-clock limit, event limit and an unallocated assembly give `failed` (`capped`, `timedOut`); wrong arguments are errors |
+| `load_profile_and_usage_streams` | a per-scenario step raises the sessions after it; another design sees the same users |
+| `the_detail_is_the_evaluated_run` | the detail's `evaluation` equals `pcmEvaluate`'s; the JSON request maps to the same request |
+| `the_script_function` | `pcmEvaluate` as the platform calls it (records with defaults, nested lists); cached |
+
+Measured (release, this dev VM, one simulation thread), the today design of the domain project
+(`build/domain/detail-work/domain-w-today-*/realised/design.model.json`, 34 autoscaled services,
+105 containers): the compressed day (C4, 1320 s incl. 120 s warm-up, 10 s bins) 4.4 s wall, 16.8 M
+events, 0.32 GB RSS, 10 pods created, 1 823 path sets, 1.9 MB of JSON; 120 s of steady load 0.6 s,
+1.4 M events, 0.10 GB. The reproduction of SimuLizar's double resume (3600 s, seed 99) completes
+in 6.1 s (0.21 GB); with `fixDoubleResume = false` it returns `failed` with SimuLizar's error.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/functions.rs` | Manifest and function calls |
-| `src/pcm.rs` | The analyses of the `pcm*` functions (per model, cached) |
-| `src/pcmrun.rs` | Simulations with load profiles and usage streams |
-| `src/pcmhpa.rs`, `src/dynamic.rs` | Dynamic runs: the request and outcome; the SPD and HPA files and the run |
-| `src/detail.rs` | The design detail |
-| `src/load.rs` | Offered loads and call frequencies of a PCM model |
-| `src/translate.rs`, `src/translate/quality.rs` | The layer-2 translation, cost, modularity and quality values (the oracle); the load balancers of the dynamic runs |
+| `src/functions.rs` | The manifest (`pcmEvaluate`, its records and defaults) and the call |
+| `src/evaluate.rs` | The request, the run's reduction to the evaluation, the bounded cache |
+| `src/dynamic.rs` | The run: SPD and HPA configuration, SimOxide with path monitoring, readings at the bin edges |
+| `src/lb.rs` | The load balancers of SPD's service groups (Slingshot's pattern) |
+| `src/detail.rs` | The design detail and the monitors |
+| `src/pcm.rs` | The plain PCM of a model, held per model, with overrides |
 | `src/graph.rs` | The model as an editable instance graph (keeps opposite ends) |
 | `src/mfile.rs` | `.m` and model data reader |
 | `src/session.rs`, `src/server.rs` | Sessions and HTTP/WebSocket, adapted from palladio-sim-service |
+| `build.rs` | The version string |
 | `tests/` | The tests and their fixtures |
 
 ## Limitations
 
-- Composite components are not walked by the load analysis (a warning says so).
-- A redirected call loses its parameter and return usages.
-- `Work` uses the rates of the container of its component's first assembly.
-- Several assemblies of one component type on containers with different CPU rates share one
-  cache-hit demand (D9).
-- Rule 0 works on a component's first assembly: the roles it adds are wired from every assembly,
-  but co-location and the composer's container are judged by the first one.
-- A bypass copies the CPU of the callee's top-level internal actions only; demands that depend on
-  parameters, and calls inside loops or branches, are left out (with a warning for the former).
-- An orchestrated step whose loop or branch also holds other calls moves them along, on the
-  consumer's roles; the MiSArch steps have none.
+- Utilisation of an autoscaled container is per ready pod; a pod's CPU is tracked from the
+  first bin edge after its creation (a scale-out mid-bin loses at most that bin's part).
+- Call counts are per external call action, summed over all assembly contexts of its component.
+- Load balancers serve components with one provided interface and callers that read no return
+  value (Slingshot's load balancers hand nothing back).
+- Times inside a group's `behaviorJson` are model time units (seconds when msPerTimeUnit = 1000).

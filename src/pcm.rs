@@ -9,7 +9,7 @@
 //! and the HPA when containers autoscale) and returns what it measured.
 
 use crate::graph::{Graph, is_pcm};
-use palladio_sim_service::protocol::{WireModel, WireValue};
+use crate::protocol::{WireModel, WireValue};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build and start the Palladio architecture plugin service.
+# Build and start the Palladio Simulation plugin service.
 #
 #   ./run.sh                    build (release), then serve on port 3022
 #   ./run.sh --no-build         start the last build
@@ -23,4 +23,4 @@ if [[ "${1:-}" != "--no-build" ]]; then
     (cd "$DIR" && cargo build --release --quiet -j "${BUILD_JOBS:-4}")
 fi
 
-exec "$DIR/target/release/palladio-arch-service" serve
+exec "$DIR/target/release/palladio-sim-service" serve

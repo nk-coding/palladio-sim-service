@@ -1,4 +1,4 @@
-# Palladio Architecture plugin service (`palladio-arch-service`)
+# Palladio Simulation plugin service (`palladio-sim-service`)
 
 An mdeo plugin service, written in Rust, that does one thing: it **simulates the plain Palladio
 (PCM) part of a model with [SimOxide](../simoxide)** and returns what the simulation measured.
@@ -7,9 +7,17 @@ Kubernetes-style autoscaling through SPD and SimOxide's HPA) and returns raw mea
 response-time statistics, utilisation and pods per processing resource, call counts and the
 container sets of the sessions' synchronous paths, over a window and per time bin. Every
 interpretation (cost, failure model, budgets, consistency, which percentile matters) belongs to
-the mdeo scripts. It uses [palladio-sim-service](../palladio-sim-service) as a library
-(protocol, auth, PCM schema, XMI writer). Used by the domain project
+the mdeo scripts. It also owns the Palladio metamodel as mdeo sees it (`gen-metamodel`) and the
+PCM ⇄ mdeo conversion (`import`, the XMI writer). Used by the domain project
 ([palladio-architecture-optimization-domain](../palladio-architecture-optimization-domain)).
+
+**One repository, one plugin (2026-10-22).** This repository merges the former
+`palladio-sim-service` (the Palladio Simulation plugin: metamodel, import, protocol, auth,
+`pcmSimulate`/`pcmStat`; tag `sim-service-final` = its last commit a5ee9d6) and the former
+`palladio-arch-service` (the architecture plugin: `pcmEvaluate`, the design detail; tag
+`arch-service-final`). Both histories are reachable (`git log --all`). Dropped in the merge:
+`pcmSimulate`, `pcmStat` and their engine (compiled-model cache, replications), the second
+session/server layer, the `summary` command. `pcmEvaluate` replaces them.
 
 The analytic functions (`pcmResources`, `pcmScenarios`, `pcmOperations`, `pcmCallRates`,
 `pcmWeightedVisits`, `pcmOperationVisits`, `pcmFailure`, `pcmSourceFailure`,
@@ -21,14 +29,16 @@ translation with its `oracle` and `translate` commands were removed on 2026-10-2
 ## Deployment
 
 ```bash
-cargo build --release          # → target/release/palladio-arch-service
-PORT=3022 target/release/palladio-arch-service serve
+cargo build --release          # → target/release/palladio-sim-service
+PORT=3022 target/release/palladio-sim-service serve
 ./run.sh                       # the same: build, then serve on 3022 (./run.sh --no-build: no build)
 ```
 
 Build against SimOxide's `main` (`../simoxide`, path dependencies; at least `1429209`, which has
-the path monitoring and `fix_double_resume`) and `../palladio-sim-service`. The binary needs no
-files at run time.
+the path monitoring and `fix_double_resume`). The binary needs no files at run time. The cargo
+feature `exact` (SimuLizar-exact mode, only for the `roundtrip` command's comparison with the
+reference) links code without a licence grant (SimOxide's LICENSES, section 7): never deploy a
+build with it.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -42,12 +52,17 @@ files at run time.
 | `SIM_MAX_EVENTS` | `0` (none) | hard event limit per simulation |
 | `MAX_SESSIONS` | `256` | concurrent script sessions |
 | `SIM_DUMP_DIR` | unset | writes every received model there (`received-*.txt`), for debugging |
+| `RUST_LOG` | `info` | log filter (tracing) |
 | `PCM_DETAIL_ENDPOINT` | unset | `1` enables `POST /pcm/detail` (unauthenticated simulations; leave off on a shared server) |
 
 **Registering it in mdeo:** under **Settings → Plugins** add the URL the service is reachable at
 (e.g. `http://host:3022/`); mdeo reads the manifest from `GET /` and opens script sessions on
-`/ws/sessions/...`. Enable **Palladio Architecture** in a project; scripts then see
-`pcmEvaluate` and its records (`PcmEvaluation`, …).
+`/ws/sessions/contrib/palladio-arch/functions`. Enable **Palladio Simulation** in a project;
+scripts then see `pcmEvaluate` and its records (`PcmEvaluation`, …). The manifest keeps the ids
+of the former architecture plugin (plugin `palladio-arch-service`, contribution `palladio-arch`),
+so projects and compiled scripts that use `pcmEvaluate` need no change; a registration of the
+former Palladio Simulation plugin (`palladio-sim-service`, contribution `palladio`, port 3020)
+is obsolete and should be removed (its `pcmSimulate`/`pcmStat` no longer exist).
 
 **Version:** the manifest's `version` (also in its descriptions) and every `PcmEvaluation`'s
 `version` field are `<date of the last commit>+<git hash>` (`-dirty` for a build with uncommitted
@@ -103,7 +118,7 @@ hpaCpuInitialisationSeconds = 300, maxPathSets = 10000, wallSeconds = 60, maxEve
   script can call `pcmEvaluate` with the same arguments in every metric function for one
   simulation. Timed-out runs are not cached.
 
-**Design detail** (`src/detail.rs`): `palladio-arch-service detail MODEL [REQUEST.json] [--out
+**Design detail** (`src/detail.rs`): `palladio-sim-service detail MODEL [REQUEST.json] [--out
 FILE]` (MODEL `.m` or mdeo model data `.json`), or `POST /pcm/detail` with the request plus
 `modelText` or `model` (only with `PCM_DETAIL_ENDPOINT=1`). The request is `pcmEvaluate`'s in
 JSON (API doc) plus `budgetsMs`, `sloFactor`, `histogramPerDecade`, `assemblyOperations`. It runs
@@ -112,23 +127,101 @@ resource; monitors do not change the run) and returns response-time statistics, 
 per-bin series per scenario, call, system and assembly operation, utilisation, queue length and
 wait per resource, utilisation and replicas per container over time, SLO violations over time
 for the budgeted series, the load profile with the measured session rate per unit of the
-profile's factor, and the run's evaluation under `evaluation`. `palladio-arch-service evaluate
+profile's factor, and the run's evaluation under `evaluation`. `palladio-sim-service evaluate
 MODEL REQUEST.json` prints only that evaluation.
 
 ## Command line
 
 ```text
-palladio-arch-service serve                      the plugin service (the default)
-palladio-arch-service evaluate MODEL [REQUEST.json] [--out FILE]
+palladio-sim-service serve                       the plugin service (the default)
+palladio-sim-service evaluate MODEL [REQUEST.json] [--out FILE]
                                                  pcmEvaluate on a model, the PcmEvaluation as JSON
-palladio-arch-service detail MODEL [REQUEST.json] [--out FILE]
+palladio-sim-service detail MODEL [REQUEST.json] [--out FILE]
                                                  the design detail of the same run (above)
+palladio-sim-service gen-metamodel [DIR]         palladio.mm and pcm/repository.mm (below)
+palladio-sim-service import [--readable] DIR [MM]
+                                                 the PCM XMI model of DIR as an mdeo model (.m)
+palladio-sim-service roundtrip DIR...            PCM -> mdeo -> PCM for corpus models, simulated and compared
+```
+
+## The Palladio metamodel
+
+`palladio-sim-service gen-metamodel [DIR]` writes the metamodel into `DIR`. It is generated from
+SimOxide's PCM 5.2 Ecore tables and holds the classes and features the simulator reads, 155
+classes. Models and scripts use `palladio.mm`.
+
+| File | Contents |
+| --- | --- |
+| `pcm/repository.mm` | The base part, which imports nothing: component types, interfaces, signatures, roles, data types (33 classes) |
+| `palladio.mm` | Imports the base part and holds everything else (122 classes); the mapping rules; one view per package group |
+
+A class lives in the base part when its PCM package is `pcm.core` or `pcm.repository`, unless the
+metamodel language forces it into `palladio.mm`:
+- A file may name an association end only on a class of its own. A containment or pair of
+  opposites is named at both ends, so its two classes share a file.
+- Parameter usages (`VariableUsage`) are contained by component implementations, SEFF actions,
+  assembly contexts and usage model calls, so these share `palladio.mm`.
+- Only `BasicComponent`, `CompositeComponent`, `ImplementationComponentType` and `PassiveResource`
+  move.
+- Each enum lives in the first file that uses it.
+
+Where a class lives does not decide how the metamodel is shown: `palladio.mm` declares a view for
+every package group (`Core`, `Repository`, `Behaviour`, `Parameters`, `Composition`,
+`ResourceEnvironment`, `Allocation`, `UsageModel`, `Monitoring`), listing the group's classes from
+either file. The metamodel editor switches between them in its toolbox.
+
+`cargo test` checks these rules on the generated layout (`mm::tests`).
+
+Mapping rules:
+- Classes keep their PCM names.
+- Features drop their EMF suffix (`components__Repository` → `components`).
+- An instance's name is its PCM id.
+- Stochastic expressions are strings holding the StoEx (`processingRate = "2.5"`).
+- Variable references are dot-separated names (`"items.NUMBER_OF_ELEMENTS"`).
+- References into Palladio's library models are enums: `ProcessingResourceType.CPU`,
+  `SchedulingPolicy.PROCESSOR_SHARING`, `MetricDescription.RESPONSE_TIME`, ...
+- Containment is composition.
+- All multiplicities are optional (`[?]`, `[*]`), so any PCM file converts.
+- PCM lists are ordered, but mdeo association ends are not: the platform sends them sorted by
+  name. The service therefore orders every list by the declaration order of the instances.
+  Imported models are written in PCM tree order, so they get back exactly their original order.
+
+The same mapping serves three purposes:
+- writing the metamodel;
+- importing PCM models: `palladio-sim-service import [--readable] DIR [../palladio.mm] > model.m`;
+- turning received models back into PCM XMI for the simulator, one file per root instance,
+  written as EMF writes them.
+
+The domain project's `metamodel/palladio.mm` and `metamodel/pcm/repository.mm` are this
+command's output byte for byte (checked 2026-10-22).
+
+## Parallelism
+
+- **Simulations** run on `SIM_THREADS` blocking threads, never on the async runtime. Calls of
+  all sessions spread over the same threads; equal requests wait for one simulation.
+- **Sessions** are independent; each handles its calls in order, as the protocol requires.
+- **Keepalive.** Every session pings every 30 s and drops a peer silent for 90 s, and keeps
+  answering while a long simulation runs.
+
+Throughput through the protocol (`BENCH_SESSIONS` sessions × `BENCH_CALLS` calls of the
+SimuLizar mediastore example, 600 s each, a seed per call):
+
+```bash
+SIM_THREADS=22 cargo test --release --test session throughput -- --ignored --nocapture
 ```
 
 ## Verification
 
-`cargo test --release` (`tests/evaluate.rs`, 10 tests; unit tests for the manifest with its
-defaults, the canonical form, the detail request and step means). Fixtures: `tests/fixtures/two-tier.m` (Frontend on
+`cargo test --release`: `tests/evaluate.rs` (10 tests), `tests/session.rs` (4 tests and the
+ignored throughput benchmark: the service end to end over its WebSocket endpoint with
+self-signed RS256 tokens, corpus models imported and evaluated through the protocol equal to the
+library's evaluation, refusal codes 4401/4404/4409, `unknown-model`, 24 parallel sessions),
+`tests/kotlin_compat.rs` (ignored; against the platform's kotlinx-serialization classes), unit
+tests (manifest with its defaults, canonical form, protocol decoding of the specification's
+reference bytes, metamodel layout rules, schema, detail request, step means).
+`palladio-sim-service roundtrip` on SimOxide's corpus (`h*`, `x_sl*`): PCM → mdeo → PCM
+simulates identically; in a local `--features exact` build also byte-identical to SimuLizar's
+stored `measurements.csv` (39/39 checked 2026-10-22). Fixtures: `tests/fixtures/two-tier.m` (Frontend on
 C1, 5 ms, calls Backend on C2, 10 ms) and `tests/fixtures/paths.m` (Frontend calls Backend with
 probability 0.3 and forks Audit on C3 asynchronously):
 
@@ -165,7 +258,12 @@ in 6.1 s (0.21 GB); with `fixDoubleResume = false` it returns `failed` with Simu
 | `src/canon.rs` | The canonical form (names and order from the structure) and the way back |
 | `src/graph.rs` | The model as an editable instance graph (keeps opposite ends) |
 | `src/mfile.rs` | `.m` and model data reader |
-| `src/session.rs`, `src/server.rs` | Sessions and HTTP/WebSocket, adapted from palladio-sim-service |
+| `src/schema.rs` | The Palladio metamodel as mdeo sees it, derived from the PCM Ecore tables |
+| `src/mm.rs`, `src/mtext.rs` | Writers for `.mm` (split into parts) and `.m` |
+| `src/import.rs` | PCM XMI → mdeo model |
+| `src/xmi.rs` | mdeo model → PCM XMI |
+| `src/protocol.rs`, `src/session.rs`, `src/server.rs`, `src/auth.rs`, `src/config.rs` | `script-functions` protocol (CBOR), sessions, HTTP/WebSocket, token verification, configuration |
+| `examples/scc.rs` | A helper that prints the metamodel's dependency groups |
 | `build.rs` | The version string |
 | `tests/` | The tests and their fixtures |
 

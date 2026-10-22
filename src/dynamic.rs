@@ -15,8 +15,8 @@
 //!   `maxCreatedPods`), and so does one past the engine's limits (`SIM_TIMEOUT_SECONDS`,
 //!   `SIM_MAX_EVENTS`); it is reported as capped, so an evaluation never grows without bound.
 
-use palladio_sim_service::protocol::WireModel;
-use palladio_sim_service::{schema, xmi};
+use crate::protocol::WireModel;
+use crate::{schema, xmi};
 use simoxide_reconf::{QvtoAdjuster, QvtoCore, SpdAdjust};
 use simoxide_sim::{CompiledModel, Fast, Limits, LoadProfile, Mode, Outputs, Pause, RunSpec, Simulation};
 use simoxide_spd::Quirks;

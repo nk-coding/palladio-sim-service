@@ -4,10 +4,9 @@
 
 use crate::functions::{self, CONTRIBUTION_ID, SESSION_NAME};
 use crate::session::Session;
-use palladio_sim_service::auth::{SCOPE_SESSION_CONNECT, Verifier};
-use palladio_sim_service::config::Config;
-use palladio_sim_service::engine::Engine;
-use palladio_sim_service::protocol::{self, decode_client, encode_service};
+use crate::auth::{SCOPE_SESSION_CONNECT, Verifier};
+use crate::config::Config;
+use crate::protocol::{self, decode_client, encode_service};
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, RawQuery, State};
@@ -29,7 +28,7 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_MESSAGE_BYTES: usize = 512 << 20;
 
 pub struct AppState {
-    pub engine: Arc<Engine>,
+    pub config: Arc<Config>,
     verifier: Verifier,
     manifest: String,
     fingerprint: HeaderValue,
@@ -61,7 +60,7 @@ pub fn app(config: Config) -> (Router, Arc<AppState>) {
     let state = Arc::new(AppState {
         verifier: Verifier::new(&config.backend_api_url, &config.jwt_issuer),
         max_sessions: config.max_sessions,
-        engine: Arc::new(Engine::new(config)),
+        config: Arc::new(config),
         manifest,
         fingerprint: HeaderValue::from_str(&fingerprint).expect("hex"),
         open_sessions: AtomicUsize::new(0),
@@ -90,10 +89,10 @@ async fn serve(config: Config) -> Result<(), String> {
     let (router, state) = app(config);
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     info!(
-        "palladio-arch-service on http://{addr}: {} simulation threads, up to {} sessions, backend {}",
-        state.engine.threads(),
+        "palladio-sim-service (Palladio Simulation) on http://{addr}: {} simulation threads, up to {} sessions, backend {}",
+        state.config.threads(),
         state.max_sessions,
-        state.engine.config.backend_api_url
+        state.config.backend_api_url
     );
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
@@ -137,7 +136,7 @@ async fn detail_handler(State(state): State<Arc<AppState>>, body: axum::body::By
         Ok(x) => x,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", &e),
     };
-    let runner = crate::evaluate::evaluator(&state.engine.config);
+    let runner = crate::evaluate::evaluator(&state.config);
     let limits = runner.limits();
     let _permit = match runner.permits.acquire().await.map_err(|e| e.to_string()) {
         Ok(p) => p,
@@ -235,14 +234,14 @@ async fn open_session(
     let short = |s: &str| s.chars().take(8).collect::<String>();
     let label = format!("session {}/{}", short(&project), short(&execution));
     info!("{label}: opened ({} open)", state.open_sessions.load(Ordering::SeqCst));
-    let summary = run_session(state.engine.clone(), socket, label.clone()).await;
+    let summary = run_session(state.config.clone(), socket, label.clone()).await;
     let open = state.open_sessions.fetch_sub(1, Ordering::SeqCst) - 1;
     info!("{label}: closed after {summary} ({open} open)");
 }
 
 /// Reads continuously (keepalives, the next messages), writes from one task, and handles the
 /// protocol messages in order on another.
-async fn run_session(engine: Arc<Engine>, socket: WebSocket, label: String) -> String {
+async fn run_session(config: Arc<Config>, socket: WebSocket, label: String) -> String {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
     let writer = tokio::spawn(async move {
@@ -257,7 +256,7 @@ async fn run_session(engine: Arc<Engine>, socket: WebSocket, label: String) -> S
     let replies = out_tx.clone();
     let processor_label = label.clone();
     let processor = tokio::spawn(async move {
-        let mut session = Session::new(engine, processor_label.clone());
+        let mut session = Session::new(config, processor_label.clone());
         while let Some(bytes) = in_rx.recv().await {
             let message = match decode_client(&bytes) {
                 Ok(m) => m,

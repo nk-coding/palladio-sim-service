@@ -164,7 +164,7 @@ if (e.failed) { /* infeasible */ }
 
 ## Design detail (explorer)
 
-`palladio-arch-service detail MODEL REQUEST.json` / `POST /pcm/detail` take the same arguments
+`palladio-sim-service detail MODEL REQUEST.json` / `POST /pcm/detail` take the same arguments
 in JSON (`durationS` = end, `warmUpS`, `binS`, `timeUnitMs`, `profile` [{scenario?, timeS,
 factor}], `groups` [{container, min, max, target, initial, startupS, scaleDownS?, cpuRequest?,
 behavior?}], `services`, `overrides` [{resource, replicas, rate}], `percentiles`, `seed`,
@@ -174,4 +174,4 @@ behavior?}], `services`, `overrides` [{resource, replicas, rate}], `percentiles`
 own `budgetsMs`, `sloFactor`, `histogramPerDecade`, `assemblyOperations`. It runs **the same
 simulation** with more monitors (which do not change the run) and adds the evaluation under
 `evaluation` (the `PcmEvaluation` fields as JSON, instances by id).
-`palladio-arch-service evaluate MODEL REQUEST.json` prints only the evaluation.
+`palladio-sim-service evaluate MODEL REQUEST.json` prints only the evaluation.

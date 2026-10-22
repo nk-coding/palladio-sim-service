@@ -31,6 +31,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// The element ids of a measuring-point key (`Kind[id|id|...]`): the measured elements.
+pub fn key_elements(mp: &str) -> Vec<String> {
+    let inner = mp.split_once('[').map_or("", |x| x.1).trim_end_matches(']');
+    inner.split('|').filter(|s| !s.is_empty() && !s.contains('=') && *s != "null").map(String::from).collect()
+}
+
 /// The plugin build: date and git hash (`build.rs`).
 pub const VERSION: &str = env!("PLUGIN_VERSION");
 
@@ -720,7 +726,7 @@ fn reduce(cache: &PcmCache, g: &Graph, req: &Request, groups: &[PodGroup], raw: 
         }
         let mp: &str = &def.mp;
         let kind = mp.split('[').next().unwrap_or("");
-        let ids = palladio_sim_service::engine::key_elements(mp);
+        let ids = key_elements(mp);
         let rows = &raw.meas.rows[i];
         let known = |x: &str| input.has(x).then(|| x.to_string());
         match kind {
@@ -1041,7 +1047,7 @@ pub struct Evaluator {
 
 /// The process's evaluator, sized like the engine (`SIM_THREADS`: simulations at once,
 /// `SIM_RESULT_CACHE_SIZE`: evaluations kept, `SIM_TIMEOUT_SECONDS`, `SIM_MAX_EVENTS`).
-pub fn evaluator(config: &palladio_sim_service::config::Config) -> &'static Evaluator {
+pub fn evaluator(config: &crate::config::Config) -> &'static Evaluator {
     static E: OnceLock<Evaluator> = OnceLock::new();
     let mb: usize = std::env::var("PCM_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
     E.get_or_init(|| Evaluator {

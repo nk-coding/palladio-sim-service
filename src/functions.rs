@@ -8,8 +8,8 @@
 
 use crate::dynamic::Controller;
 use crate::evaluate::{self, Evaluation, LoadStep, Request, ResponseStat, ScalingGroup, ServiceGroup, VERSION};
-use palladio_sim_service::engine::Engine;
-use palladio_sim_service::protocol::{HeapKind, HeapObject, WireValue};
+use crate::config::Config;
+use crate::protocol::{HeapKind, HeapObject, WireValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -277,7 +277,7 @@ pub fn manifest() -> Value {
     }
     json!({
         "id": PLUGIN_ID,
-        "name": "Palladio Architecture",
+        "name": "Palladio Simulation",
         "version": VERSION,
         "description": format!("Simulates the plain Palladio (PCM) part of a model with SimOxide and returns the measurements (version {VERSION})"),
         "icon": [
@@ -297,7 +297,7 @@ pub fn manifest() -> Value {
                 "classes": classes,
                 "types": types,
                 "id": CONTRIBUTION_ID,
-                "sessions": {SESSION_NAME: {"protocol": palladio_sim_service::protocol::PROTOCOL, "versions": [palladio_sim_service::protocol::VERSION]}}
+                "sessions": {SESSION_NAME: {"protocol": crate::protocol::PROTOCOL, "versions": [crate::protocol::VERSION]}}
             }]
         }]
     })
@@ -629,7 +629,7 @@ fn evaluation(e: &Evaluation, next_id: &mut impl FnMut() -> i64) -> Answer {
 
 /// Answers a call on the model's plain PCM `cache`.
 pub async fn call(
-    engine: &Arc<Engine>,
+    config: &Arc<Config>,
     operation: &str,
     args: &[WireValue],
     lists: &Lists,
@@ -638,7 +638,7 @@ pub async fn call(
 ) -> Result<Answer, String> {
     let f = FUNCTIONS.iter().find(|f| f.name == operation).ok_or_else(|| format!("unknown operation {operation}"))?;
     let req = Args { f, args }.request(lists)?.canonical(&cache.canon);
-    let e = evaluate::evaluator(&engine.config).evaluate(cache, req).await.map_err(|e| cache.canon.orig_text(&e, false))?;
+    let e = evaluate::evaluator(config).evaluate(cache, req).await.map_err(|e| cache.canon.orig_text(&e, false))?;
     Ok(evaluation(&e.to_caller(&cache.canon), next_id))
 }
 

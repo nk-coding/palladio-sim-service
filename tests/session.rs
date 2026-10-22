@@ -1,7 +1,7 @@
 //! The service end to end, over its WebSocket session endpoint, as an execution would use it:
 //! RS256 session tokens checked against a JWKS endpoint, the `script-functions` protocol in CBOR,
-//! and models imported from SimOxide's corpus, whose results must equal a direct run of the
-//! original PCM files (which reproduces SimuLizar byte for byte).
+//! and models imported from SimOxide's corpus, whose `pcmEvaluate` answers must equal the
+//! library's evaluation of the same model.
 
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -10,6 +10,8 @@ use palladio_sim_service::import::{entry_files, import_files, run_spec};
 use palladio_sim_service::protocol::{
     ClientMessage, ServiceMessage, WireMetamodel, WireModel, WireValue, decode_service, encode_client,
 };
+use palladio_sim_service::evaluate::{self, Monitors, Request};
+use palladio_sim_service::pcm::PcmCache;
 use palladio_sim_service::server;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -99,7 +101,7 @@ async fn connect(addr: std::net::SocketAddr, path: &str, token: Option<&str>) ->
 }
 
 async fn session(addr: std::net::SocketAddr) -> Ws {
-    connect(addr, "/ws/sessions/contrib/palladio/functions?v=1", Some(&token("contrib:palladio", "functions"))).await
+    connect(addr, "/ws/sessions/contrib/palladio-arch/functions?v=1", Some(&token("contrib:palladio-arch", "functions"))).await
 }
 
 async fn send(ws: &mut Ws, m: &ClientMessage) {
@@ -129,13 +131,22 @@ fn corpus_model(name: &str) -> (PathBuf, simoxide_sim::RunSpec, WireModel) {
     (dir, spec, model)
 }
 
-fn simulate_args(spec: &simoxide_sim::RunSpec, replications: i32) -> Vec<WireValue> {
+/// `pcmEvaluate`'s positional arguments up to the seed: end, warm-up, bins, ms per unit, then
+/// null lists and the defaults.
+fn evaluate_args(end: f64, seed: i32) -> Vec<WireValue> {
     vec![
-        WireValue::Int(spec.seed as i32),
-        WireValue::Int(spec.max_measurements as i32),
-        WireValue::Int(spec.max_sim_time as i32),
-        WireValue::Int(replications),
-        WireValue::Bool(spec.simulate_linking_resources),
+        WireValue::Double(end),
+        WireValue::Double(0.0),
+        WireValue::Double(10.0),
+        WireValue::Double(1000.0),
+        WireValue::Null,
+        WireValue::Null,
+        WireValue::Null,
+        WireValue::Null,
+        WireValue::Null,
+        WireValue::Bool(false),
+        WireValue::Int(10),
+        WireValue::Int(seed),
     ]
 }
 
@@ -149,122 +160,54 @@ fn field<'a>(v: &'a WireValue, name: &str) -> &'a WireValue {
     &fields.iter().find(|(k, _)| k == name).unwrap_or_else(|| panic!("no field {name}")).1
 }
 
-fn double(v: &WireValue) -> f64 {
-    match v {
-        WireValue::Double(d) => *d,
-        other => panic!("not a double: {other:?}"),
-    }
+fn list<'a>(objects: &'a [palladio_sim_service::protocol::HeapObject], v: &WireValue) -> &'a [WireValue] {
+    let WireValue::Ref(id) = v else { panic!("not a list: {v:?}") };
+    objects.iter().find(|o| o.id == *id).unwrap().elements.as_deref().unwrap()
 }
 
-/// Direct SimOxide run of the original PCM files: the reference.
-fn direct(dir: &Path, spec: &simoxide_sim::RunSpec, seed: i64) -> Vec<simoxide_sim::SeriesSummary> {
-    let cm = simoxide_sim::CompiledModel::compile(spec.load_model(dir).unwrap()).unwrap();
-    let mut cfg = spec.sim_config("");
-    cfg.seed = seed;
-    simoxide_sim::run(&cm, cfg, simoxide_sim::Outputs::default()).unwrap().measurements.summaries()
-}
-
-/// Every series of a `pcmSimulate` answer equals the direct run's summary, bit for bit.
-fn assert_same(answer: &ServiceMessage, reference: &[simoxide_sim::SeriesSummary]) {
+/// The answer equals the library's evaluation of the model: sessions and operations, counts and
+/// percentiles bit for bit.
+fn assert_same(answer: &ServiceMessage, model: &WireModel, end: f64, seed: i64) {
     let ServiceMessage::Result { objects, value, .. } = answer else { panic!("{answer:?}") };
-    let WireValue::Ref(id) = field(value, "series") else { panic!() };
-    let list = objects.iter().find(|o| o.id == *id).unwrap();
-    let series = list.elements.as_ref().unwrap();
-    assert_eq!(series.len(), reference.len());
-    for (s, r) in series.iter().zip(reference) {
-        assert_eq!(field(s, "measuringPoint"), &WireValue::String(r.measuring_point.clone()));
-        assert_eq!(field(s, "count"), &WireValue::Long(r.count as i64));
-        for (name, want) in [("mean", r.mean), ("stdDev", r.std_dev), ("min", r.min), ("max", r.max), ("p90", r.p90), ("p99", r.p99)] {
-            assert_eq!(double(field(s, name)).to_bits(), want.to_bits(), "{} {name}", r.measuring_point);
-        }
-        match r.time_weighted_mean {
-            Some(t) => assert_eq!(double(field(s, "timeWeightedMean")).to_bits(), t.to_bits()),
-            None => assert_eq!(field(s, "timeWeightedMean"), &WireValue::Null),
+    let want = evaluate::run_caller(&PcmCache::new(model), &Request { end_s: end, seed, ..Request::default() }, Monitors::default(), Default::default()).unwrap();
+    assert_eq!(field(value, "failed"), &WireValue::Bool(want.failed), "{}", want.message);
+    for (name, stats) in [("sessions", &want.sessions), ("operations", &want.operations)] {
+        let got = list(objects, field(value, name));
+        assert_eq!(got.len(), stats.len(), "{name}");
+        for (g, w) in got.iter().zip(stats.iter()) {
+            assert_eq!(field(g, "key"), &WireValue::String(w.key.clone()));
+            assert_eq!(field(g, "count"), &WireValue::Long(w.count as i64));
+            let p: Vec<WireValue> = w.percentiles_ms.iter().map(|x| WireValue::Double(*x)).collect();
+            assert_eq!(list(objects, field(g, "percentilesMs")), p.as_slice());
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn results_equal_the_reference_through_the_protocol() {
+async fn evaluations_through_the_protocol() {
     let addr = start().await;
     let mut ws = session(addr).await;
-    for (i, name) in ["h01_ps_single", "x_sl_mediastore", "h21_stoex_distributions", "x_pem_fork", "h13_passive_contention"]
-        .iter()
-        .enumerate()
-    {
-        let (dir, spec, model) = corpus_model(name);
-        upload(&mut ws, i as i64 + 1, model).await;
-        let call = ClientMessage::Call {
-            call_id: i as i64 + 1,
-            operation: "pcmSimulate".into(),
-            objects: vec![],
-            args: simulate_args(&spec, 1),
-            model_id: Some(i as i64 + 1),
-        };
+    for (i, name) in ["h01_ps_single", "x_sl_mediastore", "h21_stoex_distributions", "h11_fork_sync", "h13_passive_contention"].iter().enumerate() {
+        let (_, _, model) = corpus_model(name);
+        upload(&mut ws, i as i64 + 1, model.clone()).await;
+        let call = ClientMessage::Call { call_id: i as i64 + 1, operation: "pcmEvaluate".into(), objects: vec![], args: evaluate_args(200.0, 1), model_id: Some(i as i64 + 1) };
         send(&mut ws, &call).await;
-        assert_same(&answer(&mut ws).await, &direct(&dir, &spec, spec.seed));
+        let a = answer(&mut ws).await;
+        if let ServiceMessage::Result { value, .. } = &a {
+            assert_eq!(field(value, "failed"), &WireValue::Bool(false), "{name}: {:?}", field(value, "message"));
+        }
+        assert_same(&a, &model, 200.0, 1);
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stat_picks_one_series() {
-    let addr = start().await;
-    let mut ws = session(addr).await;
-    let (dir, spec, model) = corpus_model("h01_ps_single");
-    upload(&mut ws, 7, model).await;
-    let reference = direct(&dir, &spec, spec.seed);
-    let rt = reference.iter().find(|s| s.measuring_point.starts_with("UsageScenario")).unwrap().mean;
-    let mut args = vec![
-        WireValue::String("_h01_ps_single_us1".into()),
-        WireValue::String("Response Time".into()),
-        WireValue::String("mean".into()),
-    ];
-    args.extend(simulate_args(&spec, 1));
-    send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmStat".into(), objects: vec![], args: args.clone(), model_id: Some(7) }).await;
-    let ServiceMessage::Result { value, .. } = answer(&mut ws).await else { panic!() };
-    assert_eq!(double(&value).to_bits(), rt.to_bits());
-    // By the monitor's entity name too.
-    args[0] = WireValue::String("RT scenario Scenario".into());
-    send(&mut ws, &ClientMessage::Call { call_id: 2, operation: "pcmStat".into(), objects: vec![], args: args.clone(), model_id: Some(7) }).await;
-    let ServiceMessage::Result { value, .. } = answer(&mut ws).await else { panic!() };
-    assert_eq!(double(&value).to_bits(), rt.to_bits());
-    // An unknown element is an error the script sees.
-    args[0] = WireValue::String("nothing".into());
-    send(&mut ws, &ClientMessage::Call { call_id: 3, operation: "pcmStat".into(), objects: vec![], args, model_id: Some(7) }).await;
-    let ServiceMessage::Failure { message, code: None, .. } = answer(&mut ws).await else { panic!() };
-    assert!(message.contains("nothing measured for 'nothing'"), "{message}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_not_held_is_unknown() {
     let addr = start().await;
     let mut ws = session(addr).await;
-    let (_, spec, _) = corpus_model("h01_ps_single");
-    let call = ClientMessage::Call { call_id: 1, operation: "pcmSimulate".into(), objects: vec![], args: simulate_args(&spec, 1), model_id: Some(3) };
+    let call = ClientMessage::Call { call_id: 1, operation: "pcmEvaluate".into(), objects: vec![], args: evaluate_args(10.0, 1), model_id: Some(3) };
     send(&mut ws, &call).await;
     let ServiceMessage::Failure { code, .. } = answer(&mut ws).await else { panic!() };
     assert_eq!(code.as_deref(), Some("unknown-model"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn replications_run_with_consecutive_seeds() {
-    let addr = start().await;
-    let mut ws = session(addr).await;
-    let (dir, spec, model) = corpus_model("x_sl_mediastore");
-    upload(&mut ws, 1, model).await;
-    send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmSimulate".into(), objects: vec![], args: simulate_args(&spec, 4), model_id: Some(1) }).await;
-    let ServiceMessage::Result { objects, value, .. } = answer(&mut ws).await else { panic!() };
-    assert_eq!(field(&value, "replications"), &WireValue::Int(4));
-    let runs: Vec<Vec<simoxide_sim::SeriesSummary>> = (0..4).map(|r| direct(&dir, &spec, spec.seed + r)).collect();
-    let series = objects[0].elements.as_ref().unwrap();
-    let first = series
-        .iter()
-        .find(|s| matches!(field(s, "measuringPoint"), WireValue::String(m) if m.starts_with("UsageScenario")))
-        .unwrap();
-    let mp = match field(first, "measuringPoint") { WireValue::String(s) => s.clone(), _ => panic!() };
-    let counts: u64 = runs.iter().map(|r| r.iter().find(|s| s.measuring_point == mp).unwrap().count).sum();
-    assert_eq!(field(first, "count"), &WireValue::Long(counts as i64));
-    assert!(double(field(first, "ciHalfWidth")) > 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -276,43 +219,40 @@ async fn sessions_are_refused_as_specified() {
             other => panic!("expected a close, got {other:?}"),
         }
     };
-    let path = "/ws/sessions/contrib/palladio/functions";
+    let path = "/ws/sessions/contrib/palladio-arch/functions";
     assert_eq!(close_code(connect(addr, path, None).await).await, 4401);
     assert_eq!(close_code(connect(addr, path, Some("not-a-token")).await).await, 4401);
     // Signed without a key id, as the backend does: accepted with the published key.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let claims = serde_json::json!({"iss": "mdeo-platform", "exp": now + 300, "projectId": "p", "executionId": "e",
-        "scope": ["plugin:session:connect"], "target": "contrib:palladio", "session": "functions"});
+        "scope": ["plugin:session:connect"], "target": "contrib:palladio-arch", "session": "functions"});
     let no_kid = encode(&Header::new(Algorithm::RS256), &claims, &keys().encoding).unwrap();
     let mut ws = connect(addr, &format!("{path}?v=1"), Some(&no_kid)).await;
     send(&mut ws, &ClientMessage::Release { ids: vec![], handles: vec![] }).await;
-    let (_, spec, _) = corpus_model("h01_ps_single");
-    send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmSimulate".into(), objects: vec![], args: simulate_args(&spec, 1), model_id: Some(1) }).await;
+    send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmEvaluate".into(), objects: vec![], args: evaluate_args(10.0, 1), model_id: Some(1) }).await;
     assert!(matches!(answer(&mut ws).await, ServiceMessage::Failure { .. }));
     assert_eq!(close_code(connect(addr, path, Some(&token("contrib:other", "functions"))).await).await, 4401);
-    let other = token("contrib:palladio", "other");
-    assert_eq!(close_code(connect(addr, "/ws/sessions/contrib/palladio/other", Some(&other)).await).await, 4404);
-    let t = token("contrib:palladio", "functions");
+    let other = token("contrib:palladio-arch", "other");
+    assert_eq!(close_code(connect(addr, "/ws/sessions/contrib/palladio-arch/other", Some(&other)).await).await, 4404);
+    let t = token("contrib:palladio-arch", "functions");
     assert_eq!(close_code(connect(addr, &format!("{path}?v=2"), Some(&t)).await).await, 4409);
 }
 
 /// Many sessions at once, as an optimizer's workers would open them: every answer is still the
-/// reference's, and the runs spread over the pool.
+/// library's, and the runs spread over the pool.
 #[tokio::test(flavor = "multi_thread")]
 async fn many_sessions_in_parallel() {
     let addr = start().await;
-    let (dir, spec, model) = corpus_model("x_sl_mediastore");
-    let sessions = 48;
+    let (_, _, model) = corpus_model("x_sl_mediastore");
+    let sessions = 24;
     let started = std::time::Instant::now();
     let mut tasks = Vec::new();
     for k in 0..sessions {
-        let (model, spec) = (model.clone(), spec.clone());
+        let model = model.clone();
         tasks.push(tokio::spawn(async move {
             let mut ws = session(addr).await;
             upload(&mut ws, 1, model).await;
-            let mut args = simulate_args(&spec, 1);
-            args[0] = WireValue::Int(1000 + k);
-            send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmSimulate".into(), objects: vec![], args, model_id: Some(1) }).await;
+            send(&mut ws, &ClientMessage::Call { call_id: 1, operation: "pcmEvaluate".into(), objects: vec![], args: evaluate_args(100.0, 1000 + k), model_id: Some(1) }).await;
             (k, answer(&mut ws).await)
         }));
     }
@@ -321,14 +261,14 @@ async fn many_sessions_in_parallel() {
         answers.push(t.await.unwrap());
     }
     eprintln!("{sessions} sessions answered in {:?}", started.elapsed());
-    for (k, a) in answers.iter().filter(|(k, _)| k % 12 == 0) {
-        assert_same(a, &direct(&dir, &spec, 1000 + *k as i64));
+    for (k, a) in answers.iter().filter(|(k, _)| k % 8 == 0) {
+        assert_same(a, &model, 100.0, 1000 + *k as i64);
     }
 }
 
 /// Throughput through the protocol: `BENCH_SESSIONS` sessions (default 22) each make
-/// `BENCH_CALLS` calls (default 8) of mediastore with 10 000 measurements and a seed of their own,
-/// on `SIM_THREADS` simulation threads (default: one per CPU).
+/// `BENCH_CALLS` calls (default 8) of mediastore (600 s) with a seed of their own, on
+/// `SIM_THREADS` simulation threads (default: one per CPU).
 ///
 /// `SIM_THREADS=1 cargo test --release --test session throughput -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread")]
@@ -338,19 +278,17 @@ async fn throughput() {
     let threads = env("SIM_THREADS", 0);
     let (sessions, calls) = (env("BENCH_SESSIONS", 22), env("BENCH_CALLS", 8));
     let addr = start_with(threads).await;
-    let (_, mut spec, model) = corpus_model("x_sl_mediastore");
-    spec.max_measurements = 10_000;
+    let (_, _, model) = corpus_model("x_sl_mediastore");
     let started = std::time::Instant::now();
     let mut tasks = Vec::new();
     for k in 0..sessions {
-        let (model, spec) = (model.clone(), spec.clone());
+        let model = model.clone();
         tasks.push(tokio::spawn(async move {
             let mut ws = session(addr).await;
             upload(&mut ws, 1, model).await;
             for c in 0..calls {
-                let mut args = simulate_args(&spec, 1);
-                args[0] = WireValue::Int((k * 1000 + c) as i32);
-                send(&mut ws, &ClientMessage::Call { call_id: c as i64, operation: "pcmSimulate".into(), objects: vec![], args, model_id: Some(1) }).await;
+                let args = evaluate_args(600.0, (k * 1000 + c) as i32);
+                send(&mut ws, &ClientMessage::Call { call_id: c as i64, operation: "pcmEvaluate".into(), objects: vec![], args, model_id: Some(1) }).await;
                 assert!(matches!(answer(&mut ws).await, ServiceMessage::Result { .. }));
             }
         }));

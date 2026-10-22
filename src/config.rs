@@ -17,15 +17,11 @@ pub struct Config {
     pub sim_timeout_seconds: u64,
     /// Event limit of one simulation run (0: none).
     pub sim_max_events: u64,
-    /// The most replications one call may ask for.
-    pub max_replications: u32,
-    /// Compiled models kept, by content.
-    pub model_cache_size: usize,
-    /// Simulation outcomes kept, by model content and run parameters. Runs are deterministic, so
-    /// a cached outcome is exactly what running again would give.
+    /// Evaluations kept, by canonical model content and arguments. Runs are deterministic, so a
+    /// cached evaluation is exactly what running again would give.
     pub result_cache_size: usize,
-    /// When set, every model a session receives is written there (as `.m`, and as the PCM files
-    /// it becomes), for inspecting what the platform sent.
+    /// When set, every model a session receives is written there, for inspecting what the
+    /// platform sent.
     pub dump_dir: Option<std::path::PathBuf>,
 }
 
@@ -40,8 +36,6 @@ impl Config {
             sim_threads: num("SIM_THREADS", 0)?,
             sim_timeout_seconds: num("SIM_TIMEOUT_SECONDS", 600)?,
             sim_max_events: num("SIM_MAX_EVENTS", 0)?,
-            max_replications: num("SIM_MAX_REPLICATIONS", 10_000)?,
-            model_cache_size: num("SIM_MODEL_CACHE_SIZE", 256)?.max(1),
             result_cache_size: num("SIM_RESULT_CACHE_SIZE", 4096)?.max(1),
             dump_dir: std::env::var_os("SIM_DUMP_DIR").map(Into::into),
         })
@@ -68,8 +62,6 @@ impl Default for Config {
             sim_threads: 0,
             sim_timeout_seconds: 600,
             sim_max_events: 0,
-            max_replications: 10_000,
-            model_cache_size: 256,
             result_cache_size: 4096,
             dump_dir: None,
         }

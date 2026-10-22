@@ -1,26 +1,31 @@
 [package]
-name = "palladio-arch-service"
-description = "mdeo plugin service: evaluates plain Palladio (PCM) models by simulation with SimOxide (load profiles, SPD + HPA), for the architecture optimisation"
-version = "0.1.0"
+name = "palladio-sim-service"
+description = "mdeo plugin service Palladio Simulation: simulates the plain Palladio (PCM) part of a model with SimOxide (load profiles, SPD + HPA autoscaling) and returns the measurements"
+version = "0.2.0"
 edition = "2024"
 license = "EPL-2.0"
-default-run = "palladio-arch-service"
+default-run = "palladio-sim-service"
 
 [lib]
-name = "palladio_arch"
+name = "palladio_sim_service"
 path = "src/lib.rs"
 
 [dependencies]
-palladio-sim-service = { path = "../palladio-sim-service" }
+simoxide-emf-core = { path = "../simoxide/crates/foundation/simoxide-emf-core" }
 simoxide-model = { path = "../simoxide/crates/simoxide-model" }
+# EPL-only build: SimOxide's fast mode (SimuLizar's semantics, not its random numbers).
 simoxide-sim = { path = "../simoxide/crates/simoxide-sim" }
 # dynamic runs: SimOxide's SPD layer with the HPA, and Slingshot's adjustments (EPL default builds)
 simoxide-spd = { path = "../simoxide/crates/simoxide-spd", features = ["sim"] }
 simoxide-reconf = { path = "../simoxide/crates/simoxide-reconf" }
-lru = "0.12"
 
 axum = { version = "0.8", features = ["ws"] }
+ciborium = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+jsonwebtoken = "9"
+lru = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
@@ -28,13 +33,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-# SimuLizar-exact simulation (palladio-sim-service's `exact`): local use only, a build with it
-# must not be distributed. The plugin build runs SimOxide's fast mode.
-exact = ["palladio-sim-service/exact"]
+# SimuLizar-exact mode for the `roundtrip` command's comparison with the reference. Local use
+# only: it links code for which no licence is granted (SimOxide's LICENSES, section 7), so a
+# build with it must not be distributed. The plugin build leaves it off (pcmEvaluate always runs
+# the fast mode).
+exact = ["simoxide-sim/exact"]
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+rsa = "0.9"
+rand = "0.8"
 
 [profile.release]
 lto = "thin"
 codegen-units = 8
+# Simulations run behind catch_unwind: a panic fails the evaluation, not the service.
 panic = "unwind"
 
 [profile.test]

@@ -23,7 +23,7 @@
 use crate::evaluate::{self, LoadStep, Monitors, Request};
 use crate::graph::{Graph, is_a};
 use crate::pcm::PcmCache;
-use palladio_sim_service::protocol::{WireModel, WireValue};
+use crate::protocol::{WireModel, WireValue};
 use serde_json::{Value, json};
 use simoxide_sim::Limits;
 use std::collections::{BTreeMap, HashMap};
@@ -331,7 +331,7 @@ pub fn reduce(g: &Graph, cache: &PcmCache, req: &DetailRequest, meas: &simoxide_
         let rows = &meas.rows[i];
         let mp: &str = &def.mp;
         let kind = mp.split('[').next().unwrap_or("");
-        let ids = palladio_sim_service::engine::key_elements(mp);
+        let ids = crate::evaluate::key_elements(mp);
         if kind == "ActiveResourceMeasuringPoint" {
             let Some(spec) = ids.first() else { continue };
             match def.metric {

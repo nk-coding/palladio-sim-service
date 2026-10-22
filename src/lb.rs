@@ -7,7 +7,7 @@
 //! container `LoadBalancerServer` without work (joined to the first linking resource).
 
 use crate::graph::Graph;
-use palladio_sim_service::protocol::{WireModel, WireValue};
+use crate::protocol::{WireModel, WireValue};
 use std::collections::BTreeSet;
 
 struct Builder {

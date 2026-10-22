@@ -1,16 +1,15 @@
-//! `pcmEvaluate` (`palladio_arch::evaluate`) on small fixtures where the answers are known.
+//! `pcmEvaluate` (`palladio_sim_service::evaluate`) on small fixtures where the answers are known.
 //!
 //! - `two-tier.m`: Frontend (C1, 5 ms CPU) calls Backend (C2, 10 ms CPU), scenario `scenario`
 //!   at RATE/s; time unit s, CPUs at 1000 units/s (one unit = 1 ms of CPU);
 //! - `paths.m`: Frontend (C1) calls Backend (C2) with probability 0.3 and forks Audit (C3)
 //!   asynchronously: a session's synchronous path holds C1 always, C2 in 30 %, C3 never.
 
-use palladio_arch::detail::{self, DetailRequest};
-use palladio_arch::evaluate::{self, Evaluation, LoadStep, Monitors, Request, ScalingGroup};
-use palladio_arch::mfile;
-use palladio_arch::pcm::PcmCache;
+use palladio_sim_service::detail::{self, DetailRequest};
+use palladio_sim_service::evaluate::{self, Evaluation, LoadStep, Monitors, Request, ScalingGroup};
+use palladio_sim_service::mfile;
+use palladio_sim_service::pcm::PcmCache;
 use palladio_sim_service::config::Config;
-use palladio_sim_service::engine::Engine;
 use palladio_sim_service::protocol::{HeapObject, WireModel, WireValue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -257,8 +256,8 @@ fn the_detail_is_the_evaluated_run() {
 /// simulation per request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_script_function() {
-    use palladio_arch::functions;
-    let engine = Arc::new(Engine::new(Config::from_env().unwrap()));
+    use palladio_sim_service::functions;
+    let engine = Arc::new(Config::from_env().unwrap());
     let rec = |c: &str, f: Vec<(&str, WireValue)>| WireValue::Record { class_name: c.into(), fields: f.into_iter().map(|(k, v)| (k.to_string(), v)).collect() };
     let inst = |n: &str| WireValue::Instance(n.into());
     let cache = Arc::new(PcmCache::new(&fixture("paths.m", 20.0)));

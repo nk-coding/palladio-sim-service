@@ -6,8 +6,8 @@
 //! Palladio metamodel names one. Instances are kept in declaration order; new ones are appended,
 //! so the PCM lists they join stay in a deterministic order.
 
-use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
-use palladio_sim_service::schema::{PropKind, Schema, schema};
+use crate::protocol::{WireInstance, WireModel, WireValue};
+use crate::schema::{PropKind, Schema, schema};
 use simoxide_model::meta::prelude::PcmClass;
 use std::collections::{HashMap, HashSet};
 

@@ -19,7 +19,7 @@
 //! - **Result.** Instances in colour order, named `_c<colour>`, with `entityName` set to that
 //!   name; every reference list sorted by colour. The maps lead back to the caller's names.
 
-use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
+use crate::protocol::{WireInstance, WireModel, WireValue};
 use std::collections::HashMap;
 
 /// A canonical model and the way back.

@@ -6,8 +6,8 @@
 //! simulations at the same time on the shared pool.
 
 use crate::functions;
-use palladio_sim_service::engine::Engine;
-use palladio_sim_service::protocol::{ClientMessage, HeapObject, ServiceMessage, UNKNOWN_MODEL, UNKNOWN_OBJECT, WireModel};
+use crate::config::Config;
+use crate::protocol::{ClientMessage, HeapObject, ServiceMessage, UNKNOWN_MODEL, UNKNOWN_OBJECT, WireModel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -20,23 +20,23 @@ struct HeldModel {
 }
 
 pub struct Session {
-    engine: Arc<Engine>,
+    config: Arc<Config>,
     label: String,
     metamodels: HashSet<String>,
     model: Option<HeldModel>,
     /// Collections held for the client, by id, with the version they were sent at.
     heap: HashMap<i64, i64>,
     /// The elements of the lists the client sent (arguments of the `pcm*` functions).
-    lists: HashMap<i64, Vec<palladio_sim_service::protocol::WireValue>>,
+    lists: HashMap<i64, Vec<crate::protocol::WireValue>>,
     next_id: i64,
     models_seen: u64,
     calls: u64,
 }
 
 impl Session {
-    pub fn new(engine: Arc<Engine>, label: String) -> Session {
+    pub fn new(config: Arc<Config>, label: String) -> Session {
         Session {
-            engine,
+            config,
             label,
             metamodels: HashSet::new(),
             model: None,
@@ -104,7 +104,7 @@ impl Session {
         call_id: i64,
         operation: &str,
         objects: Vec<HeapObject>,
-        args: &[palladio_sim_service::protocol::WireValue],
+        args: &[crate::protocol::WireValue],
         model_id: Option<i64>,
     ) -> Result<ServiceMessage, (String, Option<&'static str>)> {
         // Collections the client left out must be held at the version it assumes.
@@ -131,7 +131,7 @@ impl Session {
             Some(c) => c.clone(),
             None => {
                 let model = held.model.clone();
-                if let Some(dir) = &self.engine.config.dump_dir {
+                if let Some(dir) = &self.config.dump_dir {
                     crate::dump(dir, &model);
                 }
                 let c = tokio::task::spawn_blocking(move || crate::pcm::PcmCache::new(&model))
@@ -143,7 +143,7 @@ impl Session {
             }
         };
         let mut next = self.next_id;
-        let answer = functions::call(&self.engine, operation, args, &self.lists, &cache, &mut || {
+        let answer = functions::call(&self.config, operation, args, &self.lists, &cache, &mut || {
             let id = next;
             next -= 1;
             id

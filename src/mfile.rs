@@ -6,7 +6,7 @@
 //! opposite ends of Palladio references are completed, as the platform sends them.
 
 use crate::graph::Graph;
-use palladio_sim_service::protocol::{WireInstance, WireModel, WireValue};
+use crate::protocol::{WireInstance, WireModel, WireValue};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,7 +257,7 @@ pub fn read(path: &std::path::Path) -> Result<WireModel, String> {
 /// A model from mdeo's model data JSON (`{metamodelPath, instances: [{name, className,
 /// properties}], links: [{sourceName, sourceProperty, targetName, targetProperty}]}`).
 pub fn from_model_data(v: &serde_json::Value) -> Result<WireModel, String> {
-    use palladio_sim_service::protocol::{WireInstance, WireValue};
+    use crate::protocol::{WireInstance, WireValue};
     let mut insts = Vec::new();
     let mut index = std::collections::HashMap::new();
     for i in v["instances"].as_array().ok_or("no instances")? {

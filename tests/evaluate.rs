@@ -317,6 +317,15 @@ fn the_detail_is_the_evaluated_run() {
     let v = serde_json::json!({"durationS": 360, "warmUpS": 60, "binS": 30, "seed": 3, "timeUnitMs": 1000,
         "groups": [{"container": "C2", "max": 4}]});
     assert_eq!(DetailRequest::from_json(&v).unwrap().run, run);
+    // revision 4's fields are detail fields too, and its evaluation carries the asynchronous sets
+    let mut va = v.clone();
+    va["asyncPaths"] = serde_json::json!(true);
+    va["asyncIgnoreForks"] = serde_json::json!([]);
+    let ra = DetailRequest::from_json(&va).unwrap();
+    assert_eq!(ra.run, Request { async_paths: true, ..run.clone() });
+    let da = detail::detail(&m, &ra, Default::default()).unwrap();
+    assert_eq!(da["evaluation"]["asyncPathsMeasured"], true);
+    assert!(!da["evaluation"]["asyncPathSets"].as_array().unwrap().is_empty());
 }
 
 /// `pcmEvaluate` as the platform calls it: named records, defaults filled in, nested lists; one

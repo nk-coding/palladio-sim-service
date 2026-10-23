@@ -67,6 +67,8 @@ impl DetailRequest {
                 "hpaDownscaleStabilisationS",
                 "hpaCpuInitialisationS",
                 "maxPathSets",
+                "asyncPaths",
+                "asyncIgnoreForks",
                 "wallSeconds",
                 "maxEvents",
                 "profile",

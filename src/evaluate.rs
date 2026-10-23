@@ -150,6 +150,10 @@ pub struct Request {
     pub wall_s: f64,
     /// Event limit (0: the service's).
     pub max_events: u64,
+    /// Path sets of asynchronous work (`asyncPaths`, revision 4) and the ForkActions whose
+    /// asynchronous behaviours they do not follow (`asyncIgnoreForks`).
+    pub async_paths: bool,
+    pub async_ignore_forks: Vec<String>,
 }
 
 pub const DEFAULT_PERCENTILES: [f64; 4] = [50.0, 90.0, 95.0, 99.0];
@@ -176,6 +180,8 @@ impl Default for Request {
             max_path_sets: 10_000,
             wall_s: 60.0,
             max_events: 0,
+            async_paths: false,
+            async_ignore_forks: Vec::new(),
         }
     }
 }
@@ -198,6 +204,10 @@ impl Request {
         for p in &mut r.profile {
             p.scenario = p.scenario.as_deref().map(|s| c.canon(s));
         }
+        for f in &mut r.async_ignore_forks {
+            *f = c.canon(f);
+        }
+        r.async_ignore_forks.sort();
         r
     }
 
@@ -228,6 +238,13 @@ impl Request {
         });
         if v["groups"].as_array().is_some_and(Vec::is_empty) {
             v.as_object_mut().unwrap().remove("groups");
+        }
+        // revision 4, only when asked for (requests without them keep revision 2's text)
+        if self.async_paths {
+            v["asyncPaths"] = json!(true);
+        }
+        if !self.async_ignore_forks.is_empty() {
+            v["asyncIgnoreForks"] = json!(self.async_ignore_forks);
         }
         v
     }
@@ -285,6 +302,10 @@ impl Request {
         r.usage_streams = flag("usageStreams").unwrap_or(r.usage_streams);
         r.fix_double_resume = flag("fixDoubleResume").unwrap_or(r.fix_double_resume);
         r.detail_calls = flag("detailCalls").unwrap_or(r.detail_calls);
+        r.async_paths = flag("asyncPaths").unwrap_or(r.async_paths);
+        if let Some(list) = o.get("asyncIgnoreForks").and_then(Value::as_array) {
+            r.async_ignore_forks = list.iter().map(|x| x.as_str().map(str::to_string).ok_or("asyncIgnoreForks holds ForkAction ids")).collect::<Result<_, _>>()?;
+        }
         if let Some(s) = o.get("seed").and_then(Value::as_i64) {
             r.seed = s;
         }
@@ -395,6 +416,19 @@ pub struct PathSet {
     pub count: u64,
 }
 
+/// Completed units of asynchronous work with one key (`PcmAsyncPathSet`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AsyncPathSet {
+    pub scenario: Option<String>,
+    pub assembly: String,
+    pub seff: String,
+    pub signature: String,
+    pub context: Vec<String>,
+    pub local_context: Vec<String>,
+    pub containers: Vec<String>,
+    pub count: u64,
+}
+
 /// What `pcmEvaluate` returns (`API-pcmEvaluate.md`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Evaluation {
@@ -418,6 +452,11 @@ pub struct Evaluation {
     pub call_counts: Vec<(String, u64)>,
     pub path_sets: Vec<PathSet>,
     pub path_sets_truncated: bool,
+    /// `asyncPaths` was asked for (the three fields below are in the JSON).
+    pub async_requested: bool,
+    pub async_paths_measured: bool,
+    pub async_path_sets: Vec<AsyncPathSet>,
+    pub async_path_sets_truncated: bool,
     pub created_pods: u64,
     pub rescales: u64,
     pub peak_pods: f64,
@@ -466,6 +505,15 @@ impl Evaluation {
             o(&mut p.scenario);
             p.containers.iter_mut().for_each(o);
         }
+        for p in &mut e.async_path_sets {
+            oo(&mut p.scenario);
+            o(&mut p.assembly);
+            o(&mut p.seff);
+            o(&mut p.signature);
+            p.context.iter_mut().for_each(o);
+            p.local_context.iter_mut().for_each(o);
+            p.containers.iter_mut().for_each(o);
+        }
         e.message = c.orig_text(&e.message, false);
         for w in &mut e.warnings {
             *w = c.orig_text(w, false);
@@ -477,6 +525,7 @@ impl Evaluation {
         Evaluation {
             failed: true,
             message,
+            async_requested: req.async_paths,
             window_s: req.end_s - req.warm_up_s,
             bin_s: req.bin_s,
             percentiles: req.percentiles.clone(),
@@ -487,7 +536,7 @@ impl Evaluation {
     /// The evaluation as JSON (instances by id; the record fields of `PcmEvaluation`).
     pub fn to_json(&self) -> Value {
         let rs = |v: &[ResponseStat]| v.iter().map(response_json).collect::<Vec<_>>();
-        json!({
+        let mut v = json!({
             "failed": self.failed, "capped": self.capped, "timedOut": self.timed_out, "message": self.message, "version": VERSION,
             "windowSeconds": self.window_s, "binSeconds": self.bin_s, "bins": self.bins, "percentiles": self.percentiles,
             "simulatedSeconds": self.simulated_s, "events": self.events, "wallMs": self.wall_ms,
@@ -506,7 +555,21 @@ impl Evaluation {
             "pathSetsTruncated": self.path_sets_truncated,
             "createdPods": self.created_pods, "rescales": self.rescales, "peakPods": self.peak_pods, "reversals": self.reversals,
             "warnings": self.warnings,
-        })
+        });
+        // revision 4: only when asked for (the JSON of other requests is revision 2's)
+        if self.async_requested {
+            let o = v.as_object_mut().unwrap();
+            o.insert("asyncPathsMeasured".into(), json!(self.async_paths_measured));
+            o.insert(
+                "asyncPathSets".into(),
+                json!(self.async_path_sets.iter().map(|s| json!({
+                    "scenario": s.scenario, "assembly": s.assembly, "seff": s.seff, "signature": s.signature,
+                    "context": s.context, "localContext": s.local_context, "containers": s.containers, "count": s.count,
+                })).collect::<Vec<_>>()),
+            );
+            o.insert("asyncPathSetsTruncated".into(), json!(self.async_path_sets_truncated));
+        }
+        v
     }
 }
 
@@ -592,6 +655,8 @@ fn build(cache: &PcmCache, req: &Request, mon: Monitors) -> Result<Result<(Dynam
         usage_streams: req.usage_streams,
         fix_double_resume: req.fix_double_resume,
         controller: req.controller.clone(),
+        async_paths: req.async_paths,
+        async_ignore_forks: req.async_ignore_forks.clone(),
     };
     Ok(Ok((dm, g)))
 }
@@ -978,6 +1043,40 @@ fn reduce(cache: &PcmCache, g: &Graph, req: &Request, groups: &[PodGroup], raw: 
     if truncated {
         warnings.push(format!("more than {} distinct path sets in a scenario: the most frequent are kept", req.max_path_sets));
     }
+    // ------------------------------------------------ asynchronous work (revision 4)
+    let mut async_path_sets = Vec::new();
+    let mut async_truncated = false;
+    if let Some(units) = &raw.async_units {
+        type K = (Option<String>, String, String, String, Vec<String>, Vec<String>, Vec<String>);
+        let mut by: BTreeMap<(bool, Option<String>, String, String), Vec<AsyncPathSet>> = BTreeMap::new();
+        let mut merged: BTreeMap<K, u64> = BTreeMap::new();
+        for u in units {
+            let k = (u.scenario.clone(), u.assembly.clone(), u.seff.clone(), u.signature.clone(), of_model(&u.context), of_model(&u.local_context), of_model(&u.containers));
+            *merged.entry(k).or_default() += u.count;
+        }
+        for ((scenario, assembly, seff, signature, context, local_context, containers), count) in merged {
+            by.entry((scenario.is_none(), scenario.clone(), assembly.clone(), seff.clone()))
+                .or_default()
+                .push(AsyncPathSet { scenario, assembly, seff, signature, context, local_context, containers, count });
+        }
+        for (_, mut v) in by {
+            v.sort_by(|a, b| {
+                b.count
+                    .cmp(&a.count)
+                    .then_with(|| a.context.cmp(&b.context))
+                    .then_with(|| a.local_context.cmp(&b.local_context))
+                    .then_with(|| a.containers.cmp(&b.containers))
+            });
+            if v.len() > req.max_path_sets {
+                async_truncated = true;
+                v.truncate(req.max_path_sets);
+            }
+            async_path_sets.extend(v);
+        }
+        if async_truncated {
+            warnings.push(format!("more than {} distinct asynchronous path sets of a trigger: the most frequent are kept", req.max_path_sets));
+        }
+    }
     let mut eval = Evaluation {
         failed: raw.failure.is_some(),
         capped: raw.capped,
@@ -998,6 +1097,10 @@ fn reduce(cache: &PcmCache, g: &Graph, req: &Request, groups: &[PodGroup], raw: 
         call_counts,
         path_sets,
         path_sets_truncated: truncated,
+        async_requested: req.async_paths,
+        async_paths_measured: raw.async_units.is_some(),
+        async_path_sets,
+        async_path_sets_truncated: async_truncated,
         created_pods: created,
         rescales,
         peak_pods,

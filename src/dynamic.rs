@@ -59,6 +59,10 @@ pub struct DynamicModel {
     pub fix_double_resume: bool,
     /// The HPA controller's settings.
     pub controller: Controller,
+    /// Record the path sets of asynchronous work (`asyncPaths`), not following the asynchronous
+    /// behaviours of these ForkActions (`asyncIgnoreForks`, canonical ids).
+    pub async_paths: bool,
+    pub async_ignore_forks: Vec<String>,
 }
 
 /// Settings of the HPA controller (Kubernetes' `kube-controller-manager` flags), in s.
@@ -321,6 +325,9 @@ pub struct RawRun {
     /// Simulated time at the end (model units).
     pub end: f64,
     pub wall_ms: f64,
+    /// The completed units of asynchronous work in the window (`asyncPaths`; `None`: not
+    /// recorded).
+    pub async_units: Option<Vec<crate::asyncpaths::RawUnits>>,
 }
 
 impl RawRun {
@@ -413,6 +420,16 @@ fn read(
     Reading { at: at_ns as f64 / 1e9, busy, sessions, calls, hpa }
 }
 
+/// The recorded units of asynchronous work with the model's ids (pods as their scaled container).
+fn async_read(
+    st: &crate::asyncpaths::AsyncState,
+    cm: &CompiledModel,
+    base: &CompiledModel,
+    units: &[(simoxide_model::ContainerId, simoxide_model::ContainerId)],
+) -> Vec<crate::asyncpaths::RawUnits> {
+    crate::asyncpaths::read(st, cm, base, |c| units.iter().find(|x| x.0 == c).map_or(c, |x| x.1))
+}
+
 /// Runs a prepared model with `seed`, pausing at `edges` (model time units, increasing) to read
 /// what it did. An error before the run (an invalid model) is an `Err`; a run that fails, hits
 /// the pod cap or a limit returns what it had done (`failure`, `capped`).
@@ -458,13 +475,31 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
     sc.call_counts = true;
     // SimuLizar's double resume at a synchronous fork join (REF-2) fixed
     sc.fix_double_resume = dm.fix_double_resume;
+    // asynchronous work (`asyncPaths`): an interpreter listener, which only observes the run
+    let rec = match dm.async_paths {
+        true => {
+            let mut ignore = std::collections::HashSet::new();
+            for id in &dm.async_ignore_forks {
+                match cm.action_ids.iter().position(|a| **a == **id) {
+                    Some(a) if cm.action_type[a] == "ForkAction" => {
+                        ignore.insert(simoxide_model::ActionId(a as u32));
+                    }
+                    _ => return Err(format!("asyncIgnoreForks: {id} is not a ForkAction of the simulated model")),
+                }
+            }
+            Some(crate::asyncpaths::AsyncRec::new(ignore, dm.warm_up_s * k, dm.end_s * k))
+        }
+        false => None,
+    };
+    let state = rec.as_ref().map(|r| r.0.clone());
     let mut sim = Simulation::<Fast>::create(&cm, sc, Outputs::default()).map_err(|e| e.message)?;
+    sim.set_listener(rec.map(|r| Box::new(r) as Box<dyn simoxide_sim::listener::Listener>));
     let (mut res, mut idx) = (Vec::new(), Vec::new());
     let _ = read(&mut sim, &[], &mut res, &mut idx, 0, Vec::new());
     let mut readings = Vec::new();
     let mut error: Option<simoxide_sim::SimError> = None;
     let end_ns = |sim: &Simulation<'_, Fast>| sim.state().now_ns();
-    let (meas, events, end, last, log) = match (&spd, &hpa) {
+    let (meas, events, end, last, log, async_units) = match (&spd, &hpa) {
         (Some(spd), Some(hpa)) => {
             let mut run = match SpdRun::new(sim, spd).and_then(|r| r.with_hpa(hpa)) {
                 Ok(r) => r,
@@ -498,8 +533,9 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
             let h = run.hpa_summary();
             let now = end_ns(&run.sim);
             let last = read(&mut run.sim, &units, &mut res, &mut idx, now, h);
+            let au = state.as_ref().map(|s| async_read(&s.borrow(), run.sim.compiled(), &cm, &units));
             let st = run.sim.state();
-            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, log)
+            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, log, au)
         }
         _ => {
             for &e in edges {
@@ -520,8 +556,9 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
             }
             let now = end_ns(&sim);
             let last = read(&mut sim, &[], &mut res, &mut idx, now, Vec::new());
+            let au = state.as_ref().map(|s| async_read(&s.borrow(), sim.compiled(), &cm, &[]));
             let st = sim.state();
-            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, HpaLog::default())
+            (st.measurements().clone(), st.events(), now as f64 / 1e9, last, HpaLog::default(), au)
         }
     };
     let (mut capped, mut timed_out, mut failure) = (false, false, None);
@@ -537,5 +574,5 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
             format!("the simulation failed: {e}")
         });
     }
-    Ok(RawRun { meas, log, resources: res, readings, last, capped, timed_out, failure, events, end, wall_ms: t0.elapsed().as_secs_f64() * 1e3 })
+    Ok(RawRun { meas, log, resources: res, readings, last, capped, timed_out, failure, events, end, wall_ms: t0.elapsed().as_secs_f64() * 1e3, async_units })
 }

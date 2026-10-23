@@ -119,6 +119,73 @@ fn sync_path_sets() {
     assert!(near(c3.mean_utilisation, 0.04, 0.1), "{}", c3.mean_utilisation);
 }
 
+/// Asynchronous path sets (`asyncPaths`, revision 4): Frontend.handle forks Audit.record
+/// asynchronously after the optional query: one unit per session, trigger AssemblyFrontend /
+/// Frontend_handle, containers C1 (the forked behaviour) and C3, context and localContext C1 or
+/// C1 + C2 (30 %).
+/// The run is the same as without; ignored forks are not followed.
+#[test]
+fn async_path_sets() {
+    let m = fixture("paths.m", 20.0);
+    let off = eval(&m, &steady(30.0, 630.0));
+    assert!(!off.async_requested && !off.async_paths_measured && off.async_path_sets.is_empty());
+    let j = off.to_json();
+    assert!(j.get("asyncPathSets").is_none() && j.get("asyncPathsMeasured").is_none());
+    let on = eval(&m, &Request { async_paths: true, ..steady(30.0, 630.0) });
+    assert!(on.async_paths_measured && !on.async_path_sets_truncated, "{}", on.message);
+    // the same run
+    let strip = |e: &Evaluation| {
+        let mut v = e.to_json();
+        let o = v.as_object_mut().unwrap();
+        for k in ["wallMs", "asyncPathsMeasured", "asyncPathSets", "asyncPathSetsTruncated"] {
+            o.remove(k);
+        }
+        v
+    };
+    assert_eq!(strip(&off), strip(&on));
+    let sessions = on.sessions[0].count;
+    let mut total = 0;
+    let mut with_c2 = 0;
+    for s in &on.async_path_sets {
+        assert_eq!(
+            (s.scenario.as_deref(), s.assembly.as_str(), s.seff.as_str(), s.signature.as_str()),
+            (Some("scenario"), "AssemblyFrontend", "Frontend_handle", "handle")
+        );
+        let mut cs = s.containers.clone();
+        cs.sort();
+        assert_eq!(cs, ["C1", "C3"]);
+        let mut ctx = s.context.clone();
+        ctx.sort();
+        assert!(ctx == ["C1"] || ctx == ["C1", "C2"], "{ctx:?}");
+        // the trigger's own synchronous execution is the session's whole path here
+        let mut local = s.local_context.clone();
+        local.sort();
+        assert_eq!(local, ctx);
+        if ctx.len() == 2 {
+            with_c2 += s.count;
+        }
+        total += s.count;
+    }
+    assert_eq!(on.async_path_sets.len(), 2);
+    assert!((total as i64 - sessions as i64).abs() <= 3, "{total} vs {sessions}");
+    let share = with_c2 as f64 / total as f64;
+    assert!((share - 0.3).abs() < 4.0 * (0.21 / total as f64).sqrt(), "{share}");
+    let j = on.to_json();
+    assert_eq!(j["asyncPathsMeasured"], serde_json::json!(true));
+    assert_eq!(j["asyncPathSets"].as_array().unwrap().len(), 2);
+    // the ignored fork: measured, no unit
+    let ign = eval(&m, &Request { async_paths: true, async_ignore_forks: vec!["Frontend_handle_fork".into()], ..steady(30.0, 630.0) });
+    assert!(ign.async_paths_measured && ign.async_path_sets.is_empty(), "{:?}", ign.async_path_sets);
+    assert_eq!(strip(&ign), strip(&off));
+    // not a fork action: a wrong argument
+    let bad = eval(&m, &Request { async_paths: true, async_ignore_forks: vec!["Frontend_handle_callRecord".into()], ..steady(30.0, 630.0) });
+    assert!(bad.failed && bad.message.contains("asyncIgnoreForks"), "{}", bad.message);
+    // the request's JSON names the new fields only when set
+    let r = Request { async_paths: true, async_ignore_forks: vec!["f".into()], ..steady(30.0, 630.0) };
+    assert_eq!(Request::from_json(&r.to_json()).unwrap(), r);
+    assert!(steady(30.0, 630.0).to_json().get("asyncPaths").is_none());
+}
+
 fn backend_group(max: u32) -> ScalingGroup {
     ScalingGroup { max, ..ScalingGroup::new("C2") }
 }

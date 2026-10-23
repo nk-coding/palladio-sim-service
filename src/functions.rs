@@ -32,6 +32,8 @@ enum Ty {
     /// A model instance (or null), as `Any?`.
     Instance,
     ListOfAny,
+    /// A nullable list of model instances.
+    NullableListOfAny,
     ListOfDouble,
     NullableListOfDouble,
     ListOfLong,
@@ -88,6 +90,9 @@ const PCM_EVALUATE_PARAMS: &[Param] = &[
     p("maxPathSets", Ty::Int, Default::Int(10_000)),
     p("wallSeconds", Ty::Double, Default::Double(60.0)),
     p("maxEvents", Ty::Long, Default::Long(0)),
+    // revision 4 (last: positional calls of revision 2 stay valid)
+    p("asyncPaths", Ty::Boolean, Default::Bool(false)),
+    p("asyncIgnoreForks", Ty::NullableListOfAny, Default::Null),
 ];
 
 struct Function {
@@ -161,6 +166,19 @@ const RECORDS: &[(&str, &[Param])] = &[
     ("PcmCallCount", &[f("action", Ty::Instance), f("count", Ty::Long)]),
     ("PcmPathSet", &[f("scenario", Ty::Instance), f("containers", Ty::ListOfAny), f("count", Ty::Long)]),
     (
+        "PcmAsyncPathSet",
+        &[
+            f("scenario", Ty::Instance),
+            f("assembly", Ty::Instance),
+            f("seff", Ty::Instance),
+            f("signature", Ty::Instance),
+            f("context", Ty::ListOfAny),
+            f("localContext", Ty::ListOfAny),
+            f("containers", Ty::ListOfAny),
+            f("count", Ty::Long),
+        ],
+    ),
+    (
         "PcmEvaluation",
         &[
             f("failed", Ty::Boolean),
@@ -183,6 +201,9 @@ const RECORDS: &[(&str, &[Param])] = &[
             f("callCounts", Ty::ListOf("PcmCallCount")),
             f("pathSets", Ty::ListOf("PcmPathSet")),
             f("pathSetsTruncated", Ty::Boolean),
+            f("asyncPathsMeasured", Ty::Boolean),
+            f("asyncPathSets", Ty::ListOf("PcmAsyncPathSet")),
+            f("asyncPathSetsTruncated", Ty::Boolean),
             f("createdPods", Ty::Long),
             f("rescales", Ty::Long),
             f("peakPods", Ty::Double),
@@ -208,6 +229,7 @@ fn type_json(ty: Ty) -> Value {
         Ty::ListOfString => list(builtin("string", false), false),
         Ty::Instance => builtin("Any", true),
         Ty::ListOfAny => list(builtin("Any", true), false),
+        Ty::NullableListOfAny => list(builtin("Any", true), true),
         Ty::ListOfDouble => list(builtin("double", false), false),
         Ty::NullableListOfDouble => list(builtin("double", false), true),
         Ty::ListOfLong => list(builtin("long", false), false),
@@ -484,6 +506,17 @@ impl Args<'_> {
             max_path_sets: self.long("maxPathSets")?.max(1) as usize,
             wall_s: self.double("wallSeconds")?,
             max_events: self.long("maxEvents")?.max(0) as u64,
+            async_paths: self.boolean("asyncPaths")?,
+            async_ignore_forks: match self.list("asyncIgnoreForks", lists)? {
+                None => Vec::new(),
+                Some(v) => v
+                    .iter()
+                    .map(|x| match x {
+                        WireValue::Instance(n) => Ok(n.clone()),
+                        other => Err(format!("{fname}: asyncIgnoreForks must hold ForkActions, not {other:?}")),
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
         };
         r.check().map_err(|e| format!("{fname}: {e}"))?;
         Ok(r)
@@ -592,6 +625,27 @@ fn evaluation(e: &Evaluation, next_id: &mut impl FnMut() -> i64) -> Answer {
         sets.push(record("PcmPathSet", vec![("scenario", inst(&s.scenario)), ("containers", cs), ("count", l(s.count))]));
     }
     let path_sets = h.list(sets);
+    let mut asets = Vec::new();
+    for s in &e.async_path_sets {
+        let ctx = h.list(s.context.iter().map(|c| inst(c)).collect());
+        let local = h.list(s.local_context.iter().map(|c| inst(c)).collect());
+        let cs = h.list(s.containers.iter().map(|c| inst(c)).collect());
+        let scen = s.scenario.as_deref().map_or(WireValue::Null, inst);
+        asets.push(record(
+            "PcmAsyncPathSet",
+            vec![
+                ("scenario", scen),
+                ("assembly", inst(&s.assembly)),
+                ("seff", inst(&s.seff)),
+                ("signature", inst(&s.signature)),
+                ("context", ctx),
+                ("localContext", local),
+                ("containers", cs),
+                ("count", l(s.count)),
+            ],
+        ));
+    }
+    let async_path_sets = h.list(asets);
     let percentiles = h.doubles(&e.percentiles);
     let warnings = h.list(e.warnings.iter().map(|w| WireValue::String(w.clone())).collect());
     let value = record(
@@ -617,6 +671,9 @@ fn evaluation(e: &Evaluation, next_id: &mut impl FnMut() -> i64) -> Answer {
             ("callCounts", call_counts),
             ("pathSets", path_sets),
             ("pathSetsTruncated", WireValue::Bool(e.path_sets_truncated)),
+            ("asyncPathsMeasured", WireValue::Bool(e.async_paths_measured)),
+            ("asyncPathSets", async_path_sets),
+            ("asyncPathSetsTruncated", WireValue::Bool(e.async_path_sets_truncated)),
             ("createdPods", l(e.created_pods)),
             ("rescales", l(e.rescales)),
             ("peakPods", d(e.peak_pods)),
@@ -677,6 +734,6 @@ mod tests {
         let g = c["classes"]["PcmScalingGroup"]["fields"].as_array().unwrap();
         assert!(g[0].get("defaultValue").is_none());
         assert_eq!(g[3]["defaultValue"]["value"], "0.7");
-        assert_eq!(c["classes"]["PcmEvaluation"]["fields"].as_array().unwrap().len(), 25);
+        assert_eq!(c["classes"]["PcmEvaluation"]["fields"].as_array().unwrap().len(), 28);
     }
 }

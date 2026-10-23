@@ -15,6 +15,7 @@
 //! - The plugin service: [`functions`] (manifest and calls), [`protocol`] (the `script-functions`
 //!   wire protocol), [`session`], [`server`], [`auth`] (session tokens), [`config`].
 
+pub mod asyncpaths;
 pub mod auth;
 pub mod canon;
 pub mod config;

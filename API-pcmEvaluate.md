@@ -1,6 +1,7 @@
 # `pcmEvaluate`: simulate the model's PCM with SimOxide, return what was measured
 
-Status 2026-10-22, revision 2 (generic). The plugin does one thing: it runs **one SimOxide
+Status 2026-10-23, revision 3 (generic; revision 2 + the opt-in `asyncPaths`, additive: a
+request without it gives revision 2's result). The plugin does one thing: it runs **one SimOxide
 simulation** of the plain PCM part of the model the script runs on and returns the raw
 measurements of that run. It interprets nothing: cost, failure models, budgets, consistency,
 which percentile matters are the scripts' (`.fn`). It is the only script function; there is no
@@ -54,6 +55,8 @@ pcmEvaluate(
     hpaDownscaleStabilisationSeconds: double = 300.0,  // default scale-down window
     hpaCpuInitialisationSeconds: double = 300.0,       // --horizontal-pod-autoscaler-cpu-initialization-period
     maxPathSets: int = 10000,                 // most distinct path sets returned per scenario
+                                              // (async: per scenario and trigger)
+    asyncPaths: boolean = false,              // also the path sets of asynchronous work (revision 3)
     wallSeconds: double = 60.0,               // wall-clock limit of the simulation (≤ 0: none)
     maxEvents: long = 0                       // event limit (0: the service's SIM_MAX_EVENTS)
 ): PcmEvaluation
@@ -101,6 +104,8 @@ is not a ResourceContainer) fail the call: they are script bugs.
 | `callCounts` | List<`PcmCallCount`> | per ExternalCallAction and EntryLevelSystemCall of the model |
 | `pathSets` | List<`PcmPathSet`> | per usage scenario, the distinct container sets of the sessions' synchronous paths |
 | `pathSetsTruncated` | boolean | some scenario had more than `maxPathSets` sets (the most frequent are kept) |
+| `asyncPathSets` | List<`PcmAsyncPathSet`> | only with `asyncPaths` (else empty): per scenario, trigger, context and container set, the units of asynchronous work completed in the window |
+| `asyncPathSetsTruncated` | boolean | some (scenario, trigger) had more than `maxPathSets` sets (the most frequent are kept) |
 | `createdPods`, `rescales` | long | all groups, whole run |
 | `peakPods` | double | most ready pods at once, all groups, in the window |
 | `reversals` | long | rescale direction reversals in the window, all groups |
@@ -152,6 +157,62 @@ are off the path. A container counts once per session. A pod created by the HPA 
 scaled container; the plugin's `LoadBalancerServer` is not a container of the model and is left
 out. Linking resources are not containers.
 
+### Asynchronous work (SimOxide `SimConfig::async_paths`, MEAS-13.5; only with `asyncPaths`)
+
+`PcmAsyncPathSet`: `scenario` (UsageScenario or null), `assembly` (AssemblyContext),
+`seff` (ResourceDemandingSEFF), `signature` (OperationSignature: the SEFF's described service),
+`context: List<ResourceContainer>`, `containers: List<ResourceContainer>`, `count: long`.
+
+- **Trigger**: one run of a SEFF (`seff`, run by assembly context `assembly`) that starts
+  asynchronous forked behaviours (ForkAction, `asynchronousForkedBehaviours`) in its own steps:
+  directly, in its loops and branches, or in its synchronous forked behaviours (recursively);
+  not in the SEFFs it calls (a callee that forks is a trigger of its own). The trigger's process
+  must not itself be part of asynchronous work: a SEFF that forks inside another trigger's work
+  is part of that work (AB24's root triggers only).
+- **Unit (of asynchronous work)**: everything one trigger run starts asynchronously: the
+  processes of all its asynchronous forks and, transitively, every process they start
+  (synchronous and asynchronous forks, also those started by further triggers inside the work).
+  All asynchronous forks of one trigger run (e.g. one per event delivery, in a loop) are one
+  unit.
+- **`containers`**: the containers the unit touched: the container of the trigger's assembly
+  (its forked behaviours run there) and, for every SEFF any process of the unit entered, the
+  container its assembly context was allocated to at entry (MEAS-13.1's rule; pods counted as
+  their scaled container, `LoadBalancerServer` left out). Sorted canonically, each once.
+- **`context`**: the containers on the synchronous path of the session the trigger ran for
+  (`pathSets`' rule) **at the trigger's first asynchronous fork**: everything the session had
+  used up to the moment the work was started, including the trigger's own container and the
+  synchronous callees it had called before the fork. Empty, with `scenario` null, when the
+  trigger ran outside any session's synchronous path. (A container in `context` was available
+  when the work started; the script decides whether to exclude it, AB24's C_T.)
+- **`scenario`**: the usage scenario of that session.
+- **`count`**: the units with exactly this (scenario, assembly, seff, context, containers) that
+  **completed** in the window. A unit completes when the trigger's SEFF run has returned (no
+  further fork can join it) and the last of its processes has ended; it counts when it completes
+  while the experiment runs and inside [warmUp, end] (differences of two readings, as `pathSets`).
+  Units still running at `end` are not counted (as sessions in progress); units that complete
+  in the window count even if they started before it.
+- Σ count over the entries of one (assembly, seff) = the trigger's runs that started
+  asynchronous work and completed in the window.
+
+Example (one entry; ids are the caller's instances):
+
+```json
+"asyncPathSets": [
+  {"scenario": "usBuy", "assembly": "acOrderService", "seff": "seffPlaceOrder",
+   "signature": "sigPlaceOrder",
+   "context": ["OrderService", "OrderDatabase", "ShoppingCartService", "GatewayService"],
+   "containers": ["OrderService", "InventoryService", "DiscountService", "PaymentService",
+                  "InvoiceService", "ShipmentService", "ShoppingCartService", "BrokerServer"],
+   "count": 9968}
+],
+"asyncPathSetsTruncated": false
+```
+
+Order: by scenario (null last), then assembly, seff, then descending count, then context and
+containers. With `asyncPaths = false` both fields are absent from the JSON outputs (`evaluate`,
+`detail`) and empty/false in the script record, and the run is the same either way (the
+monitoring draws no random numbers and schedules nothing).
+
 ## Typical use (sketch)
 
 ```fn
@@ -172,8 +233,8 @@ in JSON (`durationS` = end, `warmUpS`, `binS`, `timeUnitMs`, `profile` [{scenari
 factor}], `groups` [{container, min, max, target, initial, startupS, scaleDownS?, cpuRequest?,
 behavior?}], `services`, `overrides` [{resource, replicas, rate}], `percentiles`, `seed`,
 `usageStreams`, `fixDoubleResume`, `maxPods`, `hpaSyncS`, `hpaTolerance`,
-`hpaDownscaleStabilisationS`, `hpaCpuInitialisationS`, `maxPathSets`, `wallSeconds`,
-`maxEvents`; the older `autoscaling` {groups, services, maxPods} is read too) plus the detail's
+`hpaDownscaleStabilisationS`, `hpaCpuInitialisationS`, `maxPathSets`, `asyncPaths`,
+`wallSeconds`, `maxEvents`; the older `autoscaling` {groups, services, maxPods} is read too) plus the detail's
 own `budgetsMs`, `sloFactor`, `histogramPerDecade`, `assemblyOperations`. It runs **the same
 simulation** with more monitors (which do not change the run) and adds the evaluation under
 `evaluation` (the `PcmEvaluation` fields as JSON, instances by id).

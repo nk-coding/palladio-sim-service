@@ -300,9 +300,12 @@ pub struct Reading {
     /// Busy-time integral (model units) per [`RawRun::resources`] index, tracked since
     /// `since` (model units); `None`: not tracked yet.
     pub busy: Vec<Option<(f64, f64)>>,
-    /// Finished sessions: (scenario id, container ids, sessions).
+    /// Finished sessions: (scenario id, container ids, sessions). Only in the readings the
+    /// reduction subtracts (the window's start, the last edge and the end of the run; empty at
+    /// the other edges): the list grows with the distinct container sets, and a copy per bin
+    /// edge took gigabytes for fine-grained designs.
     pub sessions: Vec<(String, Vec<String>, u64)>,
-    /// External calls so far: (action id, count).
+    /// External calls so far: (action id, count); in the same readings as `sessions`.
     pub calls: Vec<(String, u64)>,
     pub hpa: Vec<simoxide_spd::hpa::HpaSummary>,
 }
@@ -362,7 +365,7 @@ impl RawRun {
 }
 
 /// Tracks the resources the run has that `res` does not list yet, and returns the reading at
-/// `at_ns` (the run paused before it).
+/// `at_ns` (the run paused before it); with `paths` its finished sessions and call counts.
 fn read(
     sim: &mut Simulation<'_, Fast>,
     units: &[(simoxide_model::ContainerId, simoxide_model::ContainerId)],
@@ -370,6 +373,7 @@ fn read(
     idx: &mut Vec<u32>,
     at_ns: i64,
     hpa: Vec<simoxide_spd::hpa::HpaSummary>,
+    paths: bool,
 ) -> Reading {
     let cm = sim.compiled();
     let m = &cm.model;
@@ -389,8 +393,10 @@ fn read(
         new.push(ri as u32);
     }
     let st = sim.state();
-    let sessions = st
-        .sync_paths(cm)
+    let sessions = if !paths {
+        Vec::new()
+    } else {
+        st.sync_paths(cm)
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
@@ -404,15 +410,19 @@ fn read(
                 .collect();
             (s.scenario_id, ids, s.sessions)
         })
-        .collect();
-    let calls = st
-        .call_counts()
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| **n > 0)
-        .map(|(a, n)| (cm.action_ids[a].to_string(), *n))
-        .collect();
+        .collect()
+    };
+    let calls = if !paths {
+        Vec::new()
+    } else {
+        st.call_counts()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(a, n)| (cm.action_ids[a].to_string(), *n))
+            .collect()
+    };
     let busy = idx.iter().map(|&ri| sim.busy_integral_at(ri, at_ns)).collect();
     for ri in new {
         sim.track_busy(ri);
@@ -495,7 +505,10 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
     let mut sim = Simulation::<Fast>::create(&cm, sc, Outputs::default()).map_err(|e| e.message)?;
     sim.set_listener(rec.map(|r| Box::new(r) as Box<dyn simoxide_sim::listener::Listener>));
     let (mut res, mut idx) = (Vec::new(), Vec::new());
-    let _ = read(&mut sim, &[], &mut res, &mut idx, 0, Vec::new());
+    let _ = read(&mut sim, &[], &mut res, &mut idx, 0, Vec::new(), false);
+    // the session sets and call counts are subtracted between the window's start (the first
+    // edge) and the last edge or the end of the run: only those readings hold them
+    let paths_at = |i: usize| i == 0 || i + 1 == edges.len();
     let mut readings = Vec::new();
     let mut error: Option<simoxide_sim::SimError> = None;
     let end_ns = |sim: &Simulation<'_, Fast>| sim.state().now_ns();
@@ -509,13 +522,13 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
             run.enforce_policies(&init.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
             let mut adj = QvtoAdjuster::spd(core()?, &SpdAdjust::new(&Quirks::fixed())).map_err(|e| e.to_string())?;
             let mut log = HpaLog::default();
-            for &e in edges {
+            for (i, &e) in edges.iter().enumerate() {
                 let ns = (e * 1e9).round() as i64;
                 match run.run_until(&mut adj, &mut log, Some(ns)) {
                     Ok(simoxide_sim::Status::Paused) => {
                         let units = run.container_units().to_vec();
                         let h = run.hpa_summary();
-                        readings.push(read(&mut run.sim, &units, &mut res, &mut idx, ns, h));
+                        readings.push(read(&mut run.sim, &units, &mut res, &mut idx, ns, h, paths_at(i)));
                     }
                     Ok(simoxide_sim::Status::Finished) => break,
                     Err(x) => {
@@ -532,16 +545,18 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
             let units = run.container_units().to_vec();
             let h = run.hpa_summary();
             let now = end_ns(&run.sim);
-            let last = read(&mut run.sim, &units, &mut res, &mut idx, now, h);
+            let last = read(&mut run.sim, &units, &mut res, &mut idx, now, h, true);
             let au = state.as_ref().map(|s| async_read(&s.borrow(), run.sim.compiled(), &cm, &units));
             let st = run.sim.state();
             (st.measurements().clone(), st.events(), now as f64 / 1e9, last, log, au)
         }
         _ => {
-            for &e in edges {
+            for (i, &e) in edges.iter().enumerate() {
                 let ns = (e * 1e9).round() as i64;
                 match sim.run_until(Pause::Before(ns)) {
-                    Ok(simoxide_sim::Status::Paused) => readings.push(read(&mut sim, &[], &mut res, &mut idx, ns, Vec::new())),
+                    Ok(simoxide_sim::Status::Paused) => {
+                        readings.push(read(&mut sim, &[], &mut res, &mut idx, ns, Vec::new(), paths_at(i)))
+                    }
                     Ok(simoxide_sim::Status::Finished) => break,
                     Err(x) => {
                         error = Some(x);
@@ -555,7 +570,7 @@ pub fn run_raw(p: &Prepared, seed: i64, limits: Limits, edges: &[f64]) -> Result
                 error = Some(x);
             }
             let now = end_ns(&sim);
-            let last = read(&mut sim, &[], &mut res, &mut idx, now, Vec::new());
+            let last = read(&mut sim, &[], &mut res, &mut idx, now, Vec::new(), true);
             let au = state.as_ref().map(|s| async_read(&s.borrow(), sim.compiled(), &cm, &[]));
             let st = sim.state();
             (st.measurements().clone(), st.events(), now as f64 / 1e9, last, HpaLog::default(), au)

@@ -8,8 +8,8 @@ response-time statistics, utilisation and pods per processing resource, call cou
 container sets of the sessions' synchronous paths, over a window and per time bin. Every
 interpretation (cost, failure model, budgets, consistency, which percentile matters) belongs to
 the mdeo scripts. It also owns the Palladio metamodel as mdeo sees it (`gen-metamodel`) and the
-PCM ⇄ mdeo conversion (`import`, the XMI writer). Used by the domain project
-([palladio-architecture-optimization-domain](../palladio-architecture-optimization-domain)).
+PCM ⇄ mdeo conversion (`import`, the XMI writer). The test fixtures use their own copy of that
+metamodel (`tests/fixtures/metamodel/`, written by `gen-metamodel`; a test keeps it current).
 
 **One repository, one plugin (2026-10-22).** This repository merges the former
 `palladio-sim-service` (the Palladio Simulation plugin: metamodel, import, protocol, auth,

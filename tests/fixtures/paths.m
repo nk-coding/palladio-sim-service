@@ -4,7 +4,7 @@
 // per second (replaced by the tests). A session's synchronous path holds C1 always, C2 in 30 %
 // of the sessions, C3 never.
 
-using "../../../palladio-architecture-optimization-domain/metamodel/palladio.mm"
+using "metamodel/palladio.mm"
 
 repo : Repository { entityName = "repo" }
 repo.interfaces -- IFrontend

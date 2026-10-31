@@ -4,6 +4,8 @@
 //!   at RATE/s; time unit s, CPUs at 1000 units/s (one unit = 1 ms of CPU);
 //! - `paths.m`: Frontend (C1) calls Backend (C2) with probability 0.3 and forks Audit (C3)
 //!   asynchronously: a session's synchronous path holds C1 always, C2 in 30 %, C3 never.
+//!
+//! Both use `tests/fixtures/metamodel/palladio.mm`, this crate's `gen-metamodel` output.
 
 use palladio_sim_service::detail::{self, DetailRequest};
 use palladio_sim_service::evaluate::{self, Evaluation, LoadStep, Monitors, Request, ScalingGroup};
@@ -506,11 +508,15 @@ fn results_do_not_depend_on_names_or_order() {
     invariant(&fixture("two-tier.m", 100.0), &req, rename_request);
 }
 
-/// The same on a realised MiSArch design of the domain project (skipped without it).
+/// The same on realised designs outside this repository: REALISED_DESIGN_DIR names a directory whose
+/// subdirectories hold `realised/design.model.json` (skipped without it).
 #[test]
-fn a_realised_misarch_design_does_not_depend_on_names_or_order() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../palladio-architecture-optimization-domain/build/domain/detail-work");
-    let Some(path) = std::fs::read_dir(dir).ok().and_then(|d| d.flatten().map(|e| e.path().join("realised/design.model.json")).find(|p| p.exists())) else {
+fn a_realised_design_does_not_depend_on_names_or_order() {
+    let Ok(dir) = std::env::var("REALISED_DESIGN_DIR") else {
+        eprintln!("REALISED_DESIGN_DIR not set: skipped");
+        return;
+    };
+    let Some(path) = std::fs::read_dir(&dir).ok().and_then(|d| d.flatten().map(|e| e.path().join("realised/design.model.json")).find(|p| p.exists())) else {
         eprintln!("no realised design in {dir}: skipped");
         return;
     };
@@ -646,4 +652,13 @@ async fn the_script_path_and_the_command_line_give_the_same_evaluation() {
         assert_eq!(field(r, "replicaCoreSeconds"), WireValue::Double(w.replica_core_seconds));
     }
     assert_eq!(list(field(&a.value, "pathSets")).len(), want.path_sets.len());
+}
+
+/// The fixtures' metamodel (`tests/fixtures/metamodel/`) is what `gen-metamodel` writes today.
+#[test]
+fn the_fixture_metamodel_is_current() {
+    for (path, text) in palladio_sim_service::schema::schema().metamodel_files() {
+        let file = format!("{}/tests/fixtures/metamodel/{path}", env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap_or_default(), text, "{file} is stale: run `palladio-sim-service gen-metamodel tests/fixtures/metamodel`");
+    }
 }

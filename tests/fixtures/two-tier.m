@@ -2,7 +2,7 @@
 // Backend.query, which does 10 ms. Time unit: seconds; every CPU does 1000 units per second, so
 // one unit is one millisecond of CPU. Users arrive at RATE per second (replaced by the tests).
 
-using "../../../palladio-architecture-optimization-domain/metamodel/palladio.mm"
+using "metamodel/palladio.mm"
 
 repo : Repository { entityName = "repo" }
 repo.interfaces -- IFrontend
